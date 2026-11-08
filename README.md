@@ -31,21 +31,18 @@ res['species'], res['reactions'], res['ok']   # ids, and False where no steady s
 
 ## Benchmark report
 
-Apple Silicon Mac, 40-species model, 200 parameter sets (wall clock):
+Apple Silicon Mac, wall clock. Task: scaled flux + concentration control coefficients for every parameter set.
 
-| Method | Time | Speedup |
-|---|---|---|
-| Plain roadrunner loop (`steadyState` + `getScaled*ControlCoefficientMatrix`) | 321 s (extrapolated from 20) | 1× |
-| `te.controlCoefficients`, CPU, 1 process | 105.5 s | 3× |
-| `te.controlCoefficients`, CPU, all cores | **20.0 s** | **16×** |
-| `te.controlCoefficients`, MPS GPU + all cores | 22.8 s | 14× |
+| Workload | Regular tellurium | Tellurium Turbo | Speedup |
+|---|---|---|---|
+| 200 parameter sets, 40 species, 1 CPU core | 321 s¹ | 105.5 s | **3.0×** |
+| 200 parameter sets, 40 species, all CPU cores | 321 s¹ | 20.0 s | **16.1×** |
+| 200 parameter sets, 40 species, all CPU cores + MPS GPU | 321 s¹ | 22.8 s | **14.1×** |
+| Matrix algebra only, 2000 sets, 200 species, MPS GPU | 3.86 s² | 3.01 s | **1.3×** |
 
-Linear algebra only (2000 parameter sets, 200-species synthetic system):
-
-| Device | Time |
-|---|---|
-| CPU (numpy) | 3.86 s |
-| MPS GPU (torch, float32) | 3.01 s (1.3×) |
+¹ Loop of `steadyState()` + `getScaledFluxControlCoefficientMatrix()` + `getScaledConcentrationControlCoefficientMatrix()`,
+timed on 20 sets and extrapolated to 200.
+² Regular tellurium has no batched equivalent; baseline is Tellurium Turbo's own CPU (numpy) path.
 
 **Takeaway:** ~95% of the time is roadrunner's steady-state solve, which only runs on CPU, so the big win is the
 algorithm (steady state + elasticities once, instead of roadrunner's per-call MCA) and using every core.
