@@ -5,6 +5,35 @@ metabolic control analysis. Everything else in tellurium is unchanged; the origi
 
 ## What's new
 
+### Quick start: using the GPU
+
+Call `te.gpu(True)` **once** per session. After that, every `te.controlCoefficients` call uses the GPU
+automatically; you don't pass anything else.
+
+```python
+import tellurium as te, numpy as np
+
+if __name__ == '__main__':             # needed in .py scripts (uses all CPU cores); not needed in Jupyter
+    te.gpu(True)                       # once: picks NVIDIA (CUDA) or Apple (MPS), else CPU
+
+    r = te.loada('''
+      J0: $X0 -> S1; k1*X0
+      J1: S1 -> S2;  k2*S1
+      J2: S2 -> $X1; k3*S2
+      X0 = 10; k1 = 1; k2 = 2; k3 = 0.5
+    ''')
+
+    res = te.controlCoefficients(r, {'k1': np.linspace(0.5, 3, 500)})   # 500 parameter sets in one call
+    print(res['fcc'][0])               # flux control coefficients for the first parameter set
+
+    te.gpu(False)                      # optional: back to CPU
+```
+
+Only `te.controlCoefficients` uses the GPU. Regular roadrunner calls (`r.simulate()`, `r.steadyState()`,
+`r.getScaledFluxControlCoefficientMatrix()`, ...) run exactly as before.
+
+### Full API
+
 ```python
 import tellurium as te, numpy as np
 

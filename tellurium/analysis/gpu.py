@@ -18,6 +18,7 @@ from __future__ import absolute_import
 import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 
@@ -137,10 +138,15 @@ def controlCoefficients(r, samples=None, processes=None):
     # ponytail: process pool only pays off once per-worker model compile (~0.1-0.5 s) is amortized
     processes = processes or (os.cpu_count() if n >= 64 else 1)
     _init_worker(sbml, cma)  # local copy: serial runs + structural matrices below
+    res = None
     if processes > 1:
-        with ProcessPoolExecutor(processes, initializer=_init_worker, initargs=(sbml, cma)) as ex:
-            res = list(ex.map(_sample, samples, chunksize=max(1, n // (4 * processes))))
-    else:
+        try:
+            with ProcessPoolExecutor(processes, initializer=_init_worker, initargs=(sbml, cma)) as ex:
+                res = list(ex.map(_sample, samples, chunksize=max(1, n // (4 * processes))))
+        except BrokenProcessPool:
+            warnings.warn("te.controlCoefficients: worker processes failed to start (a script needs an "
+                          "`if __name__ == '__main__':` guard); falling back to 1 process.")
+    if res is None:
         res = [_sample(p) for p in samples]
 
     # Structure is parameter independent: take it once. Align link-matrix rows to elasticity columns.
