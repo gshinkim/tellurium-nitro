@@ -110,6 +110,9 @@ from .analysis.stochasticmodel import StochasticSimulationModel
 from .analysis.parameterestimation import ParameterEstimation
 from .analysis.sensitivityanalysis import SensitivityAnalysis
 
+# GPU / parallel metabolic control analysis
+from .analysis.gpu import gpu, getGPU, controlCoefficients
+
 from .tellurium import (
     distributed_parameter_scanning, sample_plot, plotImage,
     distributed_stochastic_simulation, plot_distributed_stochastic, plot_stochastic_result, distributed_sensitivity_analysis

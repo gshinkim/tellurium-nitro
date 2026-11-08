@@ -70,6 +70,10 @@ setup(name='tellurium',
           'pytest',
           ],
       extras_require={
+        # te.gpu(): CUDA or Apple MPS for te.controlCoefficients
+        'gpu': [
+          'torch>=2.0',
+          ],
         ':(python_version < "3.10" and platform_machine != "arm64")': [
           'sbml2matlab>=0.9.1',
           ],

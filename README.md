@@ -1,3 +1,68 @@
+# Tellurium Turbo
+
+A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) that adds parallel, optionally GPU-accelerated
+metabolic control analysis. Everything else in tellurium is unchanged; the original README follows below.
+
+## What's new
+
+```python
+import tellurium as te, numpy as np
+
+te.gpu("true")        # finds an NVIDIA (CUDA) or Apple Silicon (MPS) GPU, falls back to CPU
+te.getGPU()           # -> "cuda", "mps" or "cpu"
+
+r = te.loada(model)
+res = te.controlCoefficients(r, {'k1': np.linspace(0.5, 3, 1000)})
+res['fcc']            # (1000, reactions, reactions)  scaled flux control coefficients
+res['ccc']            # (1000, species, reactions)    scaled concentration control coefficients
+res['elasticities']   # (1000, reactions, species)    scaled elasticities
+res['ufcc'], res['uccc']        # unscaled versions
+res['species'], res['reactions'], res['ok']   # ids, and False where no steady state was found (NaN rows)
+```
+
+- `samples` can be a dict of equal-length arrays (zipped, not a grid), a list of dicts, or a pandas DataFrame.
+  `None` evaluates the model's current values once.
+- Steady states and elasticities run in parallel CPU worker processes (all cores when there are 64+ samples;
+  override with `processes=`). Scripts need an `if __name__ == '__main__':` guard; notebooks don't.
+- Control coefficients are computed as `C = -L (N_R E L)^-1 N_R` and `F = I + E C` in one batched solve,
+  on the GPU when `te.gpu` is on. Results match roadrunner's own matrices to ~1e-15 on CPU.
+  Apple MPS only supports float32, so results there agree to ~1e-5.
+- GPU support needs PyTorch: `pip install -e ".[gpu]"`. Without it `te.gpu` warns and stays on CPU.
+
+## Benchmark report
+
+Apple Silicon Mac, 40-species model, 200 parameter sets (wall clock):
+
+| Method | Time | Speedup |
+|---|---|---|
+| Plain roadrunner loop (`steadyState` + `getScaled*ControlCoefficientMatrix`) | 321 s (extrapolated from 20) | 1× |
+| `te.controlCoefficients`, CPU, 1 process | 105.5 s | 3× |
+| `te.controlCoefficients`, CPU, all cores | **20.0 s** | **16×** |
+| `te.controlCoefficients`, MPS GPU + all cores | 22.8 s | 14× |
+
+Linear algebra only (2000 parameter sets, 200-species synthetic system):
+
+| Device | Time |
+|---|---|
+| CPU (numpy) | 3.86 s |
+| MPS GPU (torch, float32) | 3.01 s (1.3×) |
+
+**Takeaway:** ~95% of the time is roadrunner's steady-state solve, which only runs on CPU, so the big win is the
+algorithm (steady state + elasticities once, instead of roadrunner's per-call MCA) and using every core.
+The GPU only accelerates the matrix algebra: it slightly *slows down* small models (transfer overhead) and helps
+for large models with many samples. CUDA was not benchmarked.
+
+## Changed files
+
+- `tellurium/analysis/gpu.py` (new): `gpu()`, `getGPU()`, `controlCoefficients()`
+- `tellurium/__init__.py`: exports `te.gpu`, `te.getGPU`, `te.controlCoefficients`
+- `tellurium/tests/test_gpu.py` (new): checks results against roadrunner for CPU serial, CPU multi-process and GPU
+- `tellurium/visualization/sbmldiagram.py`: removed the Python 2 `six` import that made `import tellurium` fail
+  when `six` isn't installed
+- `setup.py`: new optional extra `gpu` (`torch>=2.0`)
+
+---
+
 <h1><img title="tellurium logo" src="./docs/images/tellurium_logo.png" height="50" />&nbsp;&nbsp;tellurium</h1>
 
 <!-- These badges come from shield.io, zenodo or travis -->

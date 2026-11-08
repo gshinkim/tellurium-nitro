@@ -10,7 +10,6 @@ try:
     import libsbml
 except ImportError:
     import tesbml as libsbml
-from six import string_types
 
 try:
     from IPython.display import Image, display
@@ -42,7 +41,7 @@ class SBMLDiagram(object):
         :type modifiers:
         """
         # load model
-        if isinstance(sbml, string_types):
+        if isinstance(sbml, str):
             self.doc = libsbml.readSBMLFromString(sbml)
             self.model = self.doc.getModel()
         elif isinstance(sbml, libsbml.SBMLDocument):
