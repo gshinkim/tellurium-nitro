@@ -63,16 +63,28 @@ res['species'], res['reactions'], res['ok']   # ids, and False where no steady s
 
 Apple Silicon Mac, wall clock. Task: scaled flux + concentration control coefficients for every parameter set.
 
-| Workload | Regular tellurium | Tellurium Turbo | Speedup |
+200 parameter sets, 40-species model:
+
+| What you run (Tellurium Turbo) | Regular tellurium | Tellurium Turbo | Speedup |
 |---|---|---|---|
-| 200 parameter sets, 40 species, 1 CPU core | 321 s¹ | 105.5 s | **3.0×** |
-| 200 parameter sets, 40 species, all CPU cores | 321 s¹ | 20.0 s | **16.1×** |
-| 200 parameter sets, 40 species, all CPU cores + MPS GPU | 321 s¹ | 22.8 s | **14.1×** |
-| Matrix algebra only, 2000 sets, 200 species, MPS GPU | 3.86 s² | 3.01 s | **1.3×** |
+| `te.controlCoefficients(r, samples, processes=1)` (1 CPU core, no GPU) | 321 s¹ | 105.5 s | **3.0×** |
+| `te.controlCoefficients(r, samples)` (default: all CPU cores, no GPU) | 321 s¹ | 20.0 s | **16.1×** |
+| `te.gpu(True)` then `te.controlCoefficients(r, samples)` (all CPU cores + MPS GPU) | 321 s¹ | 22.8 s | **14.1×** |
+
+**So what do you get from just turning on `te.gpu(True)`?** Compared with regular tellurium, 14.1× faster.
+But almost all of that comes from `te.controlCoefficients` itself, not the GPU: the same call *without*
+`te.gpu` is 16.1× faster. On a model this small the GPU is slightly slower (22.8 s vs 20.0 s), because copying
+data to the GPU costs more than the matrix math it speeds up.
+
+Where the GPU does help, the matrix math alone on a large model (2000 parameter sets, 200 species):
+
+| What you run | GPU off | `te.gpu(True)` (MPS) | Speedup |
+|---|---|---|---|
+| Matrix algebra only² | 3.86 s | 3.01 s | **1.3×** |
 
 ¹ Loop of `steadyState()` + `getScaledFluxControlCoefficientMatrix()` + `getScaledConcentrationControlCoefficientMatrix()`,
 timed on 20 sets and extrapolated to 200.
-² Regular tellurium has no batched equivalent; baseline is Tellurium Turbo's own CPU (numpy) path.
+² Regular tellurium has no batched equivalent, so this compares Tellurium Turbo with the GPU off (numpy) vs on. Steady states are not included.
 
 **Takeaway:** ~95% of the time is roadrunner's steady-state solve, which only runs on CPU, so the big win is the
 algorithm (steady state + elasticities once, instead of roadrunner's per-call MCA) and using every core.
