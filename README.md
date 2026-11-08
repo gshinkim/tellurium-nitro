@@ -1,4 +1,5 @@
 # Tellurium Turbo
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/5f0099d5-27bd-4d8f-b6da-2039999c0911" />
 
 A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) that adds parallel, optionally GPU-accelerated
 metabolic control analysis. Everything else in tellurium is unchanged; the original README follows below.
