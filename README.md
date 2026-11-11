@@ -115,20 +115,79 @@ official release, so they are upstream issues. Wall time is about the same for a
 mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation. The speed difference shows in the
 compute benchmarks above.
 
-## Install
+## Install Tellurium Nitro (step by step)
+
+> **Do not run `pip install tellurium`.** That installs *regular* tellurium from PyPI. Tellurium Nitro is installed
+> from this GitHub repo instead; it brings all of tellurium's dependencies with it. Nitro still imports as
+> `import tellurium as te`, so use a fresh virtual environment to keep it separate from any regular tellurium.
+
+**1. Install Python 3.9 or newer, and git.** Check with `python3 --version` and `git --version`.
+
+**2. Install Rust**, which compiles the fast engine. You only need to do this once.
+
+- macOS / Linux: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`, then open a new terminal
+  (on macOS, `brew install rust` also works).
+- Windows: download and run `rustup-init.exe` from https://rustup.rs. It will ask you to install the
+  "Visual Studio C++ Build Tools"; say yes.
+
+Check with `cargo --version`.
+
+**3. Download Tellurium Nitro:**
 
 ```bash
-pip install tellurium                       # dependencies (libroadrunner, antimony, ...)
-git clone https://github.com/gshinkim/tellurium-nitro && cd tellurium-nitro
-pip install -e .
-brew install rust && pip install maturin    # or rustup (Linux/Windows) + pip install maturin
-cd rrs && maturin develop --release         # builds the Rust engine into the active venv
-python check.py                             # correctness vs roadrunner + timings
+git clone https://github.com/gshinkim/tellurium-nitro.git
+cd tellurium-nitro
 ```
 
-`rrs/.cargo/config.toml` builds for the local CPU (`target-cpu=native`); delete it to build a portable binary.
-Without the Rust engine, Nitro behaves exactly like Tellurium Turbo. `te.turbo(False)` (or env
-`TELLURIUM_ENGINE=roadrunner`) switches back to roadrunner globally. Only tested on macOS (Apple Silicon) so far.
+**4. Create and activate a fresh virtual environment:**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+```
+
+**5. Install Tellurium Nitro and its dependencies:**
+
+```bash
+pip install --upgrade pip
+pip install .
+```
+
+**6. Build and install the Rust engine.** This takes 1-3 minutes the first time.
+
+```bash
+pip install ./rrs
+```
+
+**7. Check that it works:**
+
+```bash
+python -c "import tellurium as te; print('Nitro engine on:', te.turbo())"
+```
+
+It should print `Nitro engine on: True`. If it prints `False`, step 6 didn't finish; run it again and read
+the error.
+
+**8. Use it exactly like tellurium:**
+
+```python
+import tellurium as te
+r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')
+r.simulate(0, 10, 100)      # runs on the Rust engine
+r.steadyState()
+print(r.getScaledFluxControlCoefficientMatrix())
+```
+
+From now on, activate the environment (step 4, `source .venv/bin/activate`) whenever you want to use Nitro.
+
+**Optional:**
+- `te.turbo(False)` switches back to the original roadrunner engine for the rest of the session. So does setting the
+  environment variable `TELLURIUM_ENGINE=roadrunner`.
+- `python rrs/check.py` compares Nitro's results with roadrunner and prints timings.
+- `pip install ".[gpu]"` adds PyTorch for `te.gpu(True)`.
+- The engine is compiled for your own computer's processor (`rrs/.cargo/config.toml`, `target-cpu=native`). To
+  build a copy you can share with other machines, delete that file before step 6.
+- Tested on macOS (Apple Silicon). Linux and Windows should work, but they're untested.
 
 ## How it works
 
