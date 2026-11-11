@@ -332,6 +332,9 @@ for large models with many samples. CUDA was not benchmarked.
 - `benchmarks/` (new): `run.py` (speed/efficiency/accuracy), `tests.py` (pytest suite on all three), `sosbench/`
 - `docs/specJIT.pdf` (plain-language explainer), `docs/roadrunner-rs-spec.md` (technical spec)
 
+> **Everything below is the original sys-bio/tellurium README.** Its `pip install tellurium` instructions install
+> *regular* tellurium. To get Tellurium Nitro, follow [Install Tellurium Nitro](#install-tellurium-nitro-step-by-step) above.
+
 ---
 
 <h1><img title="tellurium logo" src="./docs/images/tellurium_logo.png" height="50" />&nbsp;&nbsp;tellurium</h1>
