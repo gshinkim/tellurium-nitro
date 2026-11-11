@@ -8,7 +8,8 @@ GPU-accelerated, parallel metabolic control analysis over many parameter sets.
     res['fcc'].shape                   # (10000, nReactions, nReactions)
 
 How the work is split:
-  * steady states + unscaled elasticities: roadrunner, in parallel CPU worker processes
+  * steady states + unscaled elasticities: the Rust engine ``roadrunner_rs`` (rrs/) on all
+    cores when it is built and supports the model, else roadrunner in parallel worker processes
   * C = -L (N_R E L)^-1 N_R,  F = I + E C,  and scaling: one batched solve on the GPU
 
 Scripts (not notebooks) that use more than one process need the usual
@@ -67,17 +68,18 @@ def getGPU():
 _rr = None
 
 
-def _init_worker(sbml, cma):
+def _init_worker(sbml):
     global _rr
-    import roadrunner
-    _rr = roadrunner.RoadRunner(sbml)
-    _rr.conservedMoietyAnalysis = cma
+    from roadrunner.roadrunner import RoadRunner  # plain libroadrunner, not tellurium's Rust-backed subclass
+    _rr = RoadRunner(sbml)
+    # always on: with it off, every steadyState() rebuilds + re-JITs the model twice (2.4x slower)
+    _rr.conservedMoietyAnalysis = True
 
 
 def _sample(params):
     _rr.resetAll()
     for k, v in params.items():
-        _rr[k] = v
+        _rr[k] = float(v)  # numpy ints are rejected by roadrunner
     try:
         _rr.steadyState()
         return (np.array(_rr.getUnscaledElasticityMatrix()),
@@ -115,8 +117,8 @@ def controlCoefficients(r, samples=None, processes=None):
     :param samples: parameter sets to evaluate. Either a dict of equal-length
         sequences ``{'k1': [...], 'k2': [...]}`` (zipped, not a grid), a list of
         dicts, or a pandas DataFrame. None evaluates the model's current values once.
-    :param processes: CPU worker processes for the steady states.
-        Default: all cores when there are 64+ samples, else 1.
+    :param processes: CPU threads (Rust engine) or worker processes (roadrunner fallback)
+        for the steady states. Default: all cores (Rust); roadrunner: all cores at 64+ samples, else 1.
     :returns: dict of numpy arrays, first axis = sample:
         ``ccc``/``fcc``/``elasticities`` (scaled), ``uccc``/``ufcc`` (unscaled),
         plus ``species``, ``reactions`` id lists and ``ok`` (False where no
@@ -134,14 +136,51 @@ def controlCoefficients(r, samples=None, processes=None):
     samples = list(samples)
     n = len(samples)
 
-    sbml, cma = r.getCurrentSBML(), r.conservedMoietyAnalysis
+    keys = list(samples[0]) if n else []
+    m = None
+    if all(list(p) == keys for p in samples):
+        try:
+            from .rrs_bridge import from_roadrunner
+            m = from_roadrunner(r)
+        except ImportError:
+            pass  # roadrunner_rs not built: roadrunner path
+        except NotImplementedError as e:
+            warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
+    if m is None:
+        return _cc_roadrunner(r, samples, processes)
+
+    # Rust engine: steady states + exact elasticities on all cores, no worker processes
+    vals = np.array([[float(p[k]) for k in keys] for p in samples]).reshape(n, len(keys))
+    # ponytail: GPU ignored here; the per-sample algebra is ~5 us on CPU, a GPU copy costs more
+    try:
+        res = m.mca_batch(keys, vals, threads=processes)
+    except ValueError:  # rate rules (or unknown key: roadrunner then raises its own error)
+        return _cc_roadrunner(r, samples, processes)
+    out = [res[k] for k in _KEYS]
+    ok = res['ok']
+    bad = np.flatnonzero(~ok)
+    if bad.size:  # retry Rust failures with roadrunner's solvers
+        rr = _cc_roadrunner(r, [samples[i] for i in bad], processes)
+        for dst, k in zip(out, _KEYS):
+            dst[bad] = rr[k]
+        ok = ok.copy()
+        ok[bad] = rr['ok']
+    return dict(zip(_KEYS, out), species=list(m.species), reactions=list(m.reactions), ok=ok)
+
+
+_KEYS = ('ccc', 'fcc', 'elasticities', 'uccc', 'ufcc')
+
+
+def _cc_roadrunner(r, samples, processes):
+    n = len(samples)
+    sbml = r.getCurrentSBML()
     # ponytail: process pool only pays off once per-worker model compile (~0.1-0.5 s) is amortized
     processes = processes or (os.cpu_count() if n >= 64 else 1)
-    _init_worker(sbml, cma)  # local copy: serial runs + structural matrices below
+    _init_worker(sbml)  # local copy: serial runs + structural matrices below
     res = None
     if processes > 1:
         try:
-            with ProcessPoolExecutor(processes, initializer=_init_worker, initargs=(sbml, cma)) as ex:
+            with ProcessPoolExecutor(processes, initializer=_init_worker, initargs=(sbml,)) as ex:
                 res = list(ex.map(_sample, samples, chunksize=max(1, n // (4 * processes))))
         except BrokenProcessPool:
             warnings.warn("te.controlCoefficients: worker processes failed to start (a script needs an "
@@ -150,8 +189,10 @@ def controlCoefficients(r, samples=None, processes=None):
         res = [_sample(p) for p in samples]
 
     # Structure is parameter independent: take it once. Align link-matrix rows to elasticity columns.
+    # Moiety analysis reorders species; report them in the model's own order.
     Em = _rr.getUnscaledElasticityMatrix()
-    species, reactions = list(Em.colnames), list(Em.rownames)
+    species, reactions = list(r.model.getFloatingSpeciesIds()), list(Em.rownames)
+    col = [list(Em.colnames).index(s) for s in species]
     Lm = _rr.getLinkMatrix()
     L = np.array(Lm)[[list(Lm.rownames).index(s) for s in species]]
     NR = np.array(_rr.getReducedStoichiometryMatrix())
@@ -163,8 +204,8 @@ def controlCoefficients(r, samples=None, processes=None):
     if ok.any():
         good = [x for x in res if x is not None]
         E, v, S = (np.stack(a) for a in zip(*good))
+        E, S = E[:, :, col], S[:, col]
         for dst, src in zip(out, _mca(NR, L, E, v, S)):
             dst[ok] = src
 
-    return dict(zip(('ccc', 'fcc', 'elasticities', 'uccc', 'ufcc'), out),
-                species=species, reactions=reactions, ok=ok)
+    return dict(zip(_KEYS, out), species=species, reactions=reactions, ok=ok)

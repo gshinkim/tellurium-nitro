@@ -1,10 +1,149 @@
-# Tellurium Turbo <img width="50" height="50" alt="image" src="https://github.com/user-attachments/assets/5f0099d5-27bd-4d8f-b6da-2039999c0911" />
+# Tellurium Nitro
 
+A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) in which roadrunner's compute engine is
+rewritten in Rust: steady states, time courses, events, rules, control analysis (MCA), sensitivities and
+Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and batches run on every CPU core.
+**Your tellurium code does not change**: `te.loada(...)`, `r.simulate()`, `r.steadyState()`,
+`r.getScaledFluxControlCoefficientMatrix()` and the rest return the same results, faster. Anything the Rust
+engine can't do exactly the way roadrunner does goes to the original roadrunner without you doing anything.
 
-A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) that adds parallel, optionally GPU-accelerated
-metabolic control analysis. Everything else in tellurium is unchanged; the original README follows below.
+| Version | What does the math |
+|---|---|
+| Regular tellurium (PyPI 2.2.13.1, libroadrunner 2.10.0) | roadrunner (C++) |
+| [Tellurium Turbo](https://github.com/gshinkim/tellurium-turbo) | roadrunner (C++); adds batched, parallel `te.controlCoefficients` and optional GPU |
+| **Tellurium Nitro** (this repo) | Rust engine `roadrunner_rs` + JIT; roadrunner only as a fallback |
 
-## What's new
+Plain-language explainer of what changed and how it is built: [`docs/specJIT.pdf`](docs/specJIT.pdf).
+Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.md).
+
+## Benchmark: regular tellurium vs Tellurium Turbo vs Tellurium Nitro
+
+Apple M5 Pro (18 cores, 48 GB), macOS. All three versions use the same Python 3.12 and libroadrunner 2.10.0, and each
+task runs in a fresh process. Reproduce with `python benchmarks/run.py`, which writes `benchmarks/results.md` and
+`benchmarks/results.json`.
+
+- **Time** is the median wall time per call.
+- **Cores** is CPU time ÷ wall time, so it shows how many cores were busy.
+- **MB** is peak memory (RSS).
+- **Error** is the maximum deviation from a high-precision reference, relative to the output's largest value. The
+  reference is plain roadrunner at rtol 1e-12, atol 1e-14, with finite-difference step 1e-5. It shows who is
+  closer to the true answer, not only whether the versions agree.
+
+**Roadrunner's own benchmark set.** These are the `sosbench` models from the official
+[roadrunner repo](https://github.com/sys-bio/roadrunner/tree/develop/data/sosbench), each simulated with its official
+duration, steps and tolerances (`benchmarks/sosbench/`):
+
+| Task | Regular tellurium | Tellurium Turbo | Tellurium Nitro | Nitro vs regular | Nitro vs Turbo | Error (regular / Turbo / Nitro) |
+|---|---|---|---|---|---|---|
+| sos:00009 | 1.41 ms · 1.0 cores · 248 MB | 1.47 ms · 1.0 cores · 249 MB | 0.701 ms · 1.0 cores · 256 MB | **2.01x** | **2.09x** | 2e-11 / 2e-11 / 2e-11 |
+| sos:00014 | 1.5 ms · 1.0 cores · 284 MB | 1.37 ms · 1.0 cores · 287 MB | 0.625 ms · 1.0 cores · 327 MB | **2.4x** | **2.19x** | 5e-06 / 5e-06 / 6e-06 |
+| sos:00022 | 5.32 ms · 1.0 cores · 248 MB | 5.31 ms · 1.0 cores · 248 MB | 2.79 ms · 1.0 cores · 255 MB | **1.9x** | **1.9x** | 2e-05 / 2e-05 / 3e-05 |
+| sos:00033 | 0.885 ms · 1.0 cores · 250 MB | 0.888 ms · 1.0 cores · 250 MB | 0.402 ms · 1.0 cores · 258 MB | **2.2x** | **2.21x** | 2e-09 / 2e-09 / 3e-10 |
+| sos:10000¹ | — | — | 110 ms · 1.0 cores · 260 MB | — | — | — / — / 1e-08 |
+| sos:10001 | 0.0219 ms · 1.0 cores · 247 MB | 0.0216 ms · 1.0 cores · 248 MB | 0.0176 ms · 1.0 cores · 254 MB | **1.24x** | **1.23x** | 9e-06 / 9e-06 / 3e-05 |
+| sos:repressilator¹ | — | — | 110 ms · 1.0 cores · 260 MB | — | — | — / — / 1e-08 |
+
+¹ Regular tellurium and Turbo fail on `10000` and `repressilator` with `CV_TOO_MUCH_WORK: The solver took mxstep (20000)
+internal steps`. Nitro finishes them. A blow-up at atol 1e-4 makes it retry once with a tighter atol, and the
+result matches the high-precision reference to 1e-8.
+
+**The Tellurium Turbo benchmark (40-species model).** The model is from Turbo: a 40-species chain with saturating
+side branches.
+
+| Task | Regular tellurium | Tellurium Turbo | Tellurium Nitro | Nitro vs regular | Nitro vs Turbo | Error (regular / Turbo / Nitro) |
+|---|---|---|---|---|---|---|
+| ss | 244 ms · 1.0 cores · 265 MB | 243 ms · 1.0 cores · 266 MB | 0.055 ms · 1.0 cores · 268 MB | **4.43e+03x** | **4.43e+03x** | 0e+00 / 0e+00 / 2e-15 |
+| fcc | 590 ms · 1.0 cores · 266 MB | 581 ms · 1.0 cores · 265 MB | 0.049 ms · 1.0 cores · 268 MB | **1.2e+04x** | **1.19e+04x** | 4e-08 / 4e-08 / 1e-11 |
+| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.342 ms · 1.0 cores · 269 MB | **3.32x** | **3.35x** | 3e-07 / 3e-07 / 5e-08 |
+| sens | 9.31 s · 1.0 cores · 274 MB | 9.17 s · 1.0 cores · 275 MB | 22.1 ms · 15.3 cores · 298 MB | **422x** | **415x** | — / 0e+00* / 5e-07* |
+| cc200 | 251 s · 1.0 cores · 267 MB | 8.2 s · 15.8 cores · 323 MB | 90.9 ms · 1.1 cores · 293 MB | **2.76e+03x** | **90.2x** | 4e-08 / 4e-08 / 3e-11 |
+
+- `ss` = `r.resetAll(); r.steadyState()`
+- `fcc` = `r.getScaledFluxControlCoefficientMatrix()`
+- `sim` = `r.resetAll(); r.simulate(0, 100, 1001)`
+- `sens` = `r.timeSeriesSensitivities(0, 50, 101)` (86 parameters)
+- `cc200` = scaled flux and concentration control coefficients for 200 parameter sets: `te.controlCoefficients` in
+  Turbo and Nitro, a `steadyState` + getters loop in regular tellurium (timed on 20 sets, ×10).
+
+\* There is no high-precision reference for `sens`, because roadrunner sensitivities at tight tolerance take
+more than 15 minutes. That row shows agreement with regular tellurium instead.
+
+**Accuracy in short.** Nitro's control coefficients are more accurate than roadrunner's (1e-11 vs 4e-8), because
+it differentiates exactly instead of using finite differences. Time courses are within roadrunner's own error
+range at the same tolerances.
+
+**Tellurium's own test suite.** The same upstream sys-bio/tellurium pytest suite (385 tests) runs against each
+install with `python benchmarks/tests.py <upstream checkout>`:
+
+| Engine | Wall time | Passed | Failed | Skipped |
+|---|---|---|---|---|
+| regular | 191.9 s | 363 | 14 | 8 |
+| turbo | 191.5 s | 363 | 14 | 8 |
+| nitro | 187.7 s | 363 | 14 | 8 |
+
+All three give identical outcomes; no test differs from regular tellurium. The 14 failures also happen in the
+official release, so they are upstream issues. Wall time is about the same for all three because the suite is
+mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation. The speed difference shows in the
+compute benchmarks above.
+
+## Install
+
+```bash
+pip install tellurium                       # dependencies (libroadrunner, antimony, ...)
+git clone https://github.com/gshinkim/tellurium-nitro && cd tellurium-nitro
+pip install -e .
+brew install rust && pip install maturin    # or rustup (Linux/Windows) + pip install maturin
+cd rrs && maturin develop --release         # builds the Rust engine into the active venv
+python check.py                             # correctness vs roadrunner + timings
+```
+
+`rrs/.cargo/config.toml` builds for the local CPU (`target-cpu=native`); delete it to build a portable binary.
+Without the Rust engine, Nitro behaves exactly like Tellurium Turbo. `te.turbo(False)` (or env
+`TELLURIUM_ENGINE=roadrunner`) switches back to roadrunner globally. Only tested on macOS (Apple Silicon) so far.
+
+## How it works
+
+- **Rust engine** (`rrs/`, Python module `roadrunner_rs`):
+  - Rate laws become a flat tape with exact symbolic derivatives (Jacobians, elasticities, parameter derivatives).
+  - The tape is JIT-compiled to native code with Cranelift after 2000 evaluations, so short one-shot runs don't pay
+    the compile cost. The JIT output is bit-identical to the interpreter.
+  - **Steady state:** Newton with conservation laws.
+  - **Time courses:** Rodas4 at default accuracy, and variable-order BDF with CVODE-style step and Newton control for
+    tight tolerances. Both use a sparse LU with fill-reducing ordering.
+  - **Events:** delay, priority, persistence, `useValuesFromTriggerTime` and `initialValue=false`. Pending events
+    carry across `simulate` calls.
+  - **Rules:** rate and assignment rules.
+  - **SBML features:** variable compartments, conversion factors, variable stoichiometry, function definitions,
+    `avogadro` and `rateOf`.
+  - **MCA:** closed form, `C = -L (N_R E L)^-1 N_R` and `F = I + E C`.
+  - **Sensitivities:** forward, one parameter per core.
+  - **Gillespie SSA.**
+- **Bridge** (`tellurium/analysis/rrs_bridge.py`): reads the model roadrunner loaded and builds the Rust model.
+- **Facade** (`tellurium/roadrunner/extended_roadrunner.py`): for each call, it decides between Rust and roadrunner
+  and keeps the roadrunner object in sync, so selections, getters and plotting keep working.
+- **What Rust handles:**
+  - `simulate`, including the gillespie integrator and `oneStep`
+  - `steadyState` and its variants
+  - every elasticity, control-coefficient, Jacobian and eigenvalue matrix, `getCC` and `getuCC`
+  - `timeSeriesSensitivities` (k = 0, 1)
+  - `te.controlCoefficients`
+- **Still on roadrunner, and why:**
+  - **Model loading, validation and export:** done once, and already fast.
+  - **Scalar getters** (~1 µs in C++): the call into Rust would cost more than it saves.
+  - **Structural matrices** (stoichiometry, link, conservation): computed once by libstruct, so the choice of
+    independent species stays consistent.
+  - **`getFrequencyResponse`:** no reference to verify a Rust version against.
+  - **`k ≥ 2` sensitivities.**
+  - **SBML `distrib` random functions.**
+  - **Delay equations, algebraic rules and fast reactions:** roadrunner 2.10 refuses to load these models.
+- **Known differences from roadrunner:**
+  - Roadrunner carries sensitivity state into the next `timeSeriesSensitivities` call, even after `reset()`.
+    Nitro starts each call fresh.
+  - Roadrunner ignores event changes inside sensitivities.
+  - Roadrunner returns uninitialised values from `getDependentRatesOfChange` when moiety analysis is on.
+  - Nitro gives the correct values in all three cases. The tests document each one.
+
+## From Tellurium Turbo: batched control coefficients and GPU
 
 ### Quick start: using the GPU
 
@@ -59,7 +198,7 @@ res['species'], res['reactions'], res['ok']   # ids, and False where no steady s
   Apple MPS only supports float32, so results there agree to ~1e-5.
 - GPU support needs PyTorch: `pip install -e ".[gpu]"`. Without it `te.gpu` warns and stays on CPU.
 
-## Benchmark report
+### Turbo benchmark report (roadrunner path, before the Rust engine)
 
 Apple Silicon Mac, wall clock. Task: scaled flux + concentration control coefficients for every parameter set.
 
@@ -91,14 +230,19 @@ algorithm (steady state + elasticities once, instead of roadrunner's per-call MC
 The GPU only accelerates the matrix algebra: it slightly *slows down* small models (transfer overhead) and helps
 for large models with many samples. CUDA was not benchmarked.
 
-## Changed files
+## Changed files (vs sys-bio/tellurium)
 
-- `tellurium/analysis/gpu.py` (new): `gpu()`, `getGPU()`, `controlCoefficients()`
-- `tellurium/__init__.py`: exports `te.gpu`, `te.getGPU`, `te.controlCoefficients`
-- `tellurium/tests/test_gpu.py` (new): checks results against roadrunner for CPU serial, CPU multi-process and GPU
-- `tellurium/visualization/sbmldiagram.py`: removed the Python 2 `six` import that made `import tellurium` fail
-  when `six` isn't installed
-- `setup.py`: new optional extra `gpu` (`torch>=2.0`)
+- `rrs/` (new): Rust engine `roadrunner_rs` (`src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT,
+  `src/model.rs` solvers/integrators/events/SSA/MCA, `src/sens.rs` sensitivities, `src/py.rs` bindings, `check.py`)
+- `tellurium/analysis/rrs_bridge.py` (new): roadrunner model -> Rust model
+- `tellurium/roadrunner/extended_roadrunner.py`: facade routing roadrunner calls to Rust, `te.turbo()`
+- `tellurium/analysis/gpu.py` (new): `te.gpu()`, `te.getGPU()`, `te.controlCoefficients()` (Rust first)
+- `tellurium/__init__.py`: exports `te.turbo`, `te.gpu`, `te.getGPU`, `te.controlCoefficients`
+- `tellurium/tests/test_turbo.py`, `tellurium/tests/test_gpu.py` (new): Rust / batched results vs plain roadrunner
+- `tellurium/visualization/sbmldiagram.py`: removed the Python 2 `six` import
+- `setup.py`: optional extra `gpu` (`torch>=2.0`)
+- `benchmarks/` (new): `run.py` (speed/efficiency/accuracy), `tests.py` (pytest suite on all three), `sosbench/`
+- `docs/specJIT.pdf` (plain-language explainer), `docs/roadrunner-rs-spec.md` (technical spec)
 
 ---
 

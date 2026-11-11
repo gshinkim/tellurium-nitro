@@ -1,0 +1,27 @@
+[package]
+name = "roadrunner_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "roadrunner_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"], optional = true }
+numpy = { version = "0.30", optional = true }
+rayon = "1.12"
+cranelift-codegen = "0.137"
+cranelift-frontend = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-native = "0.137"
+
+[features]
+default = []
+python = ["dep:pyo3", "dep:numpy"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
