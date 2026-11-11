@@ -50,6 +50,16 @@ class TestControlCoefficients(unittest.TestCase):
         finally:
             te.gpu(False)
 
+    def test_roadrunner_fallback(self):
+        # without the Rust engine (roadrunner_rs) te.controlCoefficients uses roadrunner
+        import sys
+        from unittest import mock
+        te.gpu(False)
+        with mock.patch.dict(sys.modules, {'roadrunner_rs': None}):
+            res = te.controlCoefficients(self.r, {'k1': self.k1})
+        self.assertEqual(res['species'], list(self.r.getFloatingSpeciesIds()))
+        self.check(res, 1e-8)
+
     def test_gpu_off_strings(self):
         self.assertEqual(te.gpu("false"), 'cpu')
         self.assertEqual(te.getGPU(), 'cpu')

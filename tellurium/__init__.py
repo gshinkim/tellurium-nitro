@@ -113,6 +113,9 @@ from .analysis.sensitivityanalysis import SensitivityAnalysis
 # GPU / parallel metabolic control analysis
 from .analysis.gpu import gpu, getGPU, controlCoefficients
 
+# Rust engine (roadrunner_rs) behind simulate/steadyState/MCA, falls back to roadrunner
+from .roadrunner.extended_roadrunner import turbo
+
 from .tellurium import (
     distributed_parameter_scanning, sample_plot, plotImage,
     distributed_stochastic_simulation, plot_distributed_stochastic, plot_stochastic_result, distributed_sensitivity_analysis

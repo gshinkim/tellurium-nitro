@@ -72,3 +72,8 @@ tellurium/tests/testdata/sedml/sed-ml/results/
 
 # Mac .DS_store
 .DS_Store
+
+# Tellurium Nitro
+rrs/target/
+graphify-out/
+benchmarks/run.log
