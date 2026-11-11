@@ -68,6 +68,35 @@ side branches.
 \* There is no high-precision reference for `sens`, because roadrunner sensitivities at tight tolerance take
 more than 15 minutes. That row shows agreement with regular tellurium instead.
 
+### Why is Nitro 2x faster in one table and thousands of times faster in the other?
+
+The two tables measure different kinds of work.
+
+**The first table (roadrunner's own benchmark) only plays the model forward in time**: "start here, show me what
+happens over the next 100 seconds." Think of driving from A to B. Roadrunner was already a good driver on that trip:
+it uses a top-quality solver (CVODE) and turns each model into fast machine code. Nitro drives the same road the
+same way, just with a lighter car: leaner code, fewer wasted steps per move, less overhead. When both do the same
+job and the old one was already efficient, the best you can do is around 2x.
+
+**The big numbers in the second table come from questions where roadrunner takes a very long detour:**
+
+- **"Where does the system settle?" (steady state).** Roadrunner can rebuild its whole copy of the model, sometimes
+  twice, every time you ask. It's like rebuilding the kitchen every time you cook dinner. Nitro builds it once and
+  reuses it.
+- **"Which reaction is really in control?" (control coefficients).** Roadrunner answers by trial and error: nudge each
+  number a tiny bit, re-solve the whole model, see what moved, and repeat for every number. That's about 170,000
+  extra re-runs on this model, and the answers come out slightly fuzzy. Nitro works the answer out exactly with
+  algebra, the way you'd take a derivative in calculus class, then solves it in one step.
+- **"How sensitive is the result to each setting?" (sensitivities).** Roadrunner checks the 86 settings one at a time
+  on a single processor core. Nitro uses exact math and checks them side by side on all 18 cores.
+
+So the two tables aren't in conflict:
+
+- **Same work, done better:** about 2-3x faster. That's the first table, plus the `sim` row in the second.
+- **A smarter route that skips almost all the work:** 400 to 12,000x faster. That's steady state, control
+  coefficients and sensitivities. Because Nitro computes these exactly instead of by trial and error, the answers
+  are also more accurate.
+
 **Accuracy in short.** Nitro's control coefficients are more accurate than roadrunner's (1e-11 vs 4e-8), because
 it differentiates exactly instead of using finite differences. Time courses are within roadrunner's own error
 range at the same tolerances.
