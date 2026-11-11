@@ -23,7 +23,7 @@ if __name__ == '__main__':
     TASKS = [f'sos:{c}' for c in CASES] + ['ss', 'fcc', 'sim', 'sens', 'cc200']
 
     NOREF = {'sens'}  # tight-tolerance roadrunner sensitivities take >15 min
-    TASKS = sys.argv[1:] or TASKS  # rerun selected tasks; others are kept from results.json
+    TASKS = [] if sys.argv[1:] == ['--table'] else (sys.argv[1:] or TASKS)  # rerun selected tasks; others are kept from results.json
     OUT = os.path.join(HERE, 'results.json')
     res, tmp = (json.load(open(OUT)) if sys.argv[1:] else {}), tempfile.mkdtemp()
     for task in TASKS:
@@ -62,7 +62,7 @@ if __name__ == '__main__':
     for task, r in res.items():
         g, t, n = (r.get(e) for e in ENGINES)
         cell = lambda x: '—' if x is None else f"{fmt(x['s'])} · {x['cores']:.1f} cores · {x['rss_mb']:.0f} MB"
-        sp = lambda a, b: '—' if a is None or b is None else f"**{a['s'] / b['s']:.3g}x**"
+        sp = lambda a, b: '—' if a is None or b is None else f"**{a['s'] / b['s']:,.0f}x**" if a['s'] / b['s'] >= 10 else f"**{a['s'] / b['s']:.1f}x**"
         err = ' / '.join('—' if x is None or x.get('err') is None else f"{x['err']:.0e}" + ('*' if x.get('vs_regular') else '') for x in (g, t, n))
         rows.append(f'| {task} | {cell(g)} | {cell(t)} | {cell(n)} | {sp(g, n)} | {sp(t, n)} | {err} |')
     open(os.path.join(HERE, 'results.md'), 'w').write('\n'.join(rows) + '\n')
