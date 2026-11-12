@@ -536,7 +536,7 @@ def loadAntimonyModel(ant):
     :rtype: roadrunner.ExtendedRoadRunner
     """
     sbml = antimonyToSBML(ant)
-    return roadrunner.RoadRunner(sbml)
+    return ExtendedRoadRunner._lazy(sbml)
 
 
 def loads(ant):
@@ -560,7 +560,7 @@ def loadSBMLModel(sbml):
     :returns: RoadRunner instance with model loaded
     :rtype: roadrunner.ExtendedRoadRunner
     """
-    return roadrunner.RoadRunner(sbml)
+    return ExtendedRoadRunner._lazy(sbml)
 
 
 def loadCellMLModel(cellml):

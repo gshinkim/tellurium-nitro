@@ -35,13 +35,13 @@ duration, steps and tolerances (`benchmarks/sosbench/`):
 
 | Task | Regular tellurium | Tellurium Turbo | Tellurium Nitro | Nitro vs regular | Nitro vs Turbo | Error (regular / Turbo / Nitro) |
 |---|---|---|---|---|---|---|
-| sos:00009 | 1.41 ms · 1.0 cores · 248 MB | 1.47 ms · 1.0 cores · 249 MB | 0.701 ms · 1.0 cores · 256 MB | **2.0x** | **2.1x** | 2e-11 / 2e-11 / 2e-11 |
-| sos:00014 | 1.5 ms · 1.0 cores · 284 MB | 1.37 ms · 1.0 cores · 287 MB | 0.625 ms · 1.0 cores · 327 MB | **2.4x** | **2.2x** | 5e-06 / 5e-06 / 6e-06 |
-| sos:00022 | 5.32 ms · 1.0 cores · 248 MB | 5.31 ms · 1.0 cores · 248 MB | 2.79 ms · 1.0 cores · 255 MB | **1.9x** | **1.9x** | 2e-05 / 2e-05 / 3e-05 |
-| sos:00033 | 0.885 ms · 1.0 cores · 250 MB | 0.888 ms · 1.0 cores · 250 MB | 0.402 ms · 1.0 cores · 258 MB | **2.2x** | **2.2x** | 2e-09 / 2e-09 / 3e-10 |
-| sos:10000¹ | — | — | 110 ms · 1.0 cores · 260 MB | — | — | — / — / 1e-08 |
-| sos:10001 | 0.0219 ms · 1.0 cores · 247 MB | 0.0216 ms · 1.0 cores · 248 MB | 0.0176 ms · 1.0 cores · 254 MB | **1.2x** | **1.2x** | 9e-06 / 9e-06 / 3e-05 |
-| sos:repressilator¹ | — | — | 110 ms · 1.0 cores · 260 MB | — | — | — / — / 1e-08 |
+| sos:00009 | 1.41 ms · 1.0 cores · 248 MB | 1.47 ms · 1.0 cores · 249 MB | 0.704 ms · 1.0 cores · 243 MB | **2.0x** | **2.1x** | 2e-11 / 2e-11 / 2e-11 |
+| sos:00014 | 1.5 ms · 1.0 cores · 284 MB | 1.37 ms · 1.0 cores · 287 MB | 0.624 ms · 1.0 cores · 253 MB | **2.4x** | **2.2x** | 5e-06 / 5e-06 / 6e-06 |
+| sos:00022 | 5.32 ms · 1.0 cores · 248 MB | 5.31 ms · 1.0 cores · 248 MB | 2.77 ms · 1.0 cores · 243 MB | **1.9x** | **1.9x** | 2e-05 / 2e-05 / 3e-05 |
+| sos:00033 | 0.885 ms · 1.0 cores · 250 MB | 0.888 ms · 1.0 cores · 250 MB | 0.404 ms · 1.0 cores · 243 MB | **2.2x** | **2.2x** | 2e-09 / 2e-09 / 3e-10 |
+| sos:10000¹ | — | — | 109 ms · 1.0 cores · 253 MB | — | — | — / — / 1e-08 |
+| sos:10001 | 0.0219 ms · 1.0 cores · 247 MB | 0.0216 ms · 1.0 cores · 248 MB | 0.0152 ms · 1.0 cores · 242 MB | **1.4x** | **1.4x** | 9e-06 / 9e-06 / 3e-05 |
+| sos:repressilator¹ | — | — | 111 ms · 1.0 cores · 253 MB | — | — | — / — / 1e-08 |
 
 ¹ Regular tellurium and Turbo fail on `10000` and `repressilator` with `CV_TOO_MUCH_WORK: The solver took mxstep (20000)
 internal steps`. Nitro finishes them. A blow-up at atol 1e-4 makes it retry once with a tighter atol, and the
@@ -52,18 +52,24 @@ side branches.
 
 | Task | Regular tellurium | Tellurium Turbo | Tellurium Nitro | Nitro vs regular | Nitro vs Turbo | Error (regular / Turbo / Nitro) |
 |---|---|---|---|---|---|---|
-| ss | 244 ms · 1.0 cores · 265 MB | 243 ms · 1.0 cores · 266 MB | 0.055 ms · 1.0 cores · 268 MB | **4,433x** | **4,426x** | 0e+00 / 0e+00 / 2e-15 |
-| fcc | 590 ms · 1.0 cores · 266 MB | 581 ms · 1.0 cores · 265 MB | 0.049 ms · 1.0 cores · 268 MB | **12,050x** | **11,859x** | 4e-08 / 4e-08 / 1e-11 |
-| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.342 ms · 1.0 cores · 269 MB | **3.3x** | **3.3x** | 3e-07 / 3e-07 / 5e-08 |
-| sens | 9.31 s · 1.0 cores · 274 MB | 9.17 s · 1.0 cores · 275 MB | 22.1 ms · 15.3 cores · 298 MB | **422x** | **415x** | — / 0e+00* / 5e-07* |
-| cc200 | 251 s · 1.0 cores · 267 MB | 8.2 s · 15.8 cores · 323 MB | 90.9 ms · 1.1 cores · 293 MB | **2,755x** | **90x** | 4e-08 / 4e-08 / 3e-11 |
+| ss | 244 ms · 1.0 cores · 265 MB | 243 ms · 1.0 cores · 266 MB | 0.0475 ms · 1.0 cores · 252 MB | **5,133x** | **5,125x** | 0e+00 / 0e+00 / 2e-15 |
+| fcc | 590 ms · 1.0 cores · 266 MB | 581 ms · 1.0 cores · 265 MB | 0.0394 ms · 1.0 cores · 252 MB | **14,979x** | **14,742x** | 4e-08 / 4e-08 / 1e-11 |
+| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.339 ms · 1.0 cores · 252 MB | **3.4x** | **3.4x** | 3e-07 / 3e-07 / 5e-08 |
+| sens | 9.31 s · 1.0 cores · 274 MB | 9.17 s · 1.0 cores · 275 MB | 22.2 ms · 15.5 cores · 281 MB | **419x** | **413x** | — / 0e+00* / 5e-07* |
+| cc200 | 251 s · 1.0 cores · 267 MB | 8.2 s · 15.8 cores · 323 MB | 13.8 ms · 1.5 cores · 278 MB | **18,165x** | **595x** | 4e-08 / 4e-08 / 3e-11 |
+| load² | — | — | 281 ms · 1.0 cores · 617 MB | — | — | — / — / — |
 
 - `ss` = `r.resetAll(); r.steadyState()`
 - `fcc` = `r.getScaledFluxControlCoefficientMatrix()`
 - `sim` = `r.resetAll(); r.simulate(0, 100, 1001)`
 - `sens` = `r.timeSeriesSensitivities(0, 50, 101)` (86 parameters)
+- `load` = `te.loadSBMLModel` of a 1000-reaction model + first `simulate` + `steadyState`
 - `cc200` = scaled flux and concentration control coefficients for 200 parameter sets: `te.controlCoefficients` in
   Turbo and Nitro, a `steadyState` + getters loop in regular tellurium (timed on 20 sets, ×10).
+
+² `load` was run for Nitro only. Nitro now builds the model straight from SBML and doesn't compile it in
+roadrunner. Before that change the same task took 13.4 s, and roadrunner's load alone takes about 10–11 s at
+1000 reactions, so regular tellurium needs at least that.
 
 \* There is no high-precision reference for `sens`, because roadrunner sensitivities at tight tolerance take
 more than 15 minutes. That row shows agreement with regular tellurium instead.
@@ -206,7 +212,19 @@ From now on, activate the environment (step 4, `source .venv/bin/activate`) when
   - **MCA:** closed form, `C = -L (N_R E L)^-1 N_R` and `F = I + E C`.
   - **Sensitivities:** forward, one parameter per core.
   - **Gillespie SSA.**
-- **Bridge** (`tellurium/analysis/rrs_bridge.py`): reads the model roadrunner loaded and builds the Rust model.
+- **Bridge** (`tellurium/analysis/rrs_bridge.py`): builds the Rust model straight from the SBML (libsbml). No
+  roadrunner compile is needed.
+- **Lazy roadrunner:** `te.loada` and `te.loadSBMLModel` no longer compile the model in roadrunner, which used to take
+  about 10 s at 1000 reactions.
+  - **Served by Nitro without loading roadrunner:**
+    - `simulate`, `steadyState`, MCA, sensitivities and gillespie
+    - values, reset, selections and ids
+    - `getCurrentSBML` and `getAntimony`
+  - **Loads roadrunner once, keeping the current state:**
+    - link and conservation matrices, and `conservedMoietyAnalysis = True`
+    - model edits (`addReaction`, etc.)
+    - integrators other than cvode or gillespie
+    - anything else Nitro doesn't serve
 - **Facade** (`tellurium/roadrunner/extended_roadrunner.py`): for each call, it decides between Rust and roadrunner
   and keeps the roadrunner object in sync, so selections, getters and plotting keep working.
 - **What Rust handles:**
