@@ -2,7 +2,8 @@
 
     python benchmarks/bench.py <task> <out.npz>
 
-Tasks: sos:<case> (roadrunner's sosbench, see sosbench/), ss, fcc, sim, sens, cc200 (40-species model).
+Tasks: sos:<case> (roadrunner's sosbench, see sosbench/), ss, fcc, sim, sens, cc200 (40-species model),
+load (load a 1000-reaction model + first simulate + steadyState).
 Reports median wall time per call, CPU time / wall time (cores busy) and peak RSS (this process + children).
 Run all three engines with benchmarks/run.py.
 """
@@ -105,6 +106,13 @@ def task(name):
         def run():
             r.resetAll()
             return np.array(r.timeSeriesSensitivities(0, 50, 101)[1])
+    elif name == 'load':  # load a 1000-reaction model and run a first simulate + steadyState
+        sb = te.antimonyToSBML(chain(1000))
+
+        def run():
+            m = te.loadSBMLModel(sb)
+            return np.concatenate([np.array(m.simulate(0, 100, 101))[-1], [m.steadyState()]])
+        return run, {}
     elif name == 'cc200':
         ks = np.linspace(0.5, 3, 200)
         if hasattr(te, 'controlCoefficients') and not REF:
@@ -128,7 +136,7 @@ def task(name):
 if __name__ == '__main__':
     name, out = sys.argv[1], sys.argv[2]
     run, extra = task(name)
-    slow = REF or name in ('cc200', 'sens')
+    slow = REF or name in ('cc200', 'sens', 'load')
     t, ratio, reps, y = timed(run, budget=0 if slow else 2.0, minrep=1 if slow else 3)
     t *= extra.get('scale', 1)
     np.savez(out, y=np.asarray(y, dtype=float))

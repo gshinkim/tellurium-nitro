@@ -77,3 +77,4 @@ tellurium/tests/testdata/sedml/sed-ml/results/
 rrs/target/
 graphify-out/
 benchmarks/run.log
+benchmarks/ref/

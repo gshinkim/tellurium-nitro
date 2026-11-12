@@ -310,6 +310,25 @@ impl PyModel {
         Ok(if cont { (y, d, es).into_pyobject(py)?.into_any() } else { (y, d).into_pyobject(py)?.into_any() })
     }
 
+    /// Outputs (all, in output_ids order, or `outputs`) at the keyed state and `time`, without integrating.
+    #[pyo3(signature = (keys, values, time=0.0, outputs=None))]
+    fn outputs_at<'py>(&self, py: Python<'py>, keys: Bound<'py, PyAny>, values: Vec<f64>, time: f64,
+                       outputs: Option<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let m = &self.m;
+        let keys = keys_of(m, &keys)?;
+        if values.len() != keys.len() { return Err(verr("values and keys differ in length".into())); }
+        let outs = match outputs {
+            Some(o) => match o.cast::<Resolved>() { Ok(r) => r.get().outs.clone(), Err(_) => self.outs(Some(o.extract()?))? },
+            None => m.outputs.iter().map(|o| o.1).collect(),
+        };
+        let mut w = self.pool.lock().unwrap().pop().unwrap_or_else(|| m.work());
+        let mut row = vec![0.0; outs.len()];
+        m.load(&mut w, &keys, &values);
+        m.record(&mut w, time, &outs, &mut row);
+        self.pool.lock().unwrap().push(w);
+        Ok(PyArray1::from_vec(py, row).into_any())
+    }
+
     /// (n, len(times), len(outputs)) Gillespie direct-method trajectories (outputs as concentrations).
     /// Sample i uses an xoshiro256++ stream seeded from seed + i (seed=None: from the clock).
     #[pyo3(signature = (keys, values, times, seed=None, threads=None, outputs=None))]

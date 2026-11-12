@@ -602,3 +602,146 @@ class TestTurboCoverage(unittest.TestCase):
             self.assertTrue(np.isfinite(out[True]).all(), case)
             if out[False] is not None:  # both within their (loose) tolerances of each other
                 np.testing.assert_allclose(out[True], out[False], rtol=1e-4, atol=300 * atol, err_msg=case)
+
+
+# ---------------------------------------------------------------------------------------------
+# Lazy loading: te.loada/loadSBMLModel build only the Rust model; roadrunner compiles on demand
+# ---------------------------------------------------------------------------------------------
+IA = '''
+compartment c = 2; S1 in c; S2 in c; S3 in c; substanceOnly species S4 in c; $B in c
+J1: S1 -> S2; k1*S1*B; J2: S2 -> S3; k1*S2; J3: S3 -> S4; k2*S3; J4: S4 -> S1; 0.1*S4
+k1 = 1; k2 = 3; S1 = 1; S2 = S1*2; S3 = k2 + S1; S4 = k2*S1; B = k2/2; p = k2*2; p' = -0.1*p; q = S2*2
+'''
+
+
+def _lazy_models():
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'benchmarks'))
+    import bench
+    out = {k: te.antimonyToSBML(v) for k, v in dict(MOIETY=MOIETY, RULES=RULES, EVENTS_RULES=EVENTS_RULES, IA=IA,
+                                                    VARS=VARS, RATE=RATE, chain=chain(12)).items()}
+    for case in ('00009', '00014', '00022', '00033', '10000', '10001', 'repressilator'):
+        d = os.path.join(bench.HERE, 'sosbench', case)
+        out[case] = open(os.path.join(d, [f for f in os.listdir(d) if f.endswith('.xml')][0])).read()
+    return out
+
+
+@unittest.skipIf(roadrunner_rs is None, "roadrunner_rs not built")
+class TestLazy(unittest.TestCase):
+    setUp, tearDown, same = TestTurbo.setUp, TestTurbo.tearDown, TestTurbo.same
+
+    def values(self, r):
+        m = r.model
+        return [list(m.getFloatingSpeciesIds()), list(m.getBoundarySpeciesIds()), list(m.getGlobalParameterIds()),
+                list(m.getCompartmentIds()), list(m.getReactionIds()), list(r.timeCourseSelections),
+                list(r.steadyStateSelections), m.getFloatingSpeciesConcentrations(), m.getFloatingSpeciesAmounts(),
+                m.getBoundarySpeciesConcentrations(), m.getBoundarySpeciesAmounts(), m.getGlobalParameterValues(),
+                m.getCompartmentVolumes(), m.getReactionRates(), [r.getValue('time')]]
+
+    def workflow(self, r, sbml):
+        """What the lazy model serves without roadrunner; r is lazy or plain roadrunner."""
+        import warnings
+        out = self.values(r) + [r.getCurrentSBML(), r.getSBML()]
+        m = r.model
+        p, s = (list(m.getGlobalParameterIds()) or ['time'])[0], m.getFloatingSpeciesIds()[0]  # rule species last
+        r.setValue(p, r.getValue(p) * 1.5)
+        r.setValue('[%s]' % s, 0.7)
+        out += self.values(r) + [r.getCurrentSBML()]
+        T = 0.5 if 'lorenz' in sbml else 5
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            out.append(r.simulate(0, T, 11))
+            sel = ['time', s, '[%s]' % s, p] + list(m.getReactionIds())[:1]
+            out += [r.simulate(T, 2 * T, 6, sel)] + self.values(r)
+        r.reset()
+        out += self.values(r)
+        r.resetAll()
+        return out + self.values(r)
+
+    def compare(self, ref, got, msg):
+        for i, (a, b) in enumerate(zip(ref, got)):
+            if isinstance(a, str) or (isinstance(a, list) and a and isinstance(a[0], str)):
+                self.assertEqual(a, b, (msg, i))
+            else:
+                self.same(a, b, rtol=2e-3, atol=1e-6, msg=(msg, i))
+
+    def test_lazy_matches_roadrunner(self):
+        import roadrunner
+        te.turbo(True)
+        base = roadrunner.roadrunner.RoadRunner
+        for name, sbml in _lazy_models().items():
+            with self.subTest(name):
+                # VARS: reset() with a variable compartment needs roadrunner (loaded from the lazy state).
+                # Compared with turbo on an eagerly loaded model: after Rust ran the events, roadrunner's
+                # reset() doesn't see their t0=false trigger state, unlike plain roadrunner.
+                ref = self.workflow(ExtendedRoadRunner(sbml) if name == 'VARS' else base(sbml), sbml)
+                if name == 'VARS':
+                    r = te.loadSBMLModel(sbml)
+                    got = self.workflow(r, sbml)
+                    self.assertNotIn('_lz', r.__dict__)
+                else:
+                    with mock.patch.object(base, 'load', _raise), mock.patch.object(base, '_load', _raise):
+                        r = te.loadSBMLModel(sbml)
+                        got = self.workflow(r, sbml)
+                        self.assertIn('_lz', r.__dict__)  # roadrunner never compiled the model
+                self.compare(ref, got, name)
+
+    def test_attributes_mca_and_load_on_demand(self):
+        import roadrunner
+        te.turbo(True)
+        for ant in (MOIETY, RULES, chain(12)):  # (roadrunner's Jacobian fails with initial assignments)
+            ref = roadrunner.roadrunner.RoadRunner(te.antimonyToSBML(ant))
+            with mock.patch.object(roadrunner.roadrunner.RoadRunner, '_load', _raise):
+                r = te.loada(ant)
+                s, p = r.getFloatingSpeciesIds()[0], r.getGlobalParameterIds()[0]
+                self.assertEqual((getattr(r, s), getattr(r, s + '_amt'), getattr(r, p), r['[%s]' % s]),
+                                 (ref['[%s]' % s], ref[s], ref[p], ref['[%s]' % s]))
+                setattr(r, p, 0.3)
+                ref.setValue(p, 0.3)
+                r.simulate(0, 20, 3)  # near the steady state: Rust's Newton solver has no presimulation
+                ref.simulate(0, 20, 3)
+                r.steadyState()
+                ref.steadyState()
+                got = [r.model.getFloatingSpeciesConcentrations(), r.getScaledConcentrationControlCoefficientMatrix(),
+                       r.getScaledFluxControlCoefficientMatrix(), r.getFullJacobian(), r.getReducedJacobian(),
+                       r.getScaledElasticityMatrix(), r.getFullStoichiometryMatrix(), [r.getCC(s, p)],
+                       r.getRatesOfChange()]
+                sens = te.loada(ant).timeSeriesSensitivities(0, 2, 5, [p])[1]
+                self.assertIn('_lz', r.__dict__)
+            want = [ref.model.getFloatingSpeciesConcentrations(), ref.getScaledConcentrationControlCoefficientMatrix(),
+                    ref.getScaledFluxControlCoefficientMatrix(), ref.getFullJacobian(), ref.getReducedJacobian(),
+                    ref.getScaledElasticityMatrix(), ref.getFullStoichiometryMatrix(), [ref.getCC(s, p)],
+                    ref.getRatesOfChange()]
+            for i, (a, b) in enumerate(zip(want, got)):
+                self.same(a, b, rtol=1e-4, atol=1e-7, msg=(ant[:20], i))
+            fresh = roadrunner.roadrunner.RoadRunner(te.antimonyToSBML(ant))
+            np.testing.assert_allclose(sens, fresh.timeSeriesSensitivities(0, 2, 5, [p])[1], rtol=1e-3, atol=1e-6)
+            # a call Nitro doesn't serve compiles the model in roadrunner, from the current state
+            ref.simulate(20, 23, 3)
+            r.simulate(20, 23, 3)
+            self.same(r.getLinkMatrix(), ref.getLinkMatrix())
+            self.assertNotIn('_lz', r.__dict__)
+            self.same(r.model.getFloatingSpeciesConcentrations(), ref.model.getFloatingSpeciesConcentrations(), rtol=1e-4)
+            self.assertEqual((r.getValue(p), r.getValue('time')), (ref.getValue(p), ref.getValue('time')))
+            self.same(r.simulate(23, 26, 7), ref.simulate(23, 26, 7), rtol=1e-4, atol=1e-7)
+
+    def test_current_sbml_round_trip_and_switch(self):
+        te.turbo(True)
+        r = te.loada(IA)
+        r.simulate(0, 3, 4)
+        r2 = te.loadSBMLModel(r.getCurrentSBML())
+        for a, b in zip(self.values(r)[:-1], self.values(r2)):  # not the time
+            if not (isinstance(a, list) and a and isinstance(a[0], str)):
+                self.same(a, b, rtol=1e-12)
+        self.assertEqual(te.loada(IA).getAntimony(), te.loada(IA)._load_rr().getAntimony())
+        te.turbo(False)
+        self.assertNotIn('_lz', te.loada(IA).__dict__)  # turbo off: eager roadrunner, as before
+        te.turbo(True)
+        r = te.loada(MOIETY)
+        r.conservedMoietyAnalysis = True  # libstruct's moieties: roadrunner
+        self.assertNotIn('_lz', r.__dict__)
+        r = te.loada(MOIETY)
+        r.addReaction('J9', ['S1'], ['S3'], 'k1*S1')  # model edits: roadrunner, Rust model rebuilt
+        self.assertNotIn('_lz', r.__dict__)
+        self.assertIn('J9', r.getReactionIds())

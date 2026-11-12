@@ -58,15 +58,7 @@ def from_roadrunner(r, info=None):
     rr = r  # read values from the loaded model: a fresh RoadRunner(sbml) is a full re-load (~10 s at 1000 reactions)
     doc = libsbml.readSBMLFromString(sbml)
     m = doc.getModel()
-    fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
     odoc = libsbml.readSBMLFromString(r.getSBML())  # getCurrentSBML() drops stoichiometryMath
-
-    rules, rate_rules = {}, {}
-    for rule in m.getListOfRules():
-        (rate_rules if rule.isRate() else rules)[rule.getVariable()] = rule.getMath()
-    targets = {ea.getVariable() for ev in m.getListOfEvents() for ea in ev.getListOfEventAssignments()}
-    changing = set(rules) | set(rate_rules) | targets
-
     if m.getNumReactions():
         Nm = rr.getFullStoichiometryMatrix()
         if sorted(Nm.colnames) != sorted(x.getId() for x in m.getListOfReactions()):
@@ -79,19 +71,43 @@ def from_roadrunner(r, info=None):
         Nm = np.zeros((len(rows), 0))
     conc = dict(zip(rr.model.getFloatingSpeciesIds(), rr.model.getFloatingSpeciesConcentrations()))
     sp = {s.getId(): s for s in m.getListOfSpecies()}
+
+    def val(x):  # value in SBML math units (species: concentration, amount if hasOnlySubstanceUnits)
+        if x in sp:
+            v = rr.getValue('[%s]' % x)
+            return v * rr.getValue(sp[x].getCompartment()) if sp[x].getHasOnlySubstanceUnits() else v
+        return rr.getValue(x)
+
+    def sref(sr, changing):
+        return rr.getValue(sr.getId()) if sr.getId() in changing else sr.getStoichiometry()
+    return _compile(m, odoc.getModel(), rows, reactions, Nm, conc, val, sref, info)
+
+
+def _compile(m, om, rows, reactions, Nm, conc, val, sref, info):
+    """Rust model from SBML model ``m`` (``om``: same model with stoichiometryMath), stoichiometry ``Nm``
+    (rows: floating species incl. rule ones, columns: reactions), floating species concentrations
+    ``conc`` and values ``val(id)`` / ``sref(speciesReference, changing)`` in SBML units."""
+    fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
+    rules, rate_rules = {}, {}
+    for rule in m.getListOfRules():
+        (rate_rules if rule.isRate() else rules)[rule.getVariable()] = rule.getMath()
+    targets = {ea.getVariable() for ev in m.getListOfEvents() for ea in ev.getListOfEventAssignments()}
+    changing = set(rules) | set(rate_rules) | targets
+
+    sp = {s.getId(): s for s in m.getListOfSpecies()}
     species = [s for s in rows if s not in rules]  # assignment-rule species: outputs only
     floating = set(species)
     comp_of = {s: sp[s].getCompartment() for s in sp}
     hosu = {s for s in sp if sp[s].getHasOnlySubstanceUnits()}
-    vol = {s: rr.getValue(comp_of[s]) for s in sp}
+    vol = {s: val(comp_of[s]) for s in sp}
 
     params = {}
     for x in list(m.getListOfParameters()) + list(m.getListOfCompartments()):
         if x.getId() not in rules:
-            params[x.getId()] = rr.getValue(x.getId())
+            params[x.getId()] = val(x.getId())
     for s in sp:  # boundary / non-floating species: parameters in their SBML units
         if s not in rules and s not in floating:
-            params[s] = rr.getValue('[%s]' % s) * (vol[s] if s in hosu else 1.0)
+            params[s] = val(s)
 
     # variable stoichiometry: (species, reaction) -> [(sign, stoichiometry AST)] over all references
     def refs_of(model):
@@ -99,12 +115,12 @@ def from_roadrunner(r, info=None):
                 for sg, lst in ((-1, rxn.getListOfReactants()), (1, rxn.getListOfProducts())) for sr in lst]
     refs = refs_of(m)
     smath = {(j, sr.getSpecies(), sg, i): sr.getStoichiometryMath().getMath()
-             for i, (sg, j, sr) in enumerate(refs_of(odoc.getModel()))
+             for i, (sg, j, sr) in enumerate(refs_of(om))
              if sr.isSetStoichiometryMath() and sr.getStoichiometryMath().isSetMath()}
     smath = {i: smath.get((j, sr.getSpecies(), sg, i)) for i, (sg, j, sr) in enumerate(refs)}
     for _, _, sr in refs:
         if sr.isSetId() and sr.getId() not in rules:
-            params[sr.getId()] = rr.getValue(sr.getId()) if sr.getId() in changing else sr.getStoichiometry()
+            params[sr.getId()] = sref(sr, changing)
     var_ref = {(sr.getSpecies(), j) for i, (_, j, sr) in enumerate(refs)
                if (sr.isSetId() and sr.getId() in changing) or smath[i] is not None}
     vstoich = {}
@@ -312,3 +328,164 @@ def from_roadrunner(r, info=None):
                                rates, np.ascontiguousarray(stoich), pn,
                                [float(params[p]) for p in pn], rate_rules=rate_list,
                                assignment_rules=out_rules, events=events)
+
+
+# ---------------------------------------------------------------------------------------------
+# Without roadrunner: initial values and stoichiometry from the SBML alone
+# ---------------------------------------------------------------------------------------------
+_A = libsbml
+_MATH = {_A.AST_FUNCTION_ABS: np.abs, _A.AST_FUNCTION_EXP: np.exp, _A.AST_FUNCTION_LN: np.log,
+         _A.AST_FUNCTION_FLOOR: np.floor, _A.AST_FUNCTION_CEILING: np.ceil, _A.AST_FUNCTION_SIN: np.sin,
+         _A.AST_FUNCTION_COS: np.cos, _A.AST_FUNCTION_TAN: np.tan, _A.AST_FUNCTION_ARCSIN: np.arcsin,
+         _A.AST_FUNCTION_ARCCOS: np.arccos, _A.AST_FUNCTION_ARCTAN: np.arctan, _A.AST_FUNCTION_SINH: np.sinh,
+         _A.AST_FUNCTION_COSH: np.cosh, _A.AST_FUNCTION_TANH: np.tanh}
+_REL = {_A.AST_RELATIONAL_EQ: np.equal, _A.AST_RELATIONAL_NEQ: np.not_equal, _A.AST_RELATIONAL_GT: np.greater,
+        _A.AST_RELATIONAL_LT: np.less, _A.AST_RELATIONAL_GEQ: np.greater_equal, _A.AST_RELATIONAL_LEQ: np.less_equal}
+
+
+def evaluate(ast, get, fdefs):
+    """Value of a libsbml AST at time 0; names through get(name). NotImplementedError if unsupported."""
+    t, n = ast.getType(), ast.getNumChildren()
+
+    def e(i):
+        return evaluate(ast.getChild(i), get, fdefs)
+    with np.errstate(all='ignore'):
+        if ast.isNumber() or t in (_A.AST_CONSTANT_E, _A.AST_CONSTANT_PI):
+            return np.float64(ast.getValue())
+        if t in (_A.AST_CONSTANT_TRUE, _A.AST_CONSTANT_FALSE):
+            return np.float64(t == _A.AST_CONSTANT_TRUE)
+        if t == _A.AST_NAME:
+            return np.float64(get(ast.getName()))
+        if t == _A.AST_NAME_TIME:
+            return np.float64(0.0)
+        if t == _A.AST_NAME_AVOGADRO:
+            return np.float64(ast.getReal())
+        if t == _A.AST_PLUS:
+            return sum((e(i) for i in range(n)), np.float64(0.0))
+        if t == _A.AST_MINUS:
+            return -e(0) if n == 1 else e(0) - e(1)
+        if t == _A.AST_TIMES:
+            return np.prod([e(i) for i in range(n)], dtype=float)
+        if t == _A.AST_DIVIDE:
+            return e(0) / e(1)
+        if t in (_A.AST_POWER, _A.AST_FUNCTION_POWER):
+            return np.power(e(0), e(1))
+        if t == _A.AST_FUNCTION_ROOT:
+            return np.sqrt(e(0)) if n == 1 else np.power(e(1), 1.0 / e(0))
+        if t == _A.AST_FUNCTION_LOG:
+            return np.log10(e(0)) if n == 1 else np.log(e(1)) / np.log(e(0))
+        if t in _MATH and n == 1:
+            return _MATH[t](e(0))
+        if t in _REL:
+            return np.float64(all(_REL[t](e(i), e(i + 1)) for i in range(n - 1)))
+        if t == _A.AST_LOGICAL_AND:
+            return np.float64(all(e(i) for i in range(n)))
+        if t == _A.AST_LOGICAL_OR:
+            return np.float64(any(e(i) for i in range(n)))
+        if t == _A.AST_LOGICAL_XOR:
+            return np.float64(sum(bool(e(i)) for i in range(n)) % 2)
+        if t == _A.AST_LOGICAL_NOT:
+            return np.float64(not e(0))
+        if t == _A.AST_FUNCTION_PIECEWISE:
+            for i in range(0, n - 1, 2):
+                if e(i + 1):
+                    return e(i)
+            return e(n - 1) if n % 2 else np.float64(np.nan)
+        if t == _A.AST_FUNCTION and ast.getName() in fdefs:
+            lam = fdefs[ast.getName()]
+            args = {lam.getChild(i).getName(): e(i) for i in range(lam.getNumChildren() - 1)}
+            return evaluate(lam.getChild(lam.getNumChildren() - 1), lambda x: args[x] if x in args else get(x), fdefs)
+    raise NotImplementedError("initial value of %s" % _l3(ast))
+
+
+def _rr_order(xs, ruled):  # roadrunner lists rule-determined symbols after the others
+    return [x for x in xs if x not in ruled] + [x for x in xs if x in ruled]
+
+
+def from_sbml(sbml, info=None):
+    """``from_roadrunner`` without roadrunner: compile SBML text into a ``roadrunner_rs.Model`` at the
+    SBML initial values (initial assignments, assignment rules, amounts / concentrations as roadrunner).
+
+    ``info`` also receives the model in roadrunner's terms: ids (floating, boundary, global parameter,
+    compartment, reaction, rate-rule ids in roadrunner's order), rows/N (full stoichiometry), ia
+    (initial assignments), fdefs, values (initial values, SBML units), doc (libsbml document).
+    NotImplementedError / ValueError: not supported (load roadrunner instead)."""
+    doc = libsbml.readSBMLFromString(sbml)
+    m = doc.getModel()
+    if m is None or doc.getNumErrors(libsbml.LIBSBML_SEV_ERROR) or doc.getNumErrors(libsbml.LIBSBML_SEV_FATAL):
+        raise ValueError("SBML errors")
+    ns = doc.getNamespaces()
+    if any(p in ns.getURI(i) for i in range(ns.getNumNamespaces()) for p in ('/comp/', '/distrib/', '/arrays/')):
+        raise NotImplementedError("SBML package")  # roadrunner flattens comp models
+    if any(r.isAlgebraic() for r in m.getListOfRules()) or any(x.getFast() for x in m.getListOfReactions()) \
+            or 'symbols/delay' in sbml:
+        raise NotImplementedError("algebraic rule, fast reaction or delay")
+    fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
+    ia = {x.getSymbol(): x.getMath() for x in m.getListOfInitialAssignments()}
+    ar = {x.getVariable(): x.getMath() for x in m.getListOfRules() if x.isAssignment()}
+    rrules = [x.getVariable() for x in m.getListOfRules() if x.isRate()]
+    sp = {s.getId(): s for s in m.getListOfSpecies()}
+    comps = {c.getId(): c for c in m.getListOfCompartments()}
+    pars = {p.getId(): p for p in m.getListOfParameters()}
+    refs = {sr.getId(): sr for rx in m.getListOfReactions()
+            for lst in (rx.getListOfReactants(), rx.getListOfProducts()) for sr in lst if sr.isSetId()}
+    vals, busy = {}, set()
+
+    def get(x):  # initial value in SBML units, as roadrunner computes it
+        if x in vals:
+            return vals[x]
+        if x in busy:
+            raise ValueError("cyclic initial values through %s" % x)
+        busy.add(x)
+        if x in ar or x in ia:
+            v = evaluate(ar[x] if x in ar else ia[x], get, fdefs)
+        elif x in comps and comps[x].isSetSize():
+            v = comps[x].getSize()
+        elif x in pars and pars[x].isSetValue():
+            v = pars[x].getValue()
+        elif x in sp and sp[x].isSetInitialConcentration():
+            v = sp[x].getInitialConcentration()
+            if sp[x].getHasOnlySubstanceUnits():
+                v *= get(sp[x].getCompartment())
+        elif x in sp and sp[x].isSetInitialAmount():
+            v = sp[x].getInitialAmount()
+            if not sp[x].getHasOnlySubstanceUnits():
+                v /= get(sp[x].getCompartment())
+        elif x in refs and not refs[x].isSetStoichiometryMath() and refs[x].isSetStoichiometry():
+            v = refs[x].getStoichiometry()
+        elif x in comps or x in sp:  # roadrunner's defaults
+            v = 1.0 if x in comps else 0.0
+        else:  # unset parameter (roadrunner refuses it), reaction ids in initial assignments
+            raise NotImplementedError("initial value of %s" % x)
+        busy.discard(x)
+        vals[x] = float(v)
+        return vals[x]
+
+    def stoich(sr):
+        if sr.isSetId():
+            return get(sr.getId())
+        if sr.isSetStoichiometryMath():
+            return float(evaluate(sr.getStoichiometryMath().getMath(), get, fdefs))
+        if sr.isSetStoichiometry() or m.getLevel() < 3:
+            return sr.getStoichiometry()
+        raise NotImplementedError("unset stoichiometry")
+
+    rows = [s for s in sp if not sp[s].getBoundaryCondition()]
+    reactions = [x.getId() for x in m.getListOfReactions()]
+    N = np.zeros((len(rows), len(reactions)))
+    ri = {s: i for i, s in enumerate(rows)}
+    for j, rx in enumerate(m.getListOfReactions()):
+        for sg, lst in ((-1, rx.getListOfReactants()), (1, rx.getListOfProducts())):
+            for sr in lst:
+                if sr.getSpecies() in ri:
+                    N[ri[sr.getSpecies()], j] += sg * stoich(sr)
+    for x in list(comps) + list(pars) + list(sp):
+        get(x)
+    conc = {s: vals[s] / vals[sp[s].getCompartment()] if sp[s].getHasOnlySubstanceUnits() else vals[s] for s in rows}
+    out = _compile(m, m, rows, reactions, N, conc, get, lambda sr, changing: get(sr.getId()), info)
+    if info is not None:
+        ruled = set(ar) | set(rrules)
+        info.update(doc=doc, ia=ia, fdefs=fdefs, values=vals, rows=rows, N=N, rate_rule_ids=rrules,
+                    ids=(_rr_order(rows, ruled), _rr_order([s for s in sp if s not in ri], ruled),
+                         _rr_order(list(pars), ruled), _rr_order(list(comps), ruled), reactions))
+    return out
