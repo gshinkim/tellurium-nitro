@@ -55,7 +55,7 @@ def from_roadrunner(r, info=None):
     is a rate rule in Rust although they have reactions: variable compartment/stoichiometry/cf).
     """
     sbml = r.getCurrentSBML()
-    rr = roadrunner.roadrunner.RoadRunner(sbml)  # plain libroadrunner, not tellurium's facade
+    rr = r  # read values from the loaded model: a fresh RoadRunner(sbml) is a full re-load (~10 s at 1000 reactions)
     doc = libsbml.readSBMLFromString(sbml)
     m = doc.getModel()
     fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
@@ -69,6 +69,10 @@ def from_roadrunner(r, info=None):
 
     if m.getNumReactions():
         Nm = rr.getFullStoichiometryMatrix()
+        if sorted(Nm.colnames) != sorted(x.getId() for x in m.getListOfReactions()):
+            # roadrunner's structure is stale after some model edits: re-load from the current SBML
+            rr = roadrunner.roadrunner.RoadRunner(sbml)  # plain libroadrunner, not tellurium's facade
+            Nm = rr.getFullStoichiometryMatrix()
         rows, reactions = list(Nm.rownames), list(Nm.colnames)
     else:  # roadrunner has no stoichiometry matrix then
         rows, reactions = list(rr.model.getFloatingSpeciesIds()), []
