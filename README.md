@@ -6,7 +6,7 @@
 reactions inside cells change over time. The part that does the actual math is called **roadrunner**.
 
 **Tellurium Nitro is the same tool with a much faster math engine.** We rewrote roadrunner's math in a faster
-language (Rust). Your results stay the same; you just get them sooner. Simple simulations run about 2-3 times faster,
+language (Rust). Your results stay the same; you just get them sooner. Simple simulations run about 2-5 times faster,
 and heavy analyses (steady states, control coefficients, sensitivities) can run hundreds to thousands of times faster.
 The benchmark tables below show the exact numbers.
 
@@ -87,7 +87,7 @@ side branches.
 |---|---|---|---|---|---|---|
 | ss | 244 ms · 1.0 cores · 265 MB | 243 ms · 1.0 cores · 266 MB | 0.0475 ms · 1.0 cores · 252 MB | **5,133x** | **5,125x** | 0e+00 / 0e+00 / 2e-15 |
 | fcc | 590 ms · 1.0 cores · 266 MB | 581 ms · 1.0 cores · 265 MB | 0.0394 ms · 1.0 cores · 252 MB | **14,979x** | **14,742x** | 4e-08 / 4e-08 / 1e-11 |
-| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.339 ms · 1.0 cores · 252 MB | **3.4x** | **3.4x** | 3e-07 / 3e-07 / 5e-08 |
+| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.221 ms · 1.0 cores · 272 MB | **5.1x** | **5.2x** | 3e-07 / 3e-07 / 1e-07 |
 | sens | 9.31 s · 1.0 cores · 274 MB | 9.17 s · 1.0 cores · 275 MB | 22.2 ms · 15.5 cores · 281 MB | **419x** | **413x** | — / 0e+00* / 5e-07* |
 | cc200 | 251 s · 1.0 cores · 267 MB | 8.2 s · 15.8 cores · 323 MB | 13.8 ms · 1.5 cores · 278 MB | **18,165x** | **595x** | 4e-08 / 4e-08 / 3e-11 |
 | load² | — | — | 281 ms · 1.0 cores · 617 MB | — | — | — / — / — |
@@ -245,8 +245,9 @@ From now on, activate the environment (step 4, `source .venv/bin/activate`) when
   - The tape is JIT-compiled to native code with Cranelift after 2000 evaluations, so short one-shot runs don't pay
     the compile cost. The JIT output is bit-identical to the interpreter.
   - **Steady state:** Newton with conservation laws.
-  - **Time courses:** Rodas4 at default accuracy, and variable-order BDF with CVODE-style step and Newton control for
-    tight tolerances. Both use a sparse LU with fill-reducing ordering.
+  - **Time courses:** variable-order BDF with CVODE-style step and Newton control at roadrunner's default accuracy
+    and tighter (relative tolerance 1e-5 or below), Rodas4 at looser tolerances, where it is faster on small or
+    event-heavy models. Both use a sparse LU with fill-reducing ordering.
   - **Events:** delay, priority, persistence, `useValuesFromTriggerTime` and `initialValue=false`. Pending events
     carry across `simulate` calls.
   - **Rules:** rate and assignment rules.

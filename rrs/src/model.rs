@@ -362,8 +362,10 @@ fn sparse_solve(piv: &[usize], lo: &[(u32, u32, f64)], up: &[(u32, u32, f64)], b
 
 fn inf_norm(x: &[f64]) -> f64 { x.iter().fold(0.0f64, |m, v| m.max(v.abs())) }
 
-/// simulate uses BDF below this relative tolerance, Rodas4 otherwise.
-const BDF_BELOW_RTOL: f64 = 1e-7;
+/// simulate uses BDF below this relative tolerance, Rodas4 otherwise. BDF is 1.0-4.8x faster from
+/// rtol 1e-5 down (roadrunner's default is 1e-6) with roadrunner-level error; Rodas4 wins on small
+/// or event-heavy models at looser tolerances.
+const BDF_BELOW_RTOL: f64 = 2e-5;
 // Rodas4 (Hairer & Wanner), transformed coefficients.
 const GAM: f64 = 0.25;
 const A: [[f64; 5]; 5] = [

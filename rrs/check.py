@@ -257,7 +257,7 @@ def sim_timing():
             t = (time.perf_counter() - t0) / reps
             assert np.isfinite(out).all()
             rows.append((label, n, th, t_rr, t / n))
-    print(f"\nTiming simulate(0, 10, 51), default tolerances (roadrunner CVODE vs roadrunner_rs Rodas4)")
+    print(f"\nTiming simulate(0, 10, 51), default tolerances (roadrunner CVODE vs roadrunner_rs BDF)")
     print(f"{'model':26s} {'samples':>7s} {'threads':>7s} {'roadrunner/sample':>18s} {'rs/sample':>11s} {'speedup':>8s}")
     for label, n, th, t_rr, t in rows:
         print(f"{label:26s} {n:7d} {th or 'all'!s:>7s} {t_rr*1e6:15.1f} us {t*1e6:8.2f} us {t_rr/t:7.1f}x")
