@@ -156,6 +156,8 @@ pub struct Work {
     bdf: Bdf,
     /// per-state multiplier of the absolute tolerance (roadrunner scales atol by initial values)
     pub atol_scale: Vec<f64>,
+    /// solver counters since the last reset: [BDF steps, Rodas4 steps, rejected steps, BDF->Rodas4 switches]
+    pub stats: [usize; 4],
 }
 
 /// Variable-order (1-5) BDF state: scaled backward differences D (rows of nx), as scipy's BDF /
@@ -560,7 +562,7 @@ impl Model {
             yn: z(nx), dy: z(nx), fx: z(nx), f0: z(nx), k: std::array::from_fn(|_| z(nx)), jf: z(nx * nx), pivf: vec![0; nx],
             lo: vec![], up: vec![], xm: z(ni * nr),
             ra: self.aux.regs(), y0: z(nx), d1: z(nx), d2: z(nx), prev: vec![false; self.events.len()],
-            pend: vec![], tmp: vec![], amt: z(nx), atol_scale: vec![1.0; nx],
+            pend: vec![], tmp: vec![], amt: z(nx), atol_scale: vec![1.0; nx], stats: [0; 4],
             bdf: Bdf { d: z((BDF_MAX + 3) * nx), jev: z(self.jac.len() + self.dt.len()), sc: std::array::from_fn(|_| z(nx)), ..Default::default() },
         }
     }
@@ -741,7 +743,7 @@ impl Model {
     fn step(&self, w: &mut Work, t: f64, t1: f64, h: &mut f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
         let nj = self.jac.len();
-        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, .. } = w;
+        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, stats: w_stats, .. } = w;
         if !(*h > 0.0) { *h = (1e-6 * (t1 - t).abs()).max(1e-12); }
         self.full_at(rf, v, ev, y, t);
         self.rhs(v, f0);
@@ -768,7 +770,7 @@ impl Model {
                 for (i, p) in pivf.iter_mut().enumerate() { *p = i; }
             } else {
                 fill(jf, true);
-                if !lu(jf, nx, pivf, 0.0) { *h *= 0.25; rejected = true; continue; }
+                if !lu(jf, nx, pivf, 0.0) { *h *= 0.25; rejected = true; w_stats[2] += 1; continue; }
                 lu_pattern(jf, nx, lo, up);
             }
             // stage 1
@@ -808,6 +810,7 @@ impl Model {
             if ok && err <= 1.0 {
                 y0.copy_from_slice(y);
                 y.copy_from_slice(dy);
+                w_stats[1] += 1;
                 let mut hn = hh * (0.9 * err.powf(-0.25)).clamp(0.2, 6.0);
                 if rejected { hn = hn.min(hh); }
                 if !(clipped && hn > hh) { *h = hn; }
@@ -815,6 +818,7 @@ impl Model {
             }
             *h = hh * if ok { (0.9 * err.powf(-0.25)).clamp(0.2, 1.0) } else { 0.25 };
             rejected = true;
+            w_stats[2] += 1;
         }
         None
     }
@@ -850,7 +854,7 @@ impl Model {
     /// Returns the new time.
     fn bdf_step(&self, w: &mut Work, t: f64, t1: f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
-        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, .. } = w;
+        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, stats: w_stats, .. } = w;
         let Bdf { d, order, h, t: bt, neq, lu: has_lu, lufac, crate_, jev, sc, nlu, jage, defer } = b;
         let [yp, psi, dd, yn, f, dy, wt] = sc; // wt: inverse error weights 1 / (atol * scale + rtol |y|)
         tmp.resize(BDF_MAX + 3, 0.0);
@@ -951,6 +955,7 @@ impl Model {
                 fresh_jac = true;
             };
             if !converged {
+                w_stats[2] += 1;
                 *h *= 0.25;
                 rescale(d, tmp, *order, 0.25);
                 *neq = 0;
@@ -958,6 +963,7 @@ impl Model {
             }
             let en = rms(nx, |i| BDF_ERR[k] * dd[i] * wt[i]);
             if en > 1.0 { // CVODE: h ratio from the error with bias 6, in [0.1, 0.2 after 2 failures]
+                w_stats[2] += 1;
                 nef += 1;
                 *defer = true;
                 let mut fac = if nef > 3 { 0.1 } else { (1.0 / ((6.0 * en).powf(1.0 / (k as f64 + 1.0)) + 1e-6)).max(0.1) };
@@ -971,6 +977,7 @@ impl Model {
             break (tn, en);
         };
         let k = *order;
+        w_stats[0] += 1;
         y.copy_from_slice(yn);
         *bt = ynew_t;
         *neq += 1;
@@ -1187,8 +1194,9 @@ impl Model {
     }
 
     /// Time course over `times` from the loaded state, writing outputs `outs` (registers) per time
-    /// into out (len(times) x len(outs)). Adaptive steps are clipped only at the end time and at
-    /// event times; output points in between come from the Rodas4 dense output. Events fire with
+    /// into out (len(times) x len(outs)). BDF below BDF_BELOW_RTOL, Rodas4 otherwise (w.stats counts
+    /// steps). Adaptive steps are clipped only at the end time and at event times; output points in
+    /// between come from the solver's dense output. Events fire with
     /// roadrunner semantics; output points at an event time report the post-event state.
     /// On success w.s / params hold the final state.
     pub fn simulate(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
@@ -1214,6 +1222,7 @@ impl Model {
             let mut step = if bdf { self.bdf_step(w, t, t1, rtol, atol) } else { self.step(w, t, t1, &mut h, rtol, atol) };
             if step.is_none() && bdf { // BDF gave up (e.g. loose atol on a near-singular system): Rodas4 from here
                 bdf = false;
+                w.stats[3] += 1;
                 step = self.step(w, t, t1, &mut h, rtol, atol);
             }
             let Some(tn) = step else { return false };

@@ -90,8 +90,9 @@ impl PyModel {
     #[allow(clippy::too_many_arguments)]
     fn time_courses<'py>(&self, py: Python<'py>, keys: Vec<String>, values: PyReadonlyArray2<f64>,
                          times: PyReadonlyArray1<f64>, threads: Option<usize>, outputs: Option<Vec<String>>,
-                         ode: Option<(f64, f64)>, seed: u64) -> PyResult<Bound<'py, PyAny>> {
+                         ode: Option<(f64, f64)>, seed: u64, atol_scale: Option<Vec<f64>>) -> PyResult<Bound<'py, PyAny>> {
         let b = self.batch(keys, values)?;
+        if atol_scale.as_ref().is_some_and(|a| a.len() != self.m.nx) { return Err(verr("atol_scale must have one entry per state".into())); }
         let times = check_times(times)?;
         let outs = self.outs(outputs)?;
         let m = &self.m;
@@ -102,6 +103,7 @@ impl PyModel {
             run_batch(m, n, threads, |w, i| {
                 let r = unsafe { rows.row(i) }; // SAFETY: one row per sample
                 m.load(w, &b.keys, &b.vals[i * nk..(i + 1) * nk]);
+                match &atol_scale { Some(a) => w.atol_scale.copy_from_slice(a), None => w.atol_scale.fill(1.0) }
                 let ok = match ode {
                     Some((rtol, atol)) => m.simulate(w, &times, rtol, atol, &outs, r),
                     None => m.gillespie(w, &times, seed.wrapping_add(i as u64), &outs, r),
@@ -238,14 +240,15 @@ impl PyModel {
         Ok(d)
     }
 
-    /// (n, len(times), len(outputs)) time courses (Rodas4, events root-located); outputs default to
-    /// the floating species (concentrations). NaN rows where integration failed.
-    #[pyo3(signature = (keys, values, times, threads=None, rtol=1e-6, atol=1e-12, outputs=None))]
+    /// (n, len(times), len(outputs)) time courses (solver as in simulate, events root-located);
+    /// outputs default to the floating species (concentrations). NaN rows where integration failed.
+    /// atol_scale: per-state multipliers of atol, as in Session.advance.
+    #[pyo3(signature = (keys, values, times, threads=None, rtol=1e-6, atol=1e-12, outputs=None, atol_scale=None))]
     #[allow(clippy::too_many_arguments)]
     fn simulate_batch<'py>(&self, py: Python<'py>, keys: Vec<String>, values: PyReadonlyArray2<f64>,
                            times: PyReadonlyArray1<f64>, threads: Option<usize>, rtol: f64, atol: f64,
-                           outputs: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
-        self.time_courses(py, keys, values, times, threads, outputs, Some((rtol, atol)), 0)
+                           outputs: Option<Vec<String>>, atol_scale: Option<Vec<f64>>) -> PyResult<Bound<'py, PyAny>> {
+        self.time_courses(py, keys, values, times, threads, outputs, Some((rtol, atol)), 0, atol_scale)
     }
 
     /// One time course -> (trajectory[len(times), len(outputs)], final) where final maps every
@@ -339,7 +342,7 @@ impl PyModel {
         if self.m.nv != self.m.nr { return Err(verr("gillespie_batch: rate rules are not supported".into())); }
         let seed = seed.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64));
-        self.time_courses(py, keys, values, times, threads, outputs, None, seed)
+        self.time_courses(py, keys, values, times, threads, outputs, None, seed, None)
     }
 
     /// Full Jacobian d(dx/dt)/dx (nState x nState, concentrations, state_ids order) at the state
@@ -357,8 +360,98 @@ impl PyModel {
     }
 }
 
+/// A running simulation of one Model: keeps the event state (trigger values, pending delayed
+/// events) between advance() calls, as consecutive roadrunner simulate/oneStep calls do.
+///
+/// Session(model); advance(keys, values, times, outputs=None, rtol=1e-6, atol=1e-12, atol_scale=None)
+///   -> (trajectory[len(times), len(outputs)], final values of all outputs in output_ids order).
+/// A failed run is retried once with atol <= 1e-12 (a loose atol can let tiny species go astray),
+/// leaving the event state as it was before the call; RuntimeError if that fails too.
+/// stats: solver counters of the last advance (solver, bdf_steps, rodas_steps, rejected, switched, atol).
+#[pyclass(name = "Session")]
+pub(crate) struct Session { model: Py<PyModel>, w: Work, fresh: bool, stats: ([usize; 4], f64, bool) }
+
+#[pymethods]
+impl Session {
+    #[new]
+    fn new(model: Py<PyModel>) -> Self {
+        let w = model.get().m.work();
+        Session { model, w, fresh: true, stats: ([0; 4], 0.0, false) }
+    }
+
+    /// Start the next advance with fresh event triggers (roadrunner's reset()).
+    fn reset_events(&mut self) { self.fresh = true; }
+
+    #[pyo3(signature = (keys, values, times, outputs=None, rtol=1e-6, atol=1e-12, atol_scale=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn advance<'py>(&mut self, py: Python<'py>, keys: Bound<'py, PyAny>, values: Vec<f64>, times: PyReadonlyArray1<f64>,
+                    outputs: Option<Bound<'py, PyAny>>, rtol: f64, atol: f64,
+                    atol_scale: Option<PyReadonlyArray1<f64>>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let pm = self.model.get();
+        let m = &pm.m;
+        let keys = keys_of(m, &keys)?;
+        if values.len() != keys.len() { return Err(verr("values and keys differ in length".into())); }
+        let times = check_times(times)?;
+        let outs = match outputs {
+            Some(o) => match o.cast::<Resolved>() { Ok(r) => r.get().outs.clone(), Err(_) => pm.outs(Some(o.extract()?))? },
+            None => pm.outs(None)?,
+        };
+        let all: Vec<u32> = m.outputs.iter().map(|o| o.1).collect();
+        let (no, nt) = (outs.len(), times.len());
+        let mut out = vec![0.0; nt * no];
+        let mut fin = vec![0.0; all.len()];
+        let w = &mut self.w;
+        match &atol_scale {
+            Some(a) if a.len()? != m.nx => return Err(verr("atol_scale must have one entry per state".into())),
+            Some(a) => w.atol_scale.copy_from_slice(a.as_slice()?),
+            None => w.atol_scale.fill(1.0),
+        }
+        if self.fresh { m.events_reset(w); }
+        let saved = m.event_state(w);
+        let fresh = &mut self.fresh;
+        let stats = &mut self.stats;
+        let ok = py.detach(|| {
+            let mut tried = f64::NAN;
+            for a in [atol, atol.min(1e-12)] {
+                if a == tried { break; }
+                tried = a;
+                w.stats = [0; 4];
+                m.load(w, &keys, &values);
+                if m.simulate_cont(w, &times, rtol, a, &outs, &mut out) {
+                    m.record(w, times[nt - 1], &all, &mut fin);
+                    *fresh = false;
+                    *stats = (w.stats, a, true);
+                    return true;
+                }
+                let _ = m.set_event_state(w, saved.0.clone(), saved.1.clone()); // undo the failed attempt
+            }
+            *stats = (w.stats, tried, false);
+            false
+        });
+        if !ok { return Err(PyRuntimeError::new_err("roadrunner_rs: integration failed")); }
+        Ok((arr(py, out, &[nt, no])?, PyArray1::from_vec(py, fin).into_any()))
+    }
+
+    /// Counters of the last advance: dict(solver='bdf'|'rodas4'|'bdf+rodas4', bdf_steps, rodas_steps,
+    /// rejected, switched, atol (the one that succeeded), ok).
+    #[getter]
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let ([b, r, rej, sw], a, ok) = self.stats;
+        let d = PyDict::new(py);
+        d.set_item("solver", if b > 0 && r > 0 { "bdf+rodas4" } else if b > 0 { "bdf" } else { "rodas4" })?;
+        d.set_item("bdf_steps", b)?;
+        d.set_item("rodas_steps", r)?;
+        d.set_item("rejected", rej)?;
+        d.set_item("switched", sw > 0)?;
+        d.set_item("atol", a)?;
+        d.set_item("ok", ok)?;
+        Ok(d)
+    }
+}
+
 #[pymodule]
 fn roadrunner_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
+    m.add_class::<Session>()?;
     m.add_class::<PyModel>()
 }
