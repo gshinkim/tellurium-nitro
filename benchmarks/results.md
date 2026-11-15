@@ -9,7 +9,7 @@
 | sos:repressilator | — | — | 111 ms · 1.0 cores · 253 MB | — | — | — / — / 1e-08 |
 | ss | 244 ms · 1.0 cores · 265 MB | 243 ms · 1.0 cores · 266 MB | 0.0475 ms · 1.0 cores · 252 MB | **5,133x** | **5,125x** | 0e+00 / 0e+00 / 2e-15 |
 | fcc | 590 ms · 1.0 cores · 266 MB | 581 ms · 1.0 cores · 265 MB | 0.0394 ms · 1.0 cores · 252 MB | **14,979x** | **14,742x** | 4e-08 / 4e-08 / 1e-11 |
-| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.339 ms · 1.0 cores · 252 MB | **3.4x** | **3.4x** | 3e-07 / 3e-07 / 5e-08 |
+| sim | 1.14 ms · 1.0 cores · 261 MB | 1.14 ms · 1.0 cores · 260 MB | 0.221 ms · 1.0 cores · 272 MB | **5.1x** | **5.2x** | 3e-07 / 3e-07 / 1e-07 |
 | sens | 9.31 s · 1.0 cores · 274 MB | 9.17 s · 1.0 cores · 275 MB | 22.2 ms · 15.5 cores · 281 MB | **419x** | **413x** | — / 0e+00* / 5e-07* |
 | cc200 | 251 s · 1.0 cores · 267 MB | 8.2 s · 15.8 cores · 323 MB | 13.8 ms · 1.5 cores · 278 MB | **18,165x** | **595x** | 4e-08 / 4e-08 / 3e-11 |
 | load | — | — | 281 ms · 1.0 cores · 617 MB | — | — | — / — / — |
