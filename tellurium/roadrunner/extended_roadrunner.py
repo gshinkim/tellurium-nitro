@@ -125,8 +125,14 @@ def _rs_st(m, info, ids, vols, nss):
 # ---------------------------------------------------------------------
 class ExtendedRoadRunner(roadrunner.RoadRunner):
 
+    def __new__(cls, *args, **kwargs):
+        # RoadRunner(sbml) with turbo: a lazily compiled RoadRunner (see _lazy); otherwise a plain one
+        r = cls._lazy(args[0]) if len(args) == 1 and not kwargs else None
+        return r if r is not None else super(ExtendedRoadRunner, cls).__new__(cls)
+
     def __init__(self, *args, **kwargs):
-        super(ExtendedRoadRunner, self).__init__(*args, **kwargs)
+        if '_lz' not in self.__dict__:  # lazy instances are already built by __new__
+            super(ExtendedRoadRunner, self).__init__(*args, **kwargs)
 
     # ---------------------------------------------------------------------
     # Lazy roadrunner: with turbo, te.loada & co. build only the Rust model (~0.2 s at 1000 reactions)
@@ -135,14 +141,14 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
     # ---------------------------------------------------------------------
     @classmethod
     def _lazy(cls, sbml):
-        """te.loada / loadSBMLModel / loadAntimonyModel: a lazily compiled RoadRunner when turbo is on."""
+        """A lazily compiled RoadRunner when turbo is on and the Rust engine takes the model, else None."""
         if _turbo and isinstance(sbml, str) and not roadrunner.Config.getValue(
                 roadrunner.Config.LOADSBMLOPTIONS_CONSERVED_MOIETIES):
             text = sbml
             if not text.lstrip().startswith('<') and os.path.isfile(text):
                 with open(text, encoding='utf-8') as f:
                     text = f.read()
-            r = cls.__new__(cls)
+            r = object.__new__(cls)
             roadrunner.roadrunner.RoadRunner._swig_init(r)  # empty roadrunner (no _makeProperties: no model)
             try:
                 if text.lstrip().startswith('<'):
@@ -150,7 +156,7 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
                     return r
             except (NotImplementedError, ValueError):
                 pass
-        return cls(sbml)
+        return None
 
     def _lz_init(self, sbml):
         from ..analysis.rrs_bridge import from_sbml, _names

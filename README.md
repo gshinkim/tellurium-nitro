@@ -7,6 +7,10 @@ Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and 
 `r.getScaledFluxControlCoefficientMatrix()` and the rest return the same results, faster. Anything the Rust
 engine can't do exactly the way roadrunner does goes to the original roadrunner without you doing anything.
 
+**Plain libroadrunner code works too**: change `import roadrunner` to `import tellurium.nitro as roadrunner`.
+`roadrunner.RoadRunner(sbml)` then loads the model straight into the Rust engine (no LLVM compile) and runs on it;
+everything else in the module is libroadrunner's own.
+
 | Version | What does the math |
 |---|---|
 | Regular tellurium (PyPI 2.2.13.1, libroadrunner 2.10.0) | roadrunner (C++) |
