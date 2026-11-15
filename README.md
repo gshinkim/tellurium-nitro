@@ -1,15 +1,44 @@
 # Tellurium Nitro
 
+## What is this, in plain words?
+
+[Tellurium](https://github.com/sys-bio/tellurium) is a Python tool biologists use to simulate how chemicals and
+reactions inside cells change over time. The part that does the actual math is called **roadrunner**.
+
+**Tellurium Nitro is the same tool with a much faster math engine.** We rewrote roadrunner's math in a faster
+language (Rust). Your results stay the same; you just get them sooner. Simple simulations run about 2-3 times faster,
+and heavy analyses (steady states, control coefficients, sensitivities) can run hundreds to thousands of times faster.
+The benchmark tables below show the exact numbers.
+
+**You don't need to learn anything new.** The commands are exactly the same as before. If the new engine ever
+can't handle something, Nitro quietly hands that job to the original roadrunner, so your code never breaks.
+
+### What's new
+
+- **Faster everything**: simulations, steady states, control analysis (MCA), sensitivities and random
+  (Gillespie) simulations all run on the new engine.
+- **Faster model loading**: big models (1000+ reactions) load in a fraction of a second instead of 10+ seconds.
+- **Works with plain roadrunner code too (new)**: if your scripts use `import roadrunner` instead of tellurium,
+  change that one line to `import tellurium.nitro as roadrunner` and the rest of your script stays the same,
+  but now runs on the fast engine. See step 8 of the install guide.
+
+### How do I use it?
+
+1. Install it with the [step-by-step guide](#install-tellurium-nitro-step-by-step) below (about 10 minutes).
+2. Keep writing your code the way you always have. That's it.
+
+<details>
+<summary><b>For experts: what's under the hood</b></summary>
+
 A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) in which roadrunner's compute engine is
 rewritten in Rust: steady states, time courses, events, rules, control analysis (MCA), sensitivities and
 Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and batches run on every CPU core.
-**Your tellurium code does not change**: `te.loada(...)`, `r.simulate()`, `r.steadyState()`,
-`r.getScaledFluxControlCoefficientMatrix()` and the rest return the same results, faster. Anything the Rust
-engine can't do exactly the way roadrunner does goes to the original roadrunner without you doing anything.
+`te.loada(...)`, `r.simulate()`, `r.steadyState()`, `r.getScaledFluxControlCoefficientMatrix()` and the rest
+return the same results, faster. Anything the Rust engine can't do exactly the way roadrunner does goes to the
+original roadrunner automatically. `tellurium.nitro` re-exports libroadrunner with a Rust-backed `RoadRunner`, so
+`roadrunner.RoadRunner(sbml)` loads the model straight into the Rust engine (no LLVM compile).
 
-**Plain libroadrunner code works too**: change `import roadrunner` to `import tellurium.nitro as roadrunner`.
-`roadrunner.RoadRunner(sbml)` then loads the model straight into the Rust engine (no LLVM compile) and runs on it;
-everything else in the module is libroadrunner's own.
+</details>
 
 | Version | What does the math |
 |---|---|
@@ -178,14 +207,24 @@ python -c "import tellurium as te; print('Nitro engine on:', te.turbo())"
 It should print `Nitro engine on: True`. If it prints `False`, step 6 didn't finish; run it again and read
 the error.
 
-**8. Use it exactly like tellurium:**
+**8. Use it.** Pick whichever matches how your code already looks.
+
+*If you use tellurium* (`import tellurium as te`): nothing changes. Write it exactly as before:
 
 ```python
 import tellurium as te
 r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')
-r.simulate(0, 10, 100)      # runs on the Rust engine
+r.simulate(0, 10, 100)      # runs on the fast engine
 r.steadyState()
 print(r.getScaledFluxControlCoefficientMatrix())
+```
+
+*If you use roadrunner directly* (`import roadrunner`): change only the import line. Everything below it stays the same.
+
+```python
+import tellurium.nitro as roadrunner     # was: import roadrunner
+r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
+r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
 
 From now on, activate the environment (step 4, `source .venv/bin/activate`) whenever you want to use Nitro.
