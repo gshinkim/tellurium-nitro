@@ -29,6 +29,9 @@ class OmexSedmlTestCase(unittest.TestCase):
     def test_omex_executeCombineArchive(self):
         tesedml.executeCombineArchive(omexPath=OMEX_SHOWCASE, workingDir=self.test_dir)
 
+    def test_omex_executeSEDML(self):
+        tesedml.executeSEDML(OMEX_SHOWCASE, workingDir=self.test_dir)
+
     def test_omex_combineArchiveToPython(self):
         pycode = tesedml.combineArchiveToPython(omexPath=OMEX_SHOWCASE)
         assert pycode is not None

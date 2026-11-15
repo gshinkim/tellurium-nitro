@@ -179,6 +179,21 @@ class PhrasedmlTestCase(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir)
 
+    def test_run_case_py_code(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            run_case(
+                call_file=os.path.realpath(__file__),
+                antimony_str="model case_01\n J0: S1 -> S2; k1*S1; S1=10; S2=0; k1=0.1\nend",
+                phrasedml_str='model0 = model "case_01.xml"\nsim0 = simulate uniform(0, 10, 10)\n'
+                              'task0 = run sim0 on model0\nreport task0.time vs task0.S1',
+                py_code=True,
+                working_dir=tmpdir
+            )
+            assert any(f.endswith('code.py') for f in os.listdir(tmpdir))
+        finally:
+            shutil.rmtree(tmpdir)
+
     def test_case_01(self):
         a_str = """
         model case_01

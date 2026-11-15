@@ -9,7 +9,7 @@ from .convert_omex import inlineOmexImporter, OmexFormatDetector
 try:
     from .convert_phrasedml import phrasedmlImporter
     from .inline_omex import inlineOmex, saveInlineOMEX
-except:
+except ImportError:
     pass
 
 from .antimony_sbo import SBOError
