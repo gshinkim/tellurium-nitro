@@ -158,6 +158,23 @@ official release, so they are upstream issues. Wall time is about the same for a
 mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation. The speed difference shows in the
 compute benchmarks above.
 
+**Upstream bugs fixed in Nitro.** Nitro now fixes those failures and a few other long-standing tellurium bugs. Its
+own test suite (`pytest tellurium/tests`) passes in full: 417 passed, 0 failed, 8 skipped (the skips need internet
+access or optional extras). What that means for you:
+
+- **Reading data files in SED-ML now works.** Simulation descriptions that load experimental data from CSV, TSV or
+  NuML files used to crash with an `AssertionError`, because newer libsedml versions return their own copy of a
+  data type. That was 13 of the failing tests.
+- **`te.executeSEDML("my_file.omex")` works.** Running an `.omex` archive file through `executeSEDML` used to crash
+  with `NameError: CombineArchive`.
+- **Turning plotting off works.** After `te.disablePlotting()`, making a tiled figure used to crash with a
+  `NameError`.
+- **No more silently missing features.** If the optional `phrasedml` package is missing, the inline OMEX tools
+  now say so clearly instead of quietly disappearing.
+- **No leftover temporary folders.** Running an inline OMEX no longer leaves a temporary folder behind each time.
+- **Smaller fixes:** `distributed_sensitivity_analysis` no longer crashes on its bounds check, `run_case(...,
+  py_code=True)` writes its Python script again, and two test files that needed the old `six` package now run.
+
 ## Install Tellurium Nitro (step by step)
 
 > **Do not run `pip install tellurium`.** That installs *regular* tellurium from PyPI. Tellurium Nitro is installed

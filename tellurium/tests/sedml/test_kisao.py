@@ -13,7 +13,6 @@ import shutil
 import tempfile
 import unittest
 import pytest
-import six
 import matplotlib
 
 import tellurium as te
@@ -268,7 +267,7 @@ class KisaoSedmlTestCase(unittest.TestCase):
         omex_file = os.path.join(self.test_dir, "test.omex")
         te.exportInlineOmex(inline_omex, omex_file)
         pycode_dict = tesedml.combineArchiveToPython(omex_file)
-        pycode = six.next(six.itervalues(pycode_dict))
+        pycode = next(iter(pycode_dict.values()))
         print(pycode)
         self.assertTrue("integrator.setValue('stiff', True)" in pycode)
 
@@ -288,7 +287,7 @@ class KisaoSedmlTestCase(unittest.TestCase):
         omex_file = os.path.join(self.test_dir, "test.omex")
         te.exportInlineOmex(inline_omex, omex_file)
         pycode_dict = tesedml.combineArchiveToPython(omex_file)
-        pycode = six.next(six.itervalues(pycode_dict))
+        pycode = next(iter(pycode_dict.values()))
         print(pycode)
         self.assertTrue("integrator.setValue('stiff', False)" in pycode)
 
@@ -308,7 +307,7 @@ class KisaoSedmlTestCase(unittest.TestCase):
         omex_file = os.path.join(self.test_dir, "test.omex")
         te.exportInlineOmex(inline_omex, omex_file)
         pycode_dict = tesedml.combineArchiveToPython(omex_file)
-        pycode = six.next(six.itervalues(pycode_dict))
+        pycode = next(iter(pycode_dict.values()))
         print(pycode)
         self.assertTrue("model0.setIntegrator('euler')" in pycode)
 
@@ -328,7 +327,7 @@ class KisaoSedmlTestCase(unittest.TestCase):
         omex_file = os.path.join(self.test_dir, "test.omex")
         te.exportInlineOmex(inline_omex, omex_file)
         pycode_dict = tesedml.combineArchiveToPython(omex_file)
-        pycode = six.next(six.itervalues(pycode_dict))
+        pycode = next(iter(pycode_dict.values()))
         print(pycode)
         self.assertTrue("model0.setIntegrator('euler')" in pycode)
 
@@ -545,7 +544,7 @@ class KisaoSedmlTestCase(unittest.TestCase):
         omex_file = os.path.join(self.test_dir, "test.omex")
         te.exportInlineOmex(inline_omex, omex_file)
         pycode_dict = tesedml.combineArchiveToPython(omex_file)
-        pycode = six.next(six.itervalues(pycode_dict))
+        pycode = next(iter(pycode_dict.values()))
         print(pycode)
         self.assertTrue("model0.integrator.setValue('nonnegative', True)" in pycode)
 

@@ -450,7 +450,7 @@ def distributed_sensitivity_analysis(sc,senitivity_analysis_model,calculation=No
         for bound_values in senitivity_analysis_model.bounds.values():
             if(len(bound_values) > 2):
                 params.append(np.logspace(bound_values[0], bound_values[1], bound_values[2]))
-            elif(len(bound_values == 2)):
+            elif(len(bound_values) == 2):
                 params.append(np.logspace(bound_values[0], bound_values[1], 3))
             else:
                 print("Improper Boundaries Defined")
@@ -459,14 +459,14 @@ def distributed_sensitivity_analysis(sc,senitivity_analysis_model,calculation=No
         for bound_values in senitivity_analysis_model.bounds.values():
             if(len(bound_values) > 2):
                 params.append(np.linspace(bound_values[0], bound_values[1], bound_values[2]))
-            elif(len(bound_values == 2)):
+            elif(len(bound_values) == 2):
                 params.append(np.linspace(bound_values[0], bound_values[1], 3))
             else:
                 print("Improper Boundaries Defined")
                 return;
 
     samples = perform_sampling(np.meshgrid(*params))
-    samples = zip([senitivity_analysis_model]*len(samples),samples)
+    samples = list(zip([senitivity_analysis_model]*len(samples),samples))
     if(calculation == "avg"):
         group_rdd = sc.parallelize(samples,len(samples)).map(spark_sensitivity_analysis).\
             flatMap(lambda x: x[1].items()).groupByKey()

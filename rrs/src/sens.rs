@@ -3,7 +3,7 @@
 //! (Var(nx + k)), so `Dag::diff` yields exact d v / d parameter as well as d v / d state.
 //!
 //! Sensitivities: for each parameter (in parallel) an augmented model with states [x | s] and
-//! ds/dt = J(x) s + df/dp_k is compiled and integrated by the same Rodas4 (its Jacobian, including
+//! ds/dt = J(x) s + df/dp_k is compiled and integrated by Model::simulate (BDF or Rodas4; its Jacobian, including
 //! the d(J s)/dx block, is again exact).
 use crate::expr::{Dag, Op, Tape, N};
 use crate::model::{Key, Model, Rules};

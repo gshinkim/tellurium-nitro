@@ -4,6 +4,7 @@ Template functions to run the example cases.
 from __future__ import print_function
 import tellurium as te
 import os
+from tellurium.sedml.tesedml import combineArchiveToPython
 
 
 
@@ -26,14 +27,15 @@ def run_case(call_file, antimony_str, phrasedml_str, py_code=False, working_dir=
         if not os.path.exists(working_dir):
             os.makedirs(working_dir)
 
-    # FIXME: not working
     # write python code
     if py_code:
         fname = os.path.basename(call_file)
+        omex_file = os.path.join(working_dir, fname + '.omex')
+        te.exportInlineOmex(inline_omex, omex_file)
         py_file = os.path.join(working_dir, fname + 'code.py')
         print(py_file)
         with open(py_file, 'w') as f:
-            f.write(exp._toPython(phrasedml_str, workingDir=working_dir))
+            f.write('\n'.join(combineArchiveToPython(omex_file).values()))
 
     # execute python
     te.executeInlineOmex(inline_omex)

@@ -2,9 +2,17 @@
 Testing temiriam module
 """
 from __future__ import absolute_import, print_function
-from six import string_types
+import pytest
+import requests
 import roadrunner
 from tellurium import temiriam
+
+
+def _fetch(urn):
+    try:
+        return temiriam.getSBMLFromBiomodelsURN(urn)
+    except requests.exceptions.RequestException as e:
+        pytest.skip('BioModels not reachable (network test): {}'.format(e))
 
 
 def test_getSBMLFromBiomodelsURN1():
@@ -13,10 +21,10 @@ def test_getSBMLFromBiomodelsURN1():
     :return:
     """
     urn = 'urn:miriam:biomodels.db:BIOMD0000000139'
-    sbml = temiriam.getSBMLFromBiomodelsURN(urn)
+    sbml = _fetch(urn)
     assert sbml is not None
     # check that string
-    assert isinstance(sbml, string_types)
+    assert isinstance(sbml, str)
 
 
 def test_getSBMLFromBiomodelsURN2():
@@ -25,7 +33,7 @@ def test_getSBMLFromBiomodelsURN2():
     :return:
     """
     urn = 'urn:miriam:biomodels.db:BIOMD0000000139'
-    sbml = temiriam.getSBMLFromBiomodelsURN(urn)
+    sbml = _fetch(urn)
 
     print("*" * 80)
     print(type(sbml))

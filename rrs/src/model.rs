@@ -1,4 +1,4 @@
-//! Reaction-network model: conservation analysis, damped Newton steady state, Rodas4 integrator
+//! Reaction-network model: conservation analysis, damped Newton steady state, BDF and Rodas4 integrators
 //! with root-located events, Gillespie SSA and per-sample MCA. All per-sample work happens in a
 //! preallocated `Work`; nothing allocates in the inner loops.
 //!
@@ -1026,7 +1026,7 @@ impl Model {
         self.events.iter().zip(prev).any(|(e, &p)| (ra[e.trig as usize] != 0.0) != p)
     }
 
-    /// Earliest trigger change inside the last step (ta, tb]: bisection on the Rodas4 dense output
+    /// Earliest trigger change inside the last step (ta, tb]: bisection on the active solver's dense output
     /// to ~1e-12 relative in time. Returns the first time at which a trigger has changed.
     fn locate(&self, w: &mut Work, ta: f64, tb: f64, bdf: bool) -> f64 {
         if !bdf { self.dense_coef(w); }

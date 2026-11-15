@@ -41,7 +41,7 @@ class NullFigure(PlottingFigure):
 
 
 
-class PlotlyTiledFigure(TiledFigure):
+class NullTiledFigure(TiledFigure):
     def __init__(self, engine, rows, cols):
         pass
 
@@ -51,7 +51,7 @@ class PlotlyTiledFigure(TiledFigure):
     def renderIfExhausted(self):
         pass
 
-class PlotlyLowerTriFigure(PlotlyTiledFigure,LowerTriFigure):
+class NullLowerTriFigure(NullTiledFigure, LowerTriFigure):
     def makeTitles(self):
         pass
 

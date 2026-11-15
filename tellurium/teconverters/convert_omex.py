@@ -5,6 +5,7 @@ from __future__ import print_function, division, absolute_import
 import os
 import re
 import tempfile
+import shutil
 import json
 import getpass
 
@@ -153,14 +154,16 @@ class Omex(object):
             pass
 
         workingDir = tempfile.mkdtemp(suffix="_sedml")
-        self.writeFiles(workingDir)
-        from tellurium import executeSEDML
-        for sedml_asset in self.getSedmlAssets():
-            if sedml_asset.getMaster():
-                sedml_path = os.path.join(workingDir, sedml_asset.getLocation())
-                executeSEDML(sedml_path,
-                             workingDir=os.path.dirname(sedml_path))
-                # shutil.rmtree(workingDir)
+        try:
+            self.writeFiles(workingDir)
+            from tellurium import executeSEDML
+            for sedml_asset in self.getSedmlAssets():
+                if sedml_asset.getMaster():
+                    sedml_path = os.path.join(workingDir, sedml_asset.getLocation())
+                    executeSEDML(sedml_path,
+                                 workingDir=os.path.dirname(sedml_path))
+        finally:
+            shutil.rmtree(workingDir)
 
     def exportToCombine(self, outfile):
         """ Export Omex instance as combine archive.

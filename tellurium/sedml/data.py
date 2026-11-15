@@ -362,7 +362,6 @@ class DataDescriptionParser(object):
         :param description:
         :return:
         """
-        assert (isinstance(description, libnuml.DimensionDescription))
         info = [cls._parse_description(description.get(k)) for k in range(description.size())]
 
         flat_info = []

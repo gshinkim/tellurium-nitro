@@ -2394,9 +2394,10 @@ class SEDMLTools(object):
 
                 # TODO: refactor this
                 # extract the archive to working directory
-                CombineArchive.extractArchive(omexPath, extractDir)
+                omex.extractCombineArchive(omexPath, directory=extractDir, method="zip")
                 # get SEDML files from archive
-                sedmlFiles = CombineArchive.filePathsFromExtractedArchive(extractDir, filetype='sed-ml')
+                sedmlFiles = [os.path.join(extractDir, loc)
+                              for loc in omex.getLocationsByFormat(omexPath, "sed-ml")]
 
                 if len(sedmlFiles) == 0:
                     raise IOError("No SEDML files found in archive.")
