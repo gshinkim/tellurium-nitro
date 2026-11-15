@@ -78,3 +78,4 @@ rrs/target/
 graphify-out/
 benchmarks/run.log
 benchmarks/ref/
+.venv/

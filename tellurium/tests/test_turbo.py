@@ -675,7 +675,7 @@ class TestLazy(unittest.TestCase):
                 # VARS: reset() with a variable compartment needs roadrunner (loaded from the lazy state).
                 # Compared with turbo on an eagerly loaded model: after Rust ran the events, roadrunner's
                 # reset() doesn't see their t0=false trigger state, unlike plain roadrunner.
-                ref = self.workflow(ExtendedRoadRunner(sbml) if name == 'VARS' else base(sbml), sbml)
+                ref = self.workflow(ExtendedRoadRunner(sbml)._load_rr() if name == 'VARS' else base(sbml), sbml)
                 if name == 'VARS':
                     r = te.loadSBMLModel(sbml)
                     got = self.workflow(r, sbml)
@@ -686,6 +686,20 @@ class TestLazy(unittest.TestCase):
                         got = self.workflow(r, sbml)
                         self.assertIn('_lz', r.__dict__)  # roadrunner never compiled the model
                 self.compare(ref, got, name)
+
+    def test_dropin_module(self):
+        # import tellurium.nitro as roadrunner: RoadRunner(sbml) is Rust-backed and lazy, results match roadrunner
+        import roadrunner
+        import tellurium.nitro as rr
+        te.turbo(True)
+        sbml = te.antimonyToSBML(chain(12))
+        ref = roadrunner.roadrunner.RoadRunner(sbml)
+        with mock.patch.object(roadrunner.roadrunner.RoadRunner, '_load', _raise):
+            r = rr.RoadRunner(sbml)
+            self.assertIsInstance(r, roadrunner.roadrunner.RoadRunner)
+            self.same(r.simulate(0, 10, 11), ref.simulate(0, 10, 11), rtol=1e-4, atol=1e-8)
+            self.assertIn('_lz', r.__dict__)
+        self.assertIs(rr.Config, roadrunner.Config)
 
     def test_attributes_mca_and_load_on_demand(self):
         import roadrunner
