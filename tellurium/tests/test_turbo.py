@@ -206,10 +206,10 @@ class TestTurbo(unittest.TestCase):
     def test_switch(self):
         te.turbo(False)
         self.assertFalse(te.turbo())
-        self.assertIsNone(te.loada(MOIETY)._rs())
+        self.assertIsNone(te.loada(MOIETY)._rs_or_none())
         te.turbo(True)
         self.assertTrue(te.turbo())
-        self.assertIsNotNone(te.loada(MOIETY)._rs())
+        self.assertIsNotNone(te.loada(MOIETY)._rs_or_none())
         self.assertTrue(issubclass(type(te.loada(MOIETY)), ExtendedRoadRunner))
 
 
@@ -700,6 +700,61 @@ class TestLazy(unittest.TestCase):
             self.same(r.simulate(0, 10, 11), ref.simulate(0, 10, 11), rtol=1e-4, atol=1e-8)
             self.assertIn('_lz', r.__dict__)
         self.assertIs(rr.Config, roadrunner.Config)
+
+    def test_routing(self):
+        # every public roadrunner method is routed: none runs roadrunner's own code on an uncompiled lazy model
+        from tellurium.roadrunner.extended_roadrunner import _routing
+        r = _routing()
+        self.assertEqual([n for n, k in r.items() if k == 'unrouted'], [])
+        for n, k in (('simulate', 'override'), ('steadyState', 'override'), ('getFullStoichiometryMatrix', 'override'),
+                     ('getConservationMatrix', 'loads'), ('load', 'invalidates'), ('addReaction', 'invalidates'),
+                     ('reset', 'resets'), ('getIntegrator', 'no-model')):
+            self.assertEqual(r.get(n), k, n)
+
+    def test_last_run(self):
+        te.turbo(True)
+        r = te.loada(chain(12))
+        self.assertIsNone(r.lastRun)
+        r.simulate(0, 10, 11)
+        run = r.lastRun
+        self.assertEqual((run['method'], run['engine'], run['reason'], run['solver']), ('simulate', 'rust', None, 'bdf'))
+        self.assertGreater(run['bdf_steps'], 0)
+        r.integrator.relative_tolerance = 1e-3
+        r.simulate(0, 10, 11)
+        self.assertEqual(r.lastRun['solver'], 'rodas4')
+        r.integrator.relative_tolerance = 1e-6
+        r.integrator.maximum_time_step = 0.5  # a setting Rust doesn't honour
+        r.simulate(0, 10, 11)
+        self.assertEqual((r.lastRun['engine'], r.lastRun['reason']), ('roadrunner', 'cvode settings maximum_time_step'))
+        r.integrator.maximum_time_step = 0.0
+        r.steadyState()
+        self.assertEqual(r.lastRun['engine'], 'rust')
+        te.turbo(False)
+        try:
+            r.steadyState()
+            self.assertEqual((r.lastRun['engine'], r.lastRun['reason']), ('roadrunner', 'turbo is off'))
+        finally:
+            te.turbo(True)
+
+    def test_simulate_batch(self):
+        te.turbo(True)
+        r = te.loada(chain(12) + "\nat time > 3: k1 = 2")
+        ks = [0.5, 1.0, 2.0]
+        got = r.simulateBatch({'k0': ks, 'S3': [0.1, 1.0, 3.0]}, 0, 10, 21)
+        self.assertEqual(r.lastRun['engine'], 'rust')
+        self.assertEqual(got.shape, (3, 21, len(r.timeCourseSelections)))
+        for i, (k, s3) in enumerate(zip(ks, [0.1, 1.0, 3.0])):  # same as one simulate per set from this state
+            q = te.loada(chain(12) + "\nat time > 3: k1 = 2")
+            q.k0, q['[S3]'] = k, s3
+            self.same(got[i], np.asarray(q.simulate(0, 10, 21)), rtol=1e-5, atol=1e-9)
+        self.assertEqual(r.getCurrentTime(), 0.0)  # the model itself is untouched
+        te.turbo(False)
+        try:
+            slow = r.simulateBatch({'k0': ks, 'S3': [0.1, 1.0, 3.0]}, 0, 10, 21)
+            self.assertEqual(r.lastRun['engine'], 'roadrunner')
+        finally:
+            te.turbo(True)
+        self.same(got, slow, rtol=1e-4, atol=1e-8)
 
     def test_attributes_mca_and_load_on_demand(self):
         import roadrunner

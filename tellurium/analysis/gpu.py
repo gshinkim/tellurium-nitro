@@ -139,13 +139,7 @@ def controlCoefficients(r, samples=None, processes=None):
     keys = list(samples[0]) if n else []
     m = None
     if all(list(p) == keys for p in samples):
-        try:
-            from .rrs_bridge import from_roadrunner
-            m = from_roadrunner(r)
-        except ImportError:
-            pass  # roadrunner_rs not built: roadrunner path
-        except NotImplementedError as e:
-            warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
+        m = _rust_model(r)
     if m is None:
         return _cc_roadrunner(r, samples, processes)
 
@@ -169,6 +163,26 @@ def controlCoefficients(r, samples=None, processes=None):
 
 
 _KEYS = ('ccc', 'fcc', 'elasticities', 'uccc', 'ufcc')
+
+
+def _rust_model(r):
+    """The runner's own (cached) Rust model, or None when roadrunner has to do it."""
+    if hasattr(r, '_rs'):  # ExtendedRoadRunner: the model it already built (and its turbo switch)
+        from ..roadrunner.extended_roadrunner import _Fallback
+        try:
+            return r._rs().m
+        except _Fallback as e:
+            if 'installed' not in str(e) and 'turbo is off' not in str(e):
+                warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
+            return None
+    try:  # a plain roadrunner.RoadRunner
+        from .rrs_bridge import from_roadrunner
+        return from_roadrunner(r)
+    except ImportError:
+        return None  # roadrunner_rs not built: roadrunner path
+    except NotImplementedError as e:
+        warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
+        return None
 
 
 def _cc_roadrunner(r, samples, processes):

@@ -21,6 +21,10 @@ can't handle something, Nitro quietly hands that job to the original roadrunner,
 - **Works with plain roadrunner code too (new)**: if your scripts use `import roadrunner` instead of tellurium,
   change that one line to `import tellurium.nitro as roadrunner` and the rest of your script stays the same,
   but now runs on the fast engine. See step 8 of the install guide.
+- **Run many simulations at once (new)**: `r.simulateBatch(...)` runs one simulation per set of parameter
+  values, using every core of your computer. Handy for parameter scans, fitting and "what if" questions.
+- **See what happened (new)**: after any simulation or analysis, `r.lastRun` tells you whether the fast engine
+  did the work, and if not, why it handed the job to the original roadrunner.
 
 ### How do I use it?
 
@@ -229,6 +233,33 @@ r.simulate(0, 10, 100)                      # runs on the fast engine
 
 From now on, activate the environment (step 4, `source .venv/bin/activate`) whenever you want to use Nitro.
 
+**9. Run many simulations at once (optional).** Give each setting you want to change a list of values. Nitro
+runs one simulation per position in the lists, all at the same time:
+
+```python
+import tellurium as te
+r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')
+results = r.simulateBatch({'k1': [0.1, 0.5, 1.0, 2.0]}, 0, 10, 100)
+print(results.shape)        # (4, 100, 3): 4 runs x 100 time points x 3 columns (time, S1, S2)
+first_run = results[0]      # the simulation with k1 = 0.1
+```
+
+Each run starts from the model as it is now, and the model itself isn't changed. Species names mean
+concentrations, the same as `r.S1`. Lists that change several settings are paired up position by position;
+they don't make every possible combination.
+
+**10. Check which engine ran (optional).** If something seems slow, ask Nitro what it did last:
+
+```python
+r.simulate(0, 10, 100)
+print(r.lastRun)
+# {'method': 'simulate', 'engine': 'rust', 'reason': None, 'solver': 'bdf', 'bdf_steps': 69, ...}
+```
+
+`'engine': 'rust'` means the fast engine did the work. `'engine': 'roadrunner'` means Nitro handed the job to the
+original roadrunner, and `'reason'` says why (for example a solver setting the fast engine doesn't support).
+Your results are correct either way. Only the speed differs.
+
 **Optional:**
 - `te.turbo(False)` switches back to the original roadrunner engine for the rest of the session. So does setting the
   environment variable `TELLURIUM_ENGINE=roadrunner`.
@@ -240,6 +271,13 @@ From now on, activate the environment (step 4, `source .venv/bin/activate`) when
 
 ## How it works
 
+- **One decision point:** every call that the Rust engine can answer goes through `ExtendedRoadRunner._run`. The
+  Rust path raises `_Fallback(reason)` for anything it can't do exactly like roadrunner; the call then goes to
+  roadrunner, and `r.lastRun` records the engine, the reason and (for time courses) the solver's step counts.
+- **Rust model per runner** (`_RsModel` in `extended_roadrunner.py`): the Rust model, the index maps between
+  roadrunner's ids and it, the output-column plans (`_Cols`) and a `roadrunner_rs.Session`, which keeps the event
+  state between `simulate`/`oneStep` calls and retries a failed run with a tighter tolerance. `simulateBatch` and
+  `te.controlCoefficients` reuse the same model.
 - **Rust engine** (`rrs/`, Python module `roadrunner_rs`):
   - Rate laws become a flat tape with exact symbolic derivatives (Jacobians, elasticities, parameter derivatives).
   - The tape is JIT-compiled to native code with Cranelift after 2000 evaluations, so short one-shot runs don't pay
