@@ -1,4 +1,4 @@
-"""roadrunner_rs vs roadrunner: MCA to 1e-8, simulation (rules, events) to 1e-4, SSA statistics,
+"""roadrunner_nitro vs roadrunner: MCA to 1e-8, simulation (rules, events) to 1e-4, SSA statistics,
 plus timings.
 Run: ~/venvs/tellurium/bin/python rrs/check.py
 """
@@ -10,13 +10,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))  # this repo's tellurium
 import roadrunner
-import tellurium as te
-from tellurium.analysis.rrs_bridge import from_roadrunner
+import tellurium_nitro as te
+from tellurium_nitro.analysis.rrs_bridge import from_roadrunner
 
 
 def load(ant):
     # plain libroadrunner as the reference: tellurium replaces roadrunner.RoadRunner with a facade
-    # that may itself run on roadrunner_rs
+    # that may itself run on roadrunner_nitro
     return roadrunner.roadrunner.RoadRunner(te.antimonyToSBML(ant))
 
 SMALL = '''
@@ -57,7 +57,7 @@ def check(name, ant, k1s):
         r.resetAll()
         r.k1 = k
         # roadrunner's elasticities are finite differences (default step 0.02 gives ~5e-8 error in
-        # fcc on the bench model); roadrunner_rs differentiates exactly, so tighten the reference.
+        # fcc on the bench model); roadrunner_nitro differentiates exactly, so tighten the reference.
         r.setDiffStepSize(1e-4)
         r.steadyState()
         for key, get in (('ccc', r.getScaledConcentrationControlCoefficientMatrix),
@@ -77,7 +77,7 @@ def timing(ant, n=1000):
         r.resetAll()
         r.k1 = k
         # roadrunner's elasticities are finite differences (default step 0.02 gives ~5e-8 error in
-        # fcc on the bench model); roadrunner_rs differentiates exactly, so tighten the reference.
+        # fcc on the bench model); roadrunner_nitro differentiates exactly, so tighten the reference.
         r.setDiffStepSize(1e-4)
         r.steadyState()
         r.getUnscaledElasticityMatrix()
@@ -99,7 +99,7 @@ def timing(ant, n=1000):
     print(f"{'engine':42s} {'per sample':>12s} {'speedup':>9s}")
     print(f"{'roadrunner steadyState+elasticities (1 thr)':42s} {t_rr*1e6:10.1f} us {1:8.0f}x")
     for (label, th), t in out.items():
-        lab = f"roadrunner_rs {label} ({'1 thr' if th else 'all thr'})"
+        lab = f"roadrunner_nitro {label} ({'1 thr' if th else 'all thr'})"
         print(f"{lab:42s} {t*1e6:10.2f} us {t_rr/t:8.0f}x")
     t_ss1 = out[('steady_state_batch', 1)]
     assert t_rr / t_ss1 >= 100, "less than 100x faster single-threaded"
@@ -165,7 +165,7 @@ E2: at (S1 > 1), t0=true: S1 = 50
 
 
 def compare(name, ant, T=10, N=101):
-    """roadrunner_rs simulate_one/simulate_batch vs roadrunner simulate, all outputs, tight tolerances."""
+    """roadrunner_nitro simulate_one/simulate_batch vs roadrunner simulate, all outputs, tight tolerances."""
     r = load(ant)
     m = from_roadrunner(r)
     ids = [i for i in m.output_ids if i in r.model.getFloatingSpeciesIds() + r.model.getGlobalParameterIds()
@@ -257,7 +257,7 @@ def sim_timing():
             t = (time.perf_counter() - t0) / reps
             assert np.isfinite(out).all()
             rows.append((label, n, th, t_rr, t / n))
-    print(f"\nTiming simulate(0, 10, 51), default tolerances (roadrunner CVODE vs roadrunner_rs BDF)")
+    print(f"\nTiming simulate(0, 10, 51), default tolerances (roadrunner CVODE vs roadrunner_nitro BDF)")
     print(f"{'model':26s} {'samples':>7s} {'threads':>7s} {'roadrunner/sample':>18s} {'rs/sample':>11s} {'speedup':>8s}")
     for label, n, th, t_rr, t in rows:
         print(f"{label:26s} {n:7d} {th or 'all'!s:>7s} {t_rr*1e6:15.1f} us {t*1e6:8.2f} us {t_rr/t:7.1f}x")

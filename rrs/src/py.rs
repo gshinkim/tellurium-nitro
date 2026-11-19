@@ -1,4 +1,4 @@
-//! Python bindings (module `roadrunner_rs`).
+//! Python bindings (module `roadrunner_nitro`).
 use crate::model::{EventDef, Key, Model, Rows, Rules, Work};
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -305,7 +305,7 @@ impl PyModel {
         });
         let es = m.event_state(&w);
         self.pool.lock().unwrap().push(w);
-        if !ok { return Err(PyRuntimeError::new_err("roadrunner_rs: integration failed")); }
+        if !ok { return Err(PyRuntimeError::new_err("roadrunner_nitro: integration failed")); }
         let d = if final_array { PyArray1::from_vec(py, fin).into_any() } else {
             let names = self.names.get_or_init(|| m.outputs.iter().map(|o| PyString::intern(py, &o.0).unbind()).collect());
             let d = PyDict::new(py);
@@ -433,7 +433,7 @@ impl Session {
             *stats = (w.stats, tried, false);
             false
         });
-        if !ok { return Err(PyRuntimeError::new_err("roadrunner_rs: integration failed")); }
+        if !ok { return Err(PyRuntimeError::new_err("roadrunner_nitro: integration failed")); }
         Ok((arr(py, out, &[nt, no])?, PyArray1::from_vec(py, fin).into_any()))
     }
 
@@ -479,7 +479,7 @@ fn antimony_to_sbml(source: &str) -> PyResult<String> {
 }
 
 #[pymodule]
-fn roadrunner_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_class::<Session>()?;

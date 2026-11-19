@@ -15,8 +15,8 @@ import glob, json, os, sys, time, warnings
 import numpy as np
 
 warnings.filterwarnings('ignore')
-import tellurium  # noqa: F401  (import order: libsedml before libsbml)
-from tellurium.analysis.rrs_bridge import from_sbml
+import tellurium_nitro  # noqa: F401  (import order: libsedml before libsbml)
+from tellurium_nitro.analysis.rrs_bridge import from_sbml
 
 LEVELS = ['l3v2', 'l3v1', 'l2v5', 'l2v4', 'l2v3', 'l2v2', 'l2v1']
 

@@ -40,8 +40,9 @@ change over time. All the real number-crunching inside it is done by a C++ engin
 Tellurium Nitro replaces that engine's work with a new engine written in the Rust programming language. The new
 engine solves the same equations, but it wastes far less work, it calculates exact answers where the old one used
 approximations, it uses every processor core, and it translates each model into native machine code (the "JIT").
-It reads model files itself, so loading a big model no longer waits for roadrunner. Your Python code does not
-change: the same <code>te.loada()</code>, <code>r.simulate()</code> and <code>r.steadyState()</code> calls just come
+It reads model files itself, so loading a big model no longer waits for roadrunner. It installs under its own names (<code>tellurium_nitro</code> and <code>libroadrunner_nitro</code>), so it sits
+next to regular tellurium without touching it. Your Python code changes only in its import line
+(<code>import tellurium_nitro as te</code>): the same <code>te.loada()</code>, <code>r.simulate()</code> and <code>r.steadyState()</code> calls just come
 back faster. If the new engine ever meets something it can't handle, it quietly hands that job to the original
 engine. With that backup switched off, it passes every one of the 1,923 cases of the official SBML Test Suite on
 its own.</p>
@@ -180,7 +181,7 @@ models and random numbers inside models ("distrib"). Section 7 explains how, fea
    Traffic controller (ExtendedRoadRunner._run): can Rust do this call?
           | yes                                             | no
           v                                                 v
-   Rust model (roadrunner_rs)                       roadrunner (C++), unchanged,
+   Rust model (roadrunner_nitro)                       roadrunner (C++), unchanged,
    formulas as a "tape" + exact derivatives;        not even loaded until a rare
    JIT turns hot tapes into machine code            call needs it ("lazy"), then
           |                                         handed the current state
@@ -222,11 +223,11 @@ and retries a failed run with tighter accuracy.</li>
 <tr><td>Random draws (<code>rrs/src/rand.rs</code>)</td><td>The 12 distributions of SBML "distrib" (normal, uniform, exponential, gamma, poisson, binomial, bernoulli, cauchy, chi-square, laplace, lognormal, rayleigh), optionally cut off at lower/upper limits. One random stream per thread, seeded per run.</td></tr>
 <tr><td>Python bindings (<code>rrs/src/py.rs</code>)</td><td>Lets Python call the Rust engine (via PyO3 and maturin), passing numpy arrays without copying where possible.</td></tr>
 <tr><td>Antimony / SBML readers (<code>rrs/crates/antimony</code>, <code>rrs/crates/sbml-io</code>)</td><td>Pure-Rust Antimony-to-SBML reader, copied from sys-bio/PathwayDesigner-rs. Anything it rejects goes to libantimony.</td></tr>
-<tr><td>Bridge (<code>tellurium/analysis/rrs_bridge.py</code>)</td><td>Reads the SBML (species, reactions, compartments, rules, events, initial assignments, unit conversions); flattens comp models; turns fast reactions and algebraic rules into solvable form; computes starting values; builds the Rust model.</td></tr>
-<tr><td>Traffic controller (<code>tellurium/roadrunner/extended_roadrunner.py</code>)</td><td>One decision point (<code>_run</code>) for every call; records <code>r.lastRun</code>; lazy roadrunner; <code>simulateBatch</code>; <code>te.turbo()</code>.</td></tr>
-<tr><td>Drop-in roadrunner (<code>tellurium/nitro.py</code>)</td><td><code>import tellurium.nitro as roadrunner</code> gives libroadrunner with the fast <code>RoadRunner</code>.</td></tr>
-<tr><td>Batch control analysis (<code>tellurium/analysis/gpu.py</code>)</td><td><code>te.controlCoefficients()</code>: thousands of parameter sets in one call; Rust first, parallel roadrunner workers as backup, optional GPU.</td></tr>
-<tr><td>Flux balance (<code>tellurium/analysis/fba.py</code>)</td><td><code>te.fba()</code>: reads the SBML fbc package (v1 and v2) and solves the linear program with SciPy's HiGHS solver.</td></tr>
+<tr><td>Bridge (<code>tellurium_nitro/analysis/rrs_bridge.py</code>)</td><td>Reads the SBML (species, reactions, compartments, rules, events, initial assignments, unit conversions); flattens comp models; turns fast reactions and algebraic rules into solvable form; computes starting values; builds the Rust model.</td></tr>
+<tr><td>Traffic controller (<code>tellurium_nitro/roadrunner/extended_roadrunner.py</code>)</td><td>One decision point (<code>_run</code>) for every call; records <code>r.lastRun</code>; lazy roadrunner; <code>simulateBatch</code>; <code>te.turbo()</code>.</td></tr>
+<tr><td>Drop-in roadrunner (<code>tellurium_nitro/nitro.py</code>)</td><td><code>import tellurium_nitro.nitro as roadrunner</code> gives libroadrunner with the fast <code>RoadRunner</code>.</td></tr>
+<tr><td>Batch control analysis (<code>tellurium_nitro/analysis/gpu.py</code>)</td><td><code>te.controlCoefficients()</code>: thousands of parameter sets in one call; Rust first, parallel roadrunner workers as backup, optional GPU.</td></tr>
+<tr><td>Flux balance (<code>tellurium_nitro/analysis/fba.py</code>)</td><td><code>te.fba()</code>: reads the SBML fbc package (v1 and v2) and solves the linear program with SciPy's HiGHS solver.</td></tr>
 </table>
 
 <h2>7. Every SBML feature, and how Nitro handles it</h2>
@@ -311,7 +312,7 @@ the other features in section 7. After each feature, run the matching SBML Test 
 
 <h3>Step 7. Connect it to tellurium</h3>
 <ol>
-<li>Expose the Rust engine to Python with PyO3 (<code>roadrunner_rs</code>), built with <code>pip install ./rrs</code>.</li>
+<li>Expose the Rust engine to Python with PyO3 (<code>roadrunner_nitro</code>), built with <code>pip install ./rrs</code>.</li>
 <li>Write the bridge: read SBML with libsbml and build the Rust model (step 2's tapes plus stoichiometry, rules,
 events). Compute starting values with your own formula evaluator, including initial assignments.</li>
 <li>Subclass tellurium's <code>ExtendedRoadRunner</code>. Route every expensive method through one function that tries
@@ -348,7 +349,7 @@ averages and spreads match the expected values. Before this work: 1,405 / 1,789 
 tellurium, Turbo and Nitro. Nitro's own suite passes in full: 417 passed, 0 failed, 8 skipped (need internet or
 optional extras).</li>
 <li><b>Side-by-side checks.</b> Every Rust feature has a test that runs the same model through roadrunner and compares
-(<code>tellurium/tests/test_turbo.py</code>, <code>rrs/check.py</code>, Rust unit tests). The random distributions
+(<code>tellurium_nitro/tests/test_turbo.py</code>, <code>rrs/check.py</code>, Rust unit tests). The random distributions
 are checked against their known averages and spreads.</li>
 <li><b>Against the truth, not just each other.</b> The benchmark compares all versions with a very-high-accuracy
 reference, so it shows who is closer to the true answer.</li>
@@ -430,18 +431,18 @@ from <code>getDependentRatesOfChange</code> when moiety analysis is on.</p>
 <h2>12. Everything that changed, file by file</h2>
 <table>
 <tr><th>File</th><th>Status</th><th>Purpose</th></tr>
-<tr><td><code>rrs/</code> (whole folder)</td><td>new</td><td>The Rust engine <code>roadrunner_rs</code>: <code>src/expr.rs</code>, <code>jit.rs</code>, <code>model.rs</code>, <code>sens.rs</code>, <code>rand.rs</code>, <code>py.rs</code>, <code>lib.rs</code>; <code>crates/antimony</code>, <code>crates/sbml-io</code>; <code>check.py</code>.</td></tr>
-<tr><td><code>tellurium/analysis/rrs_bridge.py</code></td><td>new</td><td>Reads SBML directly and builds the Rust model.</td></tr>
-<tr><td><code>tellurium/roadrunner/extended_roadrunner.py</code></td><td>changed</td><td>Traffic controller, <code>lastRun</code>, lazy roadrunner, <code>simulateBatch</code>, <code>te.turbo()</code>.</td></tr>
-<tr><td><code>tellurium/nitro.py</code></td><td>new</td><td>Drop-in <code>import tellurium.nitro as roadrunner</code>.</td></tr>
-<tr><td><code>tellurium/analysis/fba.py</code></td><td>new</td><td><code>te.fba()</code> flux balance analysis.</td></tr>
-<tr><td><code>tellurium/tellurium.py</code></td><td>changed</td><td>Loaders create the lazy model; <code>te.antimony()</code>, <code>te.SBML()</code> switches.</td></tr>
-<tr><td><code>tellurium/analysis/gpu.py</code></td><td>new in Turbo, changed</td><td><code>te.controlCoefficients</code>, <code>te.gpu</code>; now Rust first.</td></tr>
-<tr><td><code>tellurium/__init__.py</code></td><td>changed</td><td>Exports <code>te.turbo</code>, <code>te.gpu</code>, <code>te.getGPU</code>, <code>te.controlCoefficients</code>, <code>te.antimony</code>, <code>te.SBML</code>, <code>te.fba</code>.</td></tr>
-<tr><td><code>tellurium/sedml/*</code>, <code>teconverters</code>, <code>plotting/engine_null.py</code></td><td>changed</td><td>Upstream bug fixes (section 9).</td></tr>
-<tr><td><code>tellurium/visualization/sbmldiagram.py</code></td><td>changed</td><td>Removed an old Python 2 import that broke <code>import tellurium</code>.</td></tr>
-<tr><td><code>tellurium/tests/test_turbo.py</code>, <code>test_gpu.py</code></td><td>new</td><td>Rust vs roadrunner comparison tests, including sosbench.</td></tr>
-<tr><td><code>setup.py</code></td><td>changed</td><td>Optional <code>gpu</code> extra (PyTorch).</td></tr>
+<tr><td><code>rrs/</code> (whole folder)</td><td>new</td><td>The Rust engine <code>roadrunner_nitro</code>: <code>src/expr.rs</code>, <code>jit.rs</code>, <code>model.rs</code>, <code>sens.rs</code>, <code>rand.rs</code>, <code>py.rs</code>, <code>lib.rs</code>; <code>crates/antimony</code>, <code>crates/sbml-io</code>; <code>check.py</code>.</td></tr>
+<tr><td><code>tellurium_nitro/analysis/rrs_bridge.py</code></td><td>new</td><td>Reads SBML directly and builds the Rust model.</td></tr>
+<tr><td><code>tellurium_nitro/roadrunner/extended_roadrunner.py</code></td><td>changed</td><td>Traffic controller, <code>lastRun</code>, lazy roadrunner, <code>simulateBatch</code>, <code>te.turbo()</code>.</td></tr>
+<tr><td><code>tellurium_nitro/nitro.py</code></td><td>new</td><td>Drop-in <code>import tellurium_nitro.nitro as roadrunner</code>.</td></tr>
+<tr><td><code>tellurium_nitro/analysis/fba.py</code></td><td>new</td><td><code>te.fba()</code> flux balance analysis.</td></tr>
+<tr><td><code>tellurium_nitro/tellurium.py</code></td><td>changed</td><td>Loaders create the lazy model; <code>te.antimony()</code>, <code>te.SBML()</code> switches.</td></tr>
+<tr><td><code>tellurium_nitro/analysis/gpu.py</code></td><td>new in Turbo, changed</td><td><code>te.controlCoefficients</code>, <code>te.gpu</code>; now Rust first.</td></tr>
+<tr><td><code>tellurium_nitro/__init__.py</code></td><td>changed</td><td>Exports <code>te.turbo</code>, <code>te.gpu</code>, <code>te.getGPU</code>, <code>te.controlCoefficients</code>, <code>te.antimony</code>, <code>te.SBML</code>, <code>te.fba</code>.</td></tr>
+<tr><td><code>tellurium_nitro/sedml/*</code>, <code>teconverters</code>, <code>plotting/engine_null.py</code></td><td>changed</td><td>Upstream bug fixes (section 9).</td></tr>
+<tr><td><code>tellurium_nitro/visualization/sbmldiagram.py</code></td><td>changed</td><td>Removed an old Python 2 import that broke <code>import tellurium_nitro</code>.</td></tr>
+<tr><td><code>tellurium_nitro/tests/test_turbo.py</code>, <code>test_gpu.py</code></td><td>new</td><td>Rust vs roadrunner comparison tests, including sosbench.</td></tr>
+<tr><td><code>setup.py</code>, <code>rrs/pyproject.toml</code></td><td>changed</td><td>Package renamed to <code>tellurium_nitro</code>, engine to <code>libroadrunner_nitro</code> (import <code>roadrunner_nitro</code>), so neither clashes with regular tellurium or libroadrunner; optional <code>gpu</code> extra (PyTorch).</td></tr>
 <tr><td><code>benchmarks/</code></td><td>new</td><td><code>run.py</code>, <code>tests.py</code>, <code>sosbench/</code>, <code>sts/</code> (SBML Test Suite), <code>bigmodel/</code>.</td></tr>
 <tr><td><code>docs/specJIT.html</code> / <code>.pdf</code></td><td>new</td><td>This document (the HTML is the source).</td></tr>
 <tr><td><code>docs/roadrunner-rs-spec.md</code></td><td>new</td><td>Technical rewrite specification with source references.</td></tr>
