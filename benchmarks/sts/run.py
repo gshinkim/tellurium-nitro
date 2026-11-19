@@ -30,11 +30,37 @@ def tags(path):
     return out
 
 
+def fba_case(d, cid, rec):
+    """FluxBalanceSteadyState: te.fba on the newest level, compared like a time course row."""
+    import numpy as np
+    import tellurium as te
+    st = {k.strip(): v.strip() for k, v in (l.split(':', 1) for l in open(os.path.join(d, cid + '-settings.txt')) if ':' in l)}
+    names = [x.strip() for x in st['variables'].split(',') if x.strip()]
+    atol, rtol = float(st['absolute']), float(st['relative'])
+    lv = next((l for l in LEVELS if os.path.exists(os.path.join(d, '%s-sbml-%s.xml' % (cid, l)))), None)
+    rec['level'] = lv
+    exp = np.genfromtxt(os.path.join(d, cid + '-results.csv'), delimiter=',', names=True, deletechars='')
+    try:
+        got = te.fba(os.path.join(d, '%s-sbml-%s.xml' % (cid, lv)))
+    except Exception as e:
+        return dict(rec, status='error', stage='fba', reason='%s: %s' % (type(e).__name__, str(e)[:200]))
+    rec['engine'] = 'fba'
+    bad = [(n, got.get(n), float(exp[n])) for n in names
+           if not (np.isnan(float(exp[n])) and np.isnan(got.get(n, 0.0))
+                   or abs(got.get(n, np.nan) - float(exp[n])) <= atol + rtol * abs(float(exp[n])))]
+    if bad:
+        n, g, e = bad[0]
+        return dict(rec, status='fail', first_bad=dict(column=n, t=0.0, got=g, expected=e), n_bad=len(bad))
+    return dict(rec, status='pass')
+
+
 def run_case(root, cid):
     import numpy as np
     import tellurium as te
     d = os.path.join(root, cid)
     rec = dict(id=cid, **tags(os.path.join(d, cid + '-model.m')))
+    if 'FluxBalanceSteadyState' in rec.get('testType', []):
+        return fba_case(d, cid, rec)
     if 'TimeCourse' not in rec.get('testType', []):
         return dict(rec, status='skip', reason='not a time course: %s' % rec.get('testType'))
     lv = next((l for l in LEVELS if os.path.exists(os.path.join(d, '%s-sbml-%s.xml' % (cid, l)))), None)
@@ -48,11 +74,13 @@ def run_case(root, cid):
         r = te.loadSBMLModel(os.path.join(d, '%s-sbml-%s.xml' % (cid, lv)))
     except Exception as e:
         return dict(rec, status='error', stage='load', reason='%s: %s' % (type(e).__name__, str(e)[:300]))
-    sel = ['time'] + ['[%s]' % v if v in st['concentration'] else v for v in st['variables']]
+    # the time column is the requested grid (a model id may itself be named 'time')
+    sel = ['[%s]' % v if v in st['concentration'] else v for v in st['variables']]
     try:
         r.integrator.relative_tolerance = RTOL
         r.integrator.absolute_tolerance = ATOL
         res = np.asarray(r.simulate(st['start'], st['start'] + st['duration'], st['steps'] + 1, selections=sel))
+        res = np.column_stack([np.linspace(st['start'], st['start'] + st['duration'], st['steps'] + 1), res.reshape(st['steps'] + 1, -1)])
     except Exception as e:
         return dict(rec, status='error', stage='simulate', reason='%s: %s' % (type(e).__name__, str(e)[:300]),
                     engine=(r.lastRun or {}).get('engine'), fallback=(r.lastRun or {}).get('reason'))

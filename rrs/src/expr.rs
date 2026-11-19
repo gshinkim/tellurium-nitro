@@ -18,6 +18,8 @@ pub enum Op {
     Asin(N), Acos(N), Atan(N), Fact(N),
     Lt(N, N), Le(N, N), Eq(N, N), Ne(N, N), And(N, N), Or(N, N), Xor(N, N), Not(N),
     Sel(N, N, N), Min(N, N), Max(N, N),
+    /// distrib draw: (kind in rand::NAMES, call id so equal calls stay distinct draws, a, b, lower, upper)
+    Rand(u8, u32, N, N, N, N),
 }
 
 /// n! for n = round(x) >= 0 (NaN below 0, inf past 170), as libroadrunner.
@@ -49,19 +51,21 @@ fn apply(op: &Op, r: impl Fn(N) -> f64) -> f64 {
         Xor(a, c) => b((r(a) != 0.0) != (r(c) != 0.0)), Not(a) => b(r(a) == 0.0),
         Sel(c, x, y) => if r(c) != 0.0 { r(x) } else { r(y) },
         Min(a, c) => r(a).min(r(c)), Max(a, c) => r(a).max(r(c)),
+        Rand(k, _, a, b, c, d) => crate::rand::draw(k, r(a), r(b), r(c), r(d)),
         Const(_) | Var(_) | Par(_) | Time => unreachable!(),
     }
 }
 
-pub(crate) fn children(op: &Op) -> [Option<N>; 3] {
+pub(crate) fn children(op: &Op) -> [Option<N>; 4] {
     use Op::*;
     match *op {
-        Const(_) | Var(_) | Par(_) | Time => [None, None, None],
+        Const(_) | Var(_) | Par(_) | Time => [None, None, None, None],
         Neg(a) | PowI(a, _) | Exp(a) | Ln(a) | Log10(a) | Sqrt(a) | Abs(a) | Sign(a) | Floor(a)
-        | Ceil(a) | Sin(a) | Cos(a) | Tan(a) | Asin(a) | Acos(a) | Atan(a) | Fact(a) | Not(a) => [Some(a), None, None],
-        Sel(a, c, d) => [Some(a), Some(c), Some(d)],
+        | Ceil(a) | Sin(a) | Cos(a) | Tan(a) | Asin(a) | Acos(a) | Atan(a) | Fact(a) | Not(a) => [Some(a), None, None, None],
+        Sel(a, c, d) => [Some(a), Some(c), Some(d), None],
+        Rand(_, _, a, b, c, d) => [Some(a), Some(b), Some(c), Some(d)],
         Add(a, c) | Sub(a, c) | Mul(a, c) | Div(a, c) | Pow(a, c) | Lt(a, c) | Le(a, c) | Eq(a, c)
-        | Ne(a, c) | And(a, c) | Or(a, c) | Xor(a, c) | Min(a, c) | Max(a, c) => [Some(a), Some(c), None],
+        | Ne(a, c) | And(a, c) | Or(a, c) | Xor(a, c) | Min(a, c) | Max(a, c) => [Some(a), Some(c), None, None],
     }
 }
 
@@ -74,7 +78,7 @@ pub struct Dag {
 
 impl Dag {
     pub fn cst(&mut self, x: f64) -> N { self.raw(Op::Const(x.to_bits())) }
-    fn raw(&mut self, op: Op) -> N {
+    pub(crate) fn raw(&mut self, op: Op) -> N {
         if let Some(&i) = self.memo.get(&op) { return i; }
         let i = self.nodes.len() as N;
         self.nodes.push(op);
@@ -90,7 +94,7 @@ impl Dag {
     pub fn mk(&mut self, op: Op) -> N {
         use Op::*;
         let ch = children(&op);
-        if ch[0].is_some() && ch.iter().flatten().all(|&c| self.val(c).is_some()) {
+        if ch[0].is_some() && !matches!(op, Rand(..)) && ch.iter().flatten().all(|&c| self.val(c).is_some()) {
             let v = apply(&op, |c| self.val(c).unwrap());
             return self.cst(v);
         }
@@ -202,7 +206,7 @@ impl Dag {
                 let (x, y) = (self.diff(a, wrt), self.diff(c, wrt));
                 let cond = self.mk(Le(c, a)); self.mk(Sel(cond, x, y))
             }
-            Sign(_) | Floor(_) | Ceil(_) | Fact(_) | Lt(..) | Le(..) | Eq(..) | Ne(..) | And(..) | Or(..)
+            Sign(_) | Floor(_) | Ceil(_) | Fact(_) | Rand(..) | Lt(..) | Le(..) | Eq(..) | Ne(..) | And(..) | Or(..)
             | Xor(..) | Not(_) => zero,
         };
         self.dmemo.insert((n, wrt), d);
@@ -415,6 +419,19 @@ impl<'a, F: FnMut(&str) -> Option<Op>> P<'a, F> {
                 if f == "quotient" { t } else { let bt = d.mk(Mul(a[1], t)); d.mk(Sub(a[0], bt)) }
             }
             "implies" => { need(2)?; let na = d.mk(Not(a[0])); d.mk(Or(na, a[1])) }
+            f if crate::rand::NAMES.iter().any(|&(nm, _)| nm == f) => { // distrib: name(params[, lower, upper])
+                let k = crate::rand::NAMES.iter().position(|&(nm, _)| nm == f).unwrap();
+                let np = crate::rand::NAMES[k].1;
+                // one-argument cauchy/laplace give the scale (location 0)
+                let one = matches!(f, "cauchy" | "laplace") && (n == 1 || n == 3);
+                let p = if one { 1 } else { np };
+                if n != p && n != p + 2 { return Err(format!("{f}() takes {p} or {} arguments, got {n}", p + 2)); }
+                let nan = d.cst(f64::NAN);
+                let (x, y) = if one { (d.cst(0.0), a[0]) } else if np == 1 { (a[0], nan) } else { (a[0], a[1]) };
+                let (lo, hi) = if n == p + 2 { (a[p], a[p + 1]) } else { (d.cst(f64::NEG_INFINITY), d.cst(f64::INFINITY)) };
+                static UID: AtomicU32 = AtomicU32::new(0);
+                d.raw(Rand(k as u8, UID.fetch_add(1, Ordering::Relaxed), x, y, lo, hi))
+            }
             "min" => fold(d, Min)?,
             "max" => fold(d, Max)?,
             "plus" if a.is_empty() => d.cst(0.0),
@@ -516,6 +533,7 @@ impl Tape {
             stat[i] = match op {
                 Op::Const(_) => true,
                 Op::Par(k) => !dynamic.contains(k),
+                Op::Rand(..) => false, // a fresh draw at every evaluation
                 Op::Var(_) | Op::Time => false,
                 _ => children(op).iter().flatten().all(|&c| stat[c as usize]),
             };
@@ -535,6 +553,7 @@ impl Tape {
                 Ne(a, c) => Ne(m(a), m(c)), And(a, c) => And(m(a), m(c)), Or(a, c) => Or(m(a), m(c)),
                 Xor(a, c) => Xor(m(a), m(c)), Not(a) => Not(m(a)), Sel(a, c, d) => Sel(m(a), m(c), m(d)),
                 Min(a, c) => Min(m(a), m(c)), Max(a, c) => Max(m(a), m(c)),
+                Rand(k, u, a, b, c, d) => Rand(k, u, m(a), m(b), m(c), m(d)),
             };
             if stat[i] { pre.push((reg[i], r)) } else { ins.push((reg[i], r)) }
         }

@@ -105,7 +105,7 @@ impl PyModel {
                 m.load(w, &b.keys, &b.vals[i * nk..(i + 1) * nk]);
                 match &atol_scale { Some(a) => w.atol_scale.copy_from_slice(a), None => w.atol_scale.fill(1.0) }
                 let ok = match ode {
-                    Some((rtol, atol)) => m.simulate(w, &times, rtol, atol, &outs, r),
+                    Some((rtol, atol)) => { m.reseed(w, seed.wrapping_add(i as u64)); m.simulate(w, &times, rtol, atol, &outs, r) }
                     None => m.gillespie(w, &times, seed.wrapping_add(i as u64), &outs, r),
                 };
                 if !ok { r.fill(f64::NAN); }
@@ -246,12 +246,12 @@ impl PyModel {
     /// (n, len(times), len(outputs)) time courses (solver as in simulate, events root-located);
     /// outputs default to the floating species (concentrations). NaN rows where integration failed.
     /// atol_scale: per-state multipliers of atol, as in Session.advance.
-    #[pyo3(signature = (keys, values, times, threads=None, rtol=1e-6, atol=1e-12, outputs=None, atol_scale=None))]
+    #[pyo3(signature = (keys, values, times, threads=None, rtol=1e-6, atol=1e-12, outputs=None, atol_scale=None, seed=0))]
     #[allow(clippy::too_many_arguments)]
     fn simulate_batch<'py>(&self, py: Python<'py>, keys: Vec<String>, values: PyReadonlyArray2<f64>,
                            times: PyReadonlyArray1<f64>, threads: Option<usize>, rtol: f64, atol: f64,
-                           outputs: Option<Vec<String>>, atol_scale: Option<Vec<f64>>) -> PyResult<Bound<'py, PyAny>> {
-        self.time_courses(py, keys, values, times, threads, outputs, Some((rtol, atol)), 0, atol_scale)
+                           outputs: Option<Vec<String>>, atol_scale: Option<Vec<f64>>, seed: u64) -> PyResult<Bound<'py, PyAny>> {
+        self.time_courses(py, keys, values, times, threads, outputs, Some((rtol, atol)), seed, atol_scale)
     }
 
     /// One time course -> (trajectory[len(times), len(outputs)], final) where final maps every
@@ -342,7 +342,7 @@ impl PyModel {
     fn gillespie_batch<'py>(&self, py: Python<'py>, keys: Vec<String>, values: PyReadonlyArray2<f64>,
                             times: PyReadonlyArray1<f64>, seed: Option<u64>, threads: Option<usize>,
                             outputs: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
-        if self.m.nv != self.m.nr { return Err(verr("gillespie_batch: rate rules are not supported".into())); }
+        if self.m.has_algebraic() { return Err(verr("gillespie_batch: algebraic rules are not supported".into())); }
         let seed = seed.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64));
         self.time_courses(py, keys, values, times, threads, outputs, None, seed, None)
@@ -419,7 +419,9 @@ impl Session {
                 if a == tried { break; }
                 tried = a;
                 w.stats = [0; 4];
+                let hist = w.hist.save(); // a continued run keeps its delay() history
                 m.load(w, &keys, &values);
+                if !*fresh { w.hist.restore(hist); }
                 if m.simulate_cont(w, &times, rtol, a, &outs, &mut out) {
                     m.record(w, times[nt - 1], &all, &mut fin);
                     *fresh = false;
@@ -433,6 +435,20 @@ impl Session {
         });
         if !ok { return Err(PyRuntimeError::new_err("roadrunner_rs: integration failed")); }
         Ok((arr(py, out, &[nt, no])?, PyArray1::from_vec(py, fin).into_any()))
+    }
+
+    /// Outputs at `time` from the session's own state (as the last advance left it, with its delay()
+    /// history): (outputs) -> array.
+    #[pyo3(signature = (time, outputs=None))]
+    fn outputs_now<'py>(&mut self, py: Python<'py>, time: f64, outputs: Option<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+        let pm = self.model.get();
+        let outs = match outputs {
+            Some(o) => match o.cast::<Resolved>() { Ok(r) => r.get().outs.clone(), Err(_) => pm.outs(Some(o.extract()?))? },
+            None => pm.m.outputs.iter().map(|o| o.1).collect(),
+        };
+        let mut row = vec![0.0; outs.len()];
+        pm.m.record(&mut self.w, time, &outs, &mut row);
+        Ok(PyArray1::from_vec(py, row).into_any())
     }
 
     /// Counters of the last advance: dict(solver='bdf'|'rodas4'|'bdf+rodas4', bdf_steps, rodas_steps,

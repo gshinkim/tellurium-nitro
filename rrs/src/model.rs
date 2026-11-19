@@ -39,6 +39,12 @@ pub struct Hist { t: Vec<f64>, y: Vec<f64>, f: Vec<f64>, rd: Mutex<Vec<f64>>, yt
 impl Hist {
     pub fn clear(&mut self) { self.t.clear(); self.y.clear(); self.f.clear(); }
 
+    /// The recorded series (t, y, f), taken out (a reload clears them; a continued run puts them back).
+    pub fn save(&mut self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        (std::mem::take(&mut self.t), std::mem::take(&mut self.y), std::mem::take(&mut self.f))
+    }
+    pub fn restore(&mut self, s: (Vec<f64>, Vec<f64>, Vec<f64>)) { (self.t, self.y, self.f) = s; }
+
     /// State at tp into out (Hermite between recorded points; before the first: the first; after the
     /// last: linear to (t_now, s_now)).
     fn state_at(&self, tp: f64, s_now: &[f64], t_now: f64, out: &mut [f64]) {
@@ -448,6 +454,9 @@ const H: [[f64; 5]; 2] = [
 ];
 const MAX_STEPS: usize = 200_000;
 
+/// x rounded to 12 significant digits (event times located by bisection snap to round times).
+fn round12(x: f64) -> f64 { let sc = 10f64.powi(12 - x.abs().max(1e-300).log10().ceil() as i32); (x * sc).round() / sc }
+
 /// xoshiro256++ seeded through splitmix64.
 pub struct Rng([u64; 4]);
 impl Rng {
@@ -469,6 +478,7 @@ impl Rng {
     }
     /// Uniform in (0, 1].
     pub fn unif(&mut self) -> f64 { ((self.next() >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64) }
+    pub fn next_u64(&mut self) -> u64 { self.next() }
 }
 
 impl Model {
@@ -509,7 +519,8 @@ impl Model {
         for (i, s) in state_ids.iter().enumerate() {
             if sym.insert(s, Op::Var(i as u32)).is_some() && i < ns { return Err(format!("'{s}' is both a species and a parameter")); }
         }
-        sym.entry("time").or_insert(Op::Time);
+        sym.entry("time").or_insert(Op::Time); // a model id named 'time' wins; the clock stays as __time__
+        sym.insert("__time__", Op::Time);
         let mut dag = Dag::default();
         let p = |src: &str, what: &dyn std::fmt::Display, dag: &mut Dag| parse(src, dag, |n| sym.get(n).copied())
             .map_err(|e| format!("{what}: {e}"));
@@ -605,7 +616,8 @@ impl Model {
         outputs.extend(reactions.iter().enumerate().map(|(j, n)| (n.clone(), o((na + j) as u32))));
         outputs.extend(pnames.iter().enumerate().filter(|(_, n)| !state_ids.contains(n))
             .map(|(k, n)| (n.clone(), (nx + k) as u32)));
-        outputs.push(("time".into(), (nx + np) as u32));
+        if !outputs.iter().any(|o| o.0 == "time") { outputs.push(("time".into(), (nx + np) as u32)); }
+        outputs.push(("__time__".into(), (nx + np) as u32));
         let col = (0..nr).map(|j| (0..ns).filter(|&i| stoich[i * nv + j] != 0.0)
             .map(|i| (i as u32, stoich[i * nv + j])).collect()).collect();
 
@@ -646,6 +658,9 @@ impl Model {
 
     pub fn has_events(&self) -> bool { !self.events.is_empty() }
 
+    /// Any algebraic state (DAE): the SSA does not support these.
+    pub fn has_algebraic(&self) -> bool { self.alg.contains(&true) }
+
     pub fn work(&self) -> Work {
         let (nx, nv, nr, ni) = (self.nx, self.nv, self.nr, self.ni());
         let z = |n| vec![0.0; n];
@@ -684,6 +699,9 @@ impl Model {
         self.full.prep(&mut w.rf);
         self.aux.prep(&mut w.ra);
     }
+
+    /// Seed the run's random stream (event ties, distrib draws): batches give each sample its own.
+    pub fn reseed(&self, w: &mut Work, seed: u64) { w.rng = Rng::new(seed); }
 
     /// Current value of parameter k (events may have changed it).
     pub fn par_value(&self, w: &Work, k: usize) -> f64 { w.rr[self.nx + k] }
@@ -752,12 +770,8 @@ impl Model {
         let Work { rr, v, s, f0, hist, .. } = w;
         self.rates_at(hist, rr, v, s, t);
         self.rhs(v, f0);
-        if hist.t.last() == Some(&t) { // same time (event): the later state wins
-            let n = hist.t.len() - 1;
-            hist.y.truncate(n * self.nx);
-            hist.f.truncate(n * self.nx);
-            hist.t.truncate(n);
-        }
+        // same time twice (an event): both kept, the value just before the jump and the one after;
+        // state_at brackets strictly-before times with the first and later times with the second
         hist.t.push(t);
         hist.y.extend_from_slice(s);
         hist.f.extend_from_slice(f0);
@@ -1376,6 +1390,7 @@ impl Model {
     /// `simulate` keeping the event state (trigger values, pending delayed events) in `w`, as a
     /// roadrunner simulate call that continues from the previous one.
     pub fn simulate_cont(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
+        crate::rand::seed(w.rng.next_u64()); // distrib draws
         if self.alg.contains(&true) { return self.simulate_dae(w, times, rtol, atol, outs, out); }
         let (no, nt) = (outs.len(), times.len());
         let ev = self.has_events();
@@ -1432,48 +1447,104 @@ impl Model {
         false
     }
 
-    /// Time course of a DAE model (algebraic states: M = diag(1 | 0)) with diffsol's BDF, from a
-    /// consistent initial state (diffsol solves the algebraic part first). Events and delay() are
-    /// not supported here (returns false).
+    /// Time course of a DAE model (algebraic states: M = diag(1 | 0)) with diffsol's BDF. Each
+    /// segment starts from a consistent state (diffsol solves the algebraic part first) and is
+    /// stepped until a trigger (or a comparison inside one) changes, located by bisection on
+    /// diffsol's interpolant, a pending delayed event comes due, or the end time. Events then fire
+    /// as in `simulate_cont` and diffsol restarts from the post-event state. delay() is not
+    /// supported here (returns false).
     fn simulate_dae(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
-        use diffsol::{DenseMatrix, NalgebraLU, NalgebraMat, OdeBuilder, OdeSolverMethod};
-        if self.has_events() || !self.dly.is_empty() { return false; }
-        let nx = self.nx;
-        let (rr, rf) = (RefCell::new(w.rr.clone()), RefCell::new(w.rf.clone()));
+        use diffsol::{NalgebraLU, NalgebraMat, NalgebraVec, OdeBuilder, OdeSolverMethod, OdeSolverStopReason, Vector};
+        if !self.dly.is_empty() { return false; }
+        let (nx, no, nt) = (self.nx, outs.len(), times.len());
+        let has_ev = self.has_events();
+        let tend = times[nt - 1];
         let (v, ev) = (RefCell::new(vec![0.0; self.nv]), RefCell::new(vec![0.0; self.jac.len() + self.dt.len()]));
         let hs = Hist::default(); // no delay() on this path
-        let y0 = w.s.clone();
         let atols: Vec<f64> = (0..nx).map(|i| atol * w.atol_scale[i]).collect();
-        let rhs = |x: &[f64], _p: &[f64], t: f64, y: &mut [f64]| {
-            let mut v = v.borrow_mut();
-            self.rates_at(&hs, &mut rr.borrow_mut(), &mut v, x, t);
-            self.rhs(&v, y);
-        };
-        let jac = |x: &[f64], _p: &[f64], t: f64, u: &[f64], y: &mut [f64]| {
-            let (mut v, mut ev) = (v.borrow_mut(), ev.borrow_mut());
-            self.full_at(&hs, &mut rf.borrow_mut(), &mut v, &mut ev, x, t);
-            y.fill(0.0);
-            for &(d, e, c) in &self.jfull {
-                let (i, k) = (d as usize / nx, d as usize % nx);
-                y[i] += c * ev[e as usize] * u[k];
+        let get = |y: &NalgebraVec<f64>, o: &mut [f64]| for (i, x) in o.iter_mut().enumerate() { *x = y.get_index(i) };
+        let (mut t, mut q, mut steps) = (times[0], 0, 0);
+        'seg: loop {
+            // a fresh problem per segment: events may have changed parameters and states
+            let (rr, rf) = (RefCell::new(w.rr.clone()), RefCell::new(w.rf.clone()));
+            let y0 = w.s.clone();
+            let rhs = |x: &[f64], _p: &[f64], t: f64, y: &mut [f64]| {
+                let mut v = v.borrow_mut();
+                self.rates_at(&hs, &mut rr.borrow_mut(), &mut v, x, t);
+                self.rhs(&v, y);
+            };
+            let jac = |x: &[f64], _p: &[f64], t: f64, u: &[f64], y: &mut [f64]| {
+                let (mut v, mut ev) = (v.borrow_mut(), ev.borrow_mut());
+                self.full_at(&hs, &mut rf.borrow_mut(), &mut v, &mut ev, x, t);
+                y.fill(0.0);
+                for &(d, e, c) in &self.jfull {
+                    let (i, k) = (d as usize / nx, d as usize % nx);
+                    y[i] += c * ev[e as usize] * u[k];
+                }
+            };
+            let mass = |u: &[f64], _p: &[f64], _t: f64, beta: f64, y: &mut [f64]| {
+                for i in 0..nx { y[i] = if self.alg[i] { 0.0 } else { u[i] } + beta * y[i]; }
+            };
+            let init = |_p: &[f64], _t: f64, y: &mut [f64]| y.copy_from_slice(&y0);
+            let Ok(problem) = OdeBuilder::<NalgebraMat<f64>>::new().t0(t).rtol(rtol).atol(atols.clone())
+                .rhs_implicit(rhs, jac).mass(mass).init(init, nx).build() else { return false };
+            let Ok(mut solver) = problem.bdf::<NalgebraLU<f64>>() else { return false };
+            get(solver.state().y, &mut w.s); // consistent algebraic states
+            steps += 1;
+            if steps > MAX_STEPS * 10 { return false; }
+            if has_ev { // events see the consistent state; a firing restarts (algebraic states follow)
+                match self.events_at(w, t) { None => return false, Some(true) => continue 'seg, Some(false) => {} }
             }
-        };
-        let mass = |u: &[f64], _p: &[f64], _t: f64, beta: f64, y: &mut [f64]| {
-            for i in 0..nx { y[i] = if self.alg[i] { 0.0 } else { u[i] } + beta * y[i]; }
-        };
-        let init = |_p: &[f64], _t: f64, y: &mut [f64]| y.copy_from_slice(&y0);
-        let Ok(problem) = OdeBuilder::<NalgebraMat<f64>>::new().t0(times[0]).rtol(rtol).atol(atols)
-            .rhs_implicit(rhs, jac).mass(mass).init(init, nx).build() else { return false };
-        let Ok(mut solver) = problem.bdf::<NalgebraLU<f64>>() else { return false };
-        let Ok((ys, _)) = solver.solve_dense(times) else { return false };
-        let no = outs.len();
-        let mut s = vec![0.0; nx];
-        for (q, &tq) in times.iter().enumerate() {
-            for (i, x) in s.iter_mut().enumerate() { *x = ys.get_index(i, q); }
-            self.record_y(&w.hist, &mut w.ra, &s, tq, outs, &mut out[q * no..(q + 1) * no]);
+            while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; }
+            if q == nt { return true; }
+            if solver.set_stop_time(w.pend.iter().fold(tend, |m, p| m.min(p.0))).is_err() { return false; }
+            let mut ta = t; // start of the current step
+            loop {
+                steps += 1;
+                if steps > MAX_STEPS * 10 { return false; }
+                let Ok(reason) = solver.step() else { return false };
+                let tn = solver.state().t;
+                get(solver.state().y, &mut w.yn);
+                let mut te = tn;
+                if has_ev {
+                    let Work { ra, yn, prev, prevc, hist, .. } = w;
+                    if self.changed(hist, ra, prev, prevc, yn, tn) {
+                        let at = |x: f64, yn: &mut [f64], ra: &mut [f64]| match solver.interpolate(x) {
+                            Ok(y) => { get(&y, yn); Some(self.changed(hist, ra, prev, prevc, yn, x)) }
+                            Err(_) => None,
+                        };
+                        let (mut lo, mut hi) = (ta, tn);
+                        while hi - lo > 1e-12 * tn.abs().max(tn - ta) {
+                            let mid = 0.5 * (lo + hi);
+                            let Some(c) = at(mid, yn, ra) else { return false };
+                            if c { hi = mid } else { lo = mid }
+                        }
+                        // a trigger like time >= 1 holds exactly at 1: prefer the round time if it already flips
+                        let r = round12(hi);
+                        if r > lo && r < hi && at(r, yn, ra) == Some(true) { hi = r; }
+                        te = hi;
+                    }
+                }
+                while q < nt && times[q] < te { // output points inside the step from the interpolant
+                    let Ok(y) = solver.interpolate(times[q]) else { return false };
+                    get(&y, &mut w.yn);
+                    let Work { ra, yn, hist, .. } = w;
+                    self.record_y(hist, ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                    q += 1;
+                }
+                if te < tn || matches!(reason, OdeSolverStopReason::TstopReached) {
+                    if te < tn {
+                        let Ok(y) = solver.interpolate(te) else { return false };
+                        get(&y, &mut w.s);
+                    } else {
+                        w.s.copy_from_slice(&w.yn);
+                    }
+                    t = te;
+                    continue 'seg;
+                }
+                ta = tn;
+            }
         }
-        w.s.copy_from_slice(&s);
-        true
     }
 
     /// Gillespie direct method from the loaded state (concentrations; amounts = conc * volume,
@@ -1481,7 +1552,7 @@ impl Model {
     /// their delayed execution times. Outputs as in `simulate`.
     pub fn gillespie(&self, w: &mut Work, times: &[f64], seed: u64, outs: &[u32], out: &mut [f64]) -> bool {
         let (no, mut q) = (outs.len(), 0);
-        self.ssa(w, times[0], seed, |w, _, stop| {
+        self.ssa(w, times[0], seed, times, |w, _, stop| {
             while q < times.len() && times[q] < stop { self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]); q += 1; }
             q == times.len()
         })
@@ -1498,25 +1569,28 @@ impl Model {
             rows.push(t);
             rows.extend_from_slice(&row);
         };
-        let ok = self.ssa(w, t0, seed, |w, t, stop| {
+        let ok = self.ssa(w, t0, seed, &[t1], |w, t, stop| {
             push(w, t.min(t1), &mut rows);
-            if stop >= t1 && t < t1 { push(w, t1, &mut rows); }
-            stop >= t1 || rows.len() / no >= max_rows.max(2)
+            if stop > t1 && t < t1 { push(w, t1, &mut rows); }
+            t >= t1 || stop > t1 || rows.len() / no >= max_rows.max(2) // stop == t1: the row at t1 comes next
         });
         ok.then_some(rows)
     }
 
     /// SSA core: `at(w, t, stop)` is called with the state valid on [t, stop) (stop = next firing
-    /// or event time) and returns true to finish.
-    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, mut at: impl FnMut(&mut Work, f64, f64) -> bool) -> bool {
+    /// or event time) and returns true to finish. With rate rules (`ssa_hybrid`) the state at t
+    /// holds at t only, and stop never passes the next `grid` time.
+    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64) -> bool) -> bool {
         let (ns, nr) = (self.ns, self.nr);
         let mut rng = Rng::new(seed);
+        crate::rand::seed(seed ^ 0xD157_D157_D157_D157); // distrib draws: this sample's own stream
         let mut t = t0;
         self.events_reset(w);
         let resync = |w: &mut Work| for i in 0..ns { w.amt[i] = w.s[i] * self.vol[i]; };
         resync(w);
         if self.has_events() && self.events_at(w, t).is_none() { return false; }
         resync(w);
+        if self.nv != nr { return self.ssa_hybrid(w, t, &mut rng, grid, at); }
         loop {
             let Work { rr, v, s, hist, .. } = w;
             self.rates_at(hist, rr, v, s, t);
@@ -1557,6 +1631,122 @@ impl Model {
             }
             if self.has_events() {
                 match self.events_at(w, t) { None => return false, Some(true) => resync(w), _ => {} }
+            }
+        }
+    }
+
+    /// SSA with rate rules (hybrid SSA, integrated-propensity method): the rate-rule states (columns
+    /// nr..nv) and A(t) = int a0 dt are integrated deterministically (RK4 with step-doubling error
+    /// control) from each segment start; a reaction fires when A reaches r = -ln U. A segment ends
+    /// at a firing, a trigger change (bisection), a pending event or the next `grid` time; `at`
+    /// then sees the state at the segment start. Algebraic states are not supported (false).
+    fn ssa_hybrid(&self, w: &mut Work, mut t: f64, rng: &mut Rng, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64) -> bool) -> bool {
+        if self.alg.contains(&true) { return false; }
+        let (ns, nr, ev) = (self.ns, self.nr, self.has_events());
+        let (rtol, atol) = (1e-8, 1e-10);
+        let rrc: Vec<(usize, usize)> = self.nz.iter().filter(|e| e.1 as usize >= nr).map(|e| (e.0 as usize, e.1 as usize)).collect();
+        let nz = rrc.len() + 1; // rate-rule states, then A
+        let load = |w: &mut Work, z: &[f64]| for (&(i, _), &x) in rrc.iter().zip(z) { w.s[i] = x };
+        let f = |w: &mut Work, t: f64, z: &[f64], dz: &mut [f64]| {
+            load(w, z);
+            let Work { rr, v, s, hist, .. } = w;
+            self.rates_at(hist, rr, v, s, t);
+            for (d, &(_, j)) in dz.iter_mut().zip(&rrc) { *d = v[j]; }
+            dz[nz - 1] = v[..nr].iter().map(|&a| a.max(0.0)).sum();
+        };
+        let rk4 = |w: &mut Work, t: f64, h: f64, z: &[f64], o: &mut [f64], b: &mut [f64]| {
+            let (k, zt) = b.split_at_mut(4 * nz);
+            let (k1, k) = k.split_at_mut(nz);
+            let (k2, k) = k.split_at_mut(nz);
+            let (k3, k4) = k.split_at_mut(nz);
+            f(w, t, z, k1);
+            for i in 0..nz { zt[i] = z[i] + 0.5 * h * k1[i]; }
+            f(w, t + 0.5 * h, zt, k2);
+            for i in 0..nz { zt[i] = z[i] + 0.5 * h * k2[i]; }
+            f(w, t + 0.5 * h, zt, k3);
+            for i in 0..nz { zt[i] = z[i] + h * k3[i]; }
+            f(w, t + h, zt, k4);
+            for i in 0..nz { o[i] = z[i] + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]); }
+        };
+        // segment end condition at (t, z): A reached r or a trigger (or a comparison inside one) changed
+        let hit = |w: &mut Work, t: f64, z: &[f64], r: f64| z[nz - 1] >= r || ev && {
+            load(w, z);
+            let Work { ra, s, prev, prevc, hist, .. } = w;
+            self.changed(hist, ra, prev, prevc, s, t)
+        };
+        let (mut z, mut z1, mut z2, mut zh) = (vec![0.0; nz], vec![0.0; nz], vec![0.0; nz], vec![0.0; nz]);
+        let mut b = vec![0.0; 5 * nz];
+        let (mut h, mut steps) = (0.0f64, 0usize);
+        loop {
+            let tg = grid.get(grid.partition_point(|&g| g <= t)).copied().unwrap_or(f64::INFINITY);
+            let cap = w.pend.iter().fold(tg, |m, p| m.min(p.0));
+            if cap == f64::INFINITY { return at(w, t, cap); } // past the last grid time: `at` finishes
+            let y0 = w.s.clone();
+            let r = -rng.unif().ln();
+            for (x, &(i, _)) in z.iter_mut().zip(&rrc) { *x = w.s[i]; }
+            z[nz - 1] = 0.0;
+            let mut tc = t;
+            if h <= 0.0 { h = 1e-3 * (cap - t); }
+            while tc < cap { // adaptive RK4 to the first hit or cap
+                steps += 1;
+                if steps > MAX_STEPS * 100 { return false; }
+                let last = h >= cap - tc;
+                if last { h = cap - tc; }
+                rk4(w, tc, h, &z, &mut z1, &mut b);
+                rk4(w, tc, 0.5 * h, &z, &mut zh, &mut b);
+                rk4(w, tc + 0.5 * h, 0.5 * h, &zh, &mut z2, &mut b);
+                let err = (0..nz).map(|i| (z2[i] - z1[i]).abs() / 15.0 / (atol + rtol * z[i].abs().max(z2[i].abs()))).fold(0.0, f64::max);
+                if !err.is_finite() { return false; }
+                if err > 1.0 {
+                    h *= (0.9 * err.powf(-0.2)).max(0.2);
+                    if h < 1e-14 * tc.abs().max(1.0) { return false; }
+                    continue;
+                }
+                let tn = if last { cap } else { tc + h };
+                if hit(w, tn, &z2, r) { // bisect on the step length from (tc, z)
+                    let (mut lo, mut hi) = (0.0, tn - tc);
+                    while hi - lo > 1e-12 * tn.abs().max(tn - tc) {
+                        let mid = 0.5 * (lo + hi);
+                        rk4(w, tc, mid, &z, &mut z1, &mut b);
+                        if hit(w, tc + mid, &z1, r) { hi = mid } else { lo = mid }
+                    }
+                    // a trigger like k > 0.5 or time >= 25 holds at a round time: prefer it if it already flips
+                    let rt = round12(tc + hi) - tc;
+                    if rt > lo && rt < hi { rk4(w, tc, rt, &z, &mut z1, &mut b); if hit(w, tc + rt, &z1, r) { hi = rt } }
+                    if hi < tn - tc { rk4(w, tc, hi, &z, &mut z2, &mut b); }
+                    tc += hi;
+                    z.copy_from_slice(&z2);
+                    break;
+                }
+                tc = tn;
+                z.copy_from_slice(&z2);
+                h *= (0.9 * err.max(1e-10).powf(-0.2)).min(4.0);
+            }
+            // report the segment start, then move to its end
+            let mut y1 = std::mem::replace(&mut w.s, y0);
+            if at(w, t, tc) { return true; }
+            std::mem::swap(&mut w.s, &mut y1);
+            load(w, &z);
+            t = tc;
+            if z[nz - 1] >= r { // a reaction fires at t, chosen by the propensities at t
+                let Work { rr, v, s, hist, .. } = w;
+                self.rates_at(hist, rr, v, s, t);
+                let a0: f64 = v[..nr].iter().map(|&a| a.max(0.0)).sum();
+                let (mut u, mut j) = (rng.unif() * a0, nr);
+                for jj in 0..nr {
+                    let a = w.v[jj].max(0.0);
+                    if a > 0.0 { j = jj; if u <= a { break; } u -= a; }
+                }
+                if j < nr {
+                    for &(i, n) in &self.col[j] {
+                        let i = i as usize;
+                        w.amt[i] += n;
+                        w.s[i] = w.amt[i] / self.vol[i];
+                    }
+                }
+            }
+            if ev {
+                match self.events_at(w, t) { None => return false, Some(true) => for i in 0..ns { w.amt[i] = w.s[i] * self.vol[i] }, _ => {} }
             }
         }
     }
@@ -1662,6 +1852,63 @@ mod tests {
             assert!((sv - 10.0 * (-t as f64).exp()).abs() < 1e-5, "S({t}) = {sv}");
             assert!((p * p * p + p - sv).abs() < 1e-5, "p({t}) = {p} not on p^3 + p = {sv}");
         }
+    }
+
+    #[test]
+    fn dae_with_event() {
+        // S' = -k S, algebraic p^3 + p - S = 0; at time >= 1, S = 10 (p must follow on the constraint)
+        let ev = EventDef { trigger: "time >= 1".into(), delay: None, priority: None, assign: vec![("S".into(), "10".into())],
+            initial_value: true, persistent: true, use_trigger_values: true, div: vec![], rescale: vec![] };
+        let m = decay(Rules { rate: vec![("p".into(), "p^3 + p - S".into())], algebraic: vec!["p".into()], events: vec![ev], ..Default::default() });
+        let mut w = m.work();
+        m.load(&mut w, &[], &[]);
+        let times = [0.0, 0.5, 0.999, 1.0, 1.5, 2.0];
+        let outs = m.output_regs(&["S".into(), "p".into()]).unwrap();
+        let mut out = vec![0.0; times.len() * 2];
+        assert!(m.simulate(&mut w, &times, 1e-8, 1e-10, &outs, &mut out));
+        for (q, &t) in times.iter().enumerate() {
+            let ex = if t < 1.0 { 10.0 * (-t as f64).exp() } else { 10.0 * (-(t - 1.0) as f64).exp() };
+            let (sv, p) = (out[2 * q], out[2 * q + 1]);
+            assert!((sv - ex).abs() < 1e-5, "S({t}) = {sv} vs {ex}");
+            assert!((p * p * p + p - ex).abs() < 1e-5, "p({t}) = {p} not on p^3 + p = {ex}");
+        }
+    }
+
+    #[test]
+    fn ssa_rate_rule() {
+        // k' = 1 (k(0) = 0) drives S -> with propensity k S: E[S(t)] = S0 exp(-t^2/2)
+        let check = |m: &Model, t: f64, s0: f64, pr: f64| {
+            let mut w = m.work();
+            let outs = m.output_regs(&s(&["S", "k"])).unwrap();
+            let (n, mut acc) = (4000, 0.0);
+            for i in 0..n {
+                m.load(&mut w, &[], &[]);
+                let mut out = [0.0; 4];
+                assert!(m.gillespie(&mut w, &[0.0, t], i, &outs, &mut out));
+                assert!((out[3] - t).abs() < 1e-9, "k({t}) = {}", out[3]);
+                acc += out[2];
+            }
+            let mean = acc / n as f64;
+            let se = (s0 * pr * (1.0 - pr) / n as f64).sqrt();
+            assert!((mean - s0 * pr).abs() < 4.0 * se, "{mean} vs {}", s0 * pr);
+        };
+        let rk = || vec![("k".to_string(), "1".to_string())];
+        let mut m = decay(Rules { rate: rk(), ..Default::default() });
+        m.init[1] = 0.0; // k(0) = 0
+        check(&m, 1.0, 10.0, (-0.5f64).exp());
+        // variable-step rows: one per firing, ending at t1 with the integrated k(t1) = t1
+        let mut w = m.work();
+        m.load(&mut w, &[], &[]);
+        let rows = m.gillespie_steps(&mut w, 0.0, 1.5, 7, &m.output_regs(&s(&["S", "k"])).unwrap(), 1000).unwrap();
+        let last = &rows[rows.len() - 3..];
+        assert!(last[0] == 1.5 && (last[2] - 1.5).abs() < 1e-9, "{last:?}");
+        for r in rows.chunks(3) { assert!((r[2] - r[0]).abs() < 1e-9, "k(t) = t: {r:?}"); }
+        // a trigger on the rate-rule state: k > 0.5 sets S = 20, then E[S(1)] = 20 exp(-(1 - 0.25)/2)
+        let ev = EventDef { trigger: "k > 0.5".into(), delay: None, priority: None, assign: vec![("S".into(), "20".into())],
+            initial_value: true, persistent: true, use_trigger_values: true, div: vec![], rescale: vec![] };
+        let mut m = decay(Rules { rate: rk(), events: vec![ev], ..Default::default() });
+        m.init[1] = 0.0;
+        check(&m, 1.0, 20.0, (-0.375f64).exp());
     }
 
     #[test]

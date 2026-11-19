@@ -368,6 +368,9 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
     def _lz_out(self, lz, outputs=None):
         """Rust outputs (all, or the resolved `outputs`) at the current state and time."""
         st = lz['st']
+        live = lz.get('live')  # (state, time) the last run left: the session also has its delay() history
+        if live is not None and live[1] == lz['t'] and np.array_equal(live[0], lz['x']):
+            return np.asarray(st.session.outputs_now(lz['t'], outputs=outputs))
         return np.asarray(st.m.outputs_at(st.kres, lz['x'], lz['t'], outputs=outputs))
 
     def _lz_get(self, lz, sel):
@@ -716,6 +719,9 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
             raise _Fallback('non-finite Rust output')
         self._rs_sync(st, final, mdl)
         mdl.setTime(times[-1])
+        lz = self.__dict__.get('_lz')
+        if lz is not None:
+            lz['live'] = (lz['x'].copy(), lz['t'])
         self.__dict__['_run_info'] = st.stats
         return Y
 

@@ -4,3 +4,4 @@ pub mod model;
 pub mod sens;
 #[cfg(feature = "python")]
 mod py;
+pub mod rand;
