@@ -1,5 +1,30 @@
 # Tellurium Nitro
 
+## SBML Test Suite results
+
+The [SBML Test Suite](https://github.com/sbmlteam/sbml-test-suite) is the standard set of test models that checks
+whether a simulator gets SBML right. Nitro was run on it with the roadrunner fallback turned off
+(`te.turbo('strict')`), so every result below comes from the new Rust engine alone.
+
+| Test cases | Cases | Pass | Rate |
+|---|---:|---:|---:|
+| Semantic, time courses | 1,789 | 1,781 | **99.6%** |
+| Semantic, all cases | 1,823 | 1,781 | 97.7% |
+| Stochastic (DSMTS, 10,000 Gillespie runs each) | 100 | 35 | 35.0% |
+| **Semantic + stochastic, all cases** | **1,923** | **1,816** | **94.4%** |
+| Excluding flux balance (34) and `distrib` (61) | 1,828 | 1,816 | 99.3% |
+
+- **Not counted as passing, by design:**
+  - flux-balance cases (34), which are optimization problems, not simulations;
+  - stochastic cases that need the `distrib` package (61), for random numbers drawn inside the model, which Nitro
+    doesn't support.
+- **Fast-reaction edge cases (6):** 00987, 00988, 01397, 01398, 01571, 01572.
+- **Runner limitation (2):** 01820 and 01821 use a parameter named `time`, which the test runner can't select.
+- **Stochastic (4):** chance or the variance test's assumptions.
+- **Earlier result:** with the roadrunner fallback on, Nitro passed 1,405 of 1,789 (78.5%) semantic time courses.
+
+Full report, runners and per-case results: [`benchmarks/sts/`](benchmarks/sts/report.md).
+
 ## What is this, in plain words?
 
 [Tellurium](https://github.com/sys-bio/tellurium) is a Python tool biologists use to simulate how chemicals and
