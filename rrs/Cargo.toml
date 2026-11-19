@@ -11,6 +11,10 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"], optional = true }
 numpy = { version = "0.30", optional = true }
 rayon = "1.12"
+# Antimony -> SBML in pure Rust (copied from sys-bio/PathwayDesigner-rs, see crates/UPSTREAM)
+# DAE models (algebraic states, singular mass matrix) only: BDF with consistent initial conditions
+diffsol = { version = "0.20", default-features = false, features = ["nalgebra"] }
+antimony = { package = "antimony-rs", path = "crates/antimony", features = ["sbml"] }
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-jit = "0.137"

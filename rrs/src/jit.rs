@@ -30,6 +30,10 @@ extern "C" fn log10(a: f64) -> f64 { a.log10() }
 extern "C" fn sin(a: f64) -> f64 { a.sin() }
 extern "C" fn cos(a: f64) -> f64 { a.cos() }
 extern "C" fn tan(a: f64) -> f64 { a.tan() }
+extern "C" fn asin(a: f64) -> f64 { a.asin() }
+extern "C" fn acos(a: f64) -> f64 { a.acos() }
+extern "C" fn atan(a: f64) -> f64 { a.atan() }
+extern "C" fn fact(a: f64) -> f64 { crate::expr::factorial(a) }
 
 /// Compile `ins` (as in `Tape::ins`); registers in `outs` that `ins` writes are stored back.
 pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
@@ -97,6 +101,10 @@ pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
                 Sin(a) => call!(sin as extern "C" fn(f64) -> f64, a),
                 Cos(a) => call!(cos as extern "C" fn(f64) -> f64, a),
                 Tan(a) => call!(tan as extern "C" fn(f64) -> f64, a),
+                Asin(a) => call!(asin as extern "C" fn(f64) -> f64, a),
+                Acos(a) => call!(acos as extern "C" fn(f64) -> f64, a),
+                Atan(a) => call!(atan as extern "C" fn(f64) -> f64, a),
+                Fact(a) => call!(fact as extern "C" fn(f64) -> f64, a),
                 Sqrt(a) => { let a = r(&mut b, a); b.ins().sqrt(a) }
                 Abs(a) => { let a = r(&mut b, a); b.ins().fabs(a) }
                 Floor(a) => { let a = r(&mut b, a); b.ins().floor(a) }

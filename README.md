@@ -278,8 +278,18 @@ original roadrunner, and `'reason'` says why (for example a solver setting the f
 Your results are correct either way. Only the speed differs.
 
 **Optional:**
+- `te.turbo('strict')` (or `TELLURIUM_ENGINE=strict`) turns off the fallback: anything the Rust engine can't do raises
+  `NotSupportedByRust` instead of going to roadrunner. In strict mode Nitro passes 1781 of the 1789 SBML Test Suite
+  time-course cases (`benchmarks/sts/report.md`). That includes algebraic rules, fast reactions, `delay()` and `comp`
+  models, which roadrunner itself refuses or handles differently. Models with nonlinear algebraic constraints are
+  solved as DAEs with [diffsol](https://github.com/martinjrobins/diffsol); everything else uses Nitro's own solvers.
 - `te.turbo(False)` switches back to the original roadrunner engine for the rest of the session. So does setting the
   environment variable `TELLURIUM_ENGINE=roadrunner`.
+- Antimony is read by a pure-Rust reader (`rrs/crates/antimony`, from
+  [PathwayDesigner-rs](https://github.com/sys-bio/PathwayDesigner-rs)), about 4x faster to load than libantimony.
+  Anything it rejects goes to libantimony. `te.antimony(False)` always uses libantimony. Species are listed in
+  declaration order, which can differ from libantimony's, so select result columns by name, not position.
+  `te.SBML(False)` is reserved for a Rust SBML reader (`rrs/crates/sbml-io`); SBML is still read with libsbml.
 - `python rrs/check.py` compares Nitro's results with roadrunner and prints timings.
 - `pip install ".[gpu]"` adds PyTorch for `te.gpu(True)`.
 - The engine is compiled for your own computer's processor (`rrs/.cargo/config.toml`, `target-cpu=native`). To

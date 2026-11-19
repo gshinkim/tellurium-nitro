@@ -15,8 +15,16 @@ pub enum Op {
     Time,
     Neg(N), Add(N, N), Sub(N, N), Mul(N, N), Div(N, N), Pow(N, N), PowI(N, i32),
     Exp(N), Ln(N), Log10(N), Sqrt(N), Abs(N), Sign(N), Floor(N), Ceil(N), Sin(N), Cos(N), Tan(N),
+    Asin(N), Acos(N), Atan(N), Fact(N),
     Lt(N, N), Le(N, N), Eq(N, N), Ne(N, N), And(N, N), Or(N, N), Xor(N, N), Not(N),
     Sel(N, N, N), Min(N, N), Max(N, N),
+}
+
+/// n! for n = round(x) >= 0 (NaN below 0, inf past 170), as libroadrunner.
+pub fn factorial(x: f64) -> f64 {
+    let n = x.round();
+    if !(n >= 0.0) { return f64::NAN; }
+    (1..=(n.min(171.0) as u32)).fold(1.0, |p, k| p * k as f64)
 }
 
 #[inline(always)]
@@ -34,6 +42,7 @@ fn apply(op: &Op, r: impl Fn(N) -> f64) -> f64 {
         Sign(a) => { let x = r(a); if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 } }
         Floor(a) => r(a).floor(), Ceil(a) => r(a).ceil(),
         Sin(a) => r(a).sin(), Cos(a) => r(a).cos(), Tan(a) => r(a).tan(),
+        Asin(a) => r(a).asin(), Acos(a) => r(a).acos(), Atan(a) => r(a).atan(), Fact(a) => factorial(r(a)),
         Lt(a, c) => b(r(a) < r(c)), Le(a, c) => b(r(a) <= r(c)),
         Eq(a, c) => b(r(a) == r(c)), Ne(a, c) => b(r(a) != r(c)),
         And(a, c) => b(r(a) != 0.0 && r(c) != 0.0), Or(a, c) => b(r(a) != 0.0 || r(c) != 0.0),
@@ -44,12 +53,12 @@ fn apply(op: &Op, r: impl Fn(N) -> f64) -> f64 {
     }
 }
 
-fn children(op: &Op) -> [Option<N>; 3] {
+pub(crate) fn children(op: &Op) -> [Option<N>; 3] {
     use Op::*;
     match *op {
         Const(_) | Var(_) | Par(_) | Time => [None, None, None],
         Neg(a) | PowI(a, _) | Exp(a) | Ln(a) | Log10(a) | Sqrt(a) | Abs(a) | Sign(a) | Floor(a)
-        | Ceil(a) | Sin(a) | Cos(a) | Tan(a) | Not(a) => [Some(a), None, None],
+        | Ceil(a) | Sin(a) | Cos(a) | Tan(a) | Asin(a) | Acos(a) | Atan(a) | Fact(a) | Not(a) => [Some(a), None, None],
         Sel(a, c, d) => [Some(a), Some(c), Some(d)],
         Add(a, c) | Sub(a, c) | Mul(a, c) | Div(a, c) | Pow(a, c) | Lt(a, c) | Le(a, c) | Eq(a, c)
         | Ne(a, c) | And(a, c) | Or(a, c) | Xor(a, c) | Min(a, c) | Max(a, c) => [Some(a), Some(c), None],
@@ -172,6 +181,16 @@ impl Dag {
                 let da = self.diff(a, wrt); let one = self.cst(1.0);
                 let t2 = self.mk(PowI(n, 2)); let s = self.mk(Add(one, t2)); self.mk(Mul(s, da))
             }
+            Asin(a) | Acos(a) => { // +-da / sqrt(1 - a^2)
+                let da = self.diff(a, wrt); let one = self.cst(1.0);
+                let a2 = self.mk(PowI(a, 2)); let s = self.mk(Sub(one, a2)); let q = self.mk(Sqrt(s));
+                let t = self.mk(Div(da, q));
+                if matches!(op, Asin(_)) { t } else { self.mk(Neg(t)) }
+            }
+            Atan(a) => {
+                let da = self.diff(a, wrt); let one = self.cst(1.0);
+                let a2 = self.mk(PowI(a, 2)); let s = self.mk(Add(one, a2)); self.mk(Div(da, s))
+            }
             Sel(c, x, y) => {
                 let (dx, dy) = (self.diff(x, wrt), self.diff(y, wrt)); self.mk(Sel(c, dx, dy))
             }
@@ -183,7 +202,7 @@ impl Dag {
                 let (x, y) = (self.diff(a, wrt), self.diff(c, wrt));
                 let cond = self.mk(Le(c, a)); self.mk(Sel(cond, x, y))
             }
-            Sign(_) | Floor(_) | Ceil(_) | Lt(..) | Le(..) | Eq(..) | Ne(..) | And(..) | Or(..)
+            Sign(_) | Floor(_) | Ceil(_) | Fact(_) | Lt(..) | Le(..) | Eq(..) | Ne(..) | And(..) | Or(..)
             | Xor(..) | Not(_) => zero,
         };
         self.dmemo.insert((n, wrt), d);
@@ -265,14 +284,18 @@ impl<'a, F: FnMut(&str) -> Option<Op>> P<'a, F> {
         while self.eat("&&") { let c = self.cmp()?; a = self.d.mk(Op::And(a, c)); }
         Ok(a)
     }
+    /// a < b < c is (a < b) && (b < c), as MathML's n-ary relations (libsbml prints them chained).
     fn cmp(&mut self) -> Result<N, String> {
         let mut a = self.sum()?;
+        let mut acc: Option<N> = None;
         loop {
             let op = ["<=", ">=", "==", "!=", "<", ">"].into_iter().find(|s| self.peek(s));
-            let Some(op) = op else { return Ok(a) };
+            let Some(op) = op else { return Ok(acc.unwrap_or(a)) };
             self.i += 1;
             let c = self.sum()?;
-            a = self.d.mk(rel(op, a, c));
+            let r = self.d.mk(rel(op, a, c));
+            acc = Some(match acc { None => r, Some(p) => self.d.mk(Op::And(p, r)) });
+            a = c;
         }
     }
     fn sum(&mut self) -> Result<N, String> {
@@ -313,15 +336,13 @@ impl<'a, F: FnMut(&str) -> Option<Op>> P<'a, F> {
                 }
                 self.call(&name, args)
             }
-            Tok::Id(name) => {
+            Tok::Id(name) => { // a model symbol first: SBML ids may be named INF, pi, ...
+                if let Some(op) = (self.res)(&name) { return Ok(self.d.mk(op)); }
                 let c = match name.as_str() {
                     "true" => 1.0, "false" => 0.0, "pi" => std::f64::consts::PI,
                     "exponentiale" => std::f64::consts::E, "infinity" | "INF" | "inf" => f64::INFINITY,
                     "NaN" | "nan" => f64::NAN,
-                    _ => {
-                        let op = (self.res)(&name).ok_or(format!("unknown symbol '{name}'"))?;
-                        return Ok(self.d.mk(op));
-                    }
+                    _ => return Err(format!("unknown symbol '{name}'")),
                 };
                 Ok(self.d.cst(c))
             }
@@ -353,8 +374,53 @@ impl<'a, F: FnMut(&str) -> Option<Op>> P<'a, F> {
             "sin" => { need(1)?; d.mk(Sin(a[0])) }
             "cos" => { need(1)?; d.mk(Cos(a[0])) }
             "tan" => { need(1)?; d.mk(Tan(a[0])) }
+            "asin" | "arcsin" => { need(1)?; d.mk(Asin(a[0])) }
+            "acos" | "arccos" => { need(1)?; d.mk(Acos(a[0])) }
+            "atan" | "arctan" => { need(1)?; d.mk(Atan(a[0])) }
+            "factorial" => { need(1)?; d.mk(Fact(a[0])) }
+            "sec" | "csc" | "cot" => { // 1 / cos, sin, tan
+                need(1)?; let one = d.cst(1.0);
+                let x = d.mk(match f { "sec" => Cos(a[0]), "csc" => Sin(a[0]), _ => Tan(a[0]) }); d.mk(Div(one, x))
+            }
+            "sinh" | "cosh" | "tanh" | "sech" | "csch" | "coth" => { // from e^x and e^-x
+                need(1)?; let ep = d.mk(Exp(a[0])); let na = d.mk(Neg(a[0])); let em = d.mk(Exp(na));
+                let (s, c) = (d.mk(Sub(ep, em)), d.mk(Add(ep, em)));
+                let two = d.cst(2.0);
+                match f {
+                    "sinh" => d.mk(Div(s, two)), "cosh" => d.mk(Div(c, two)), "tanh" => d.mk(Div(s, c)),
+                    "sech" => d.mk(Div(two, c)), "csch" => d.mk(Div(two, s)), _ => d.mk(Div(c, s)),
+                }
+            }
+            "arcsec" | "arccsc" | "arccot" => { // of 1/x
+                need(1)?; let one = d.cst(1.0); let r = d.mk(Div(one, a[0]));
+                d.mk(match f { "arcsec" => Acos(r), "arccsc" => Asin(r), _ => Atan(r) })
+            }
+            "arcsinh" | "asinh" | "arccosh" | "acosh" | "arccsch" | "arcsech" => { // ln(y + sqrt(y^2 +- 1))
+                need(1)?; let one = d.cst(1.0);
+                let y = if matches!(f, "arccsch" | "arcsech") { d.mk(Div(one, a[0])) } else { a[0] };
+                let y2 = d.mk(PowI(y, 2));
+                let s = if matches!(f, "arcsinh" | "asinh" | "arccsch") { d.mk(Add(y2, one)) } else { d.mk(Sub(y2, one)) };
+                let q = d.mk(Sqrt(s)); let t = d.mk(Add(y, q)); d.mk(Ln(t))
+            }
+            "arctanh" | "atanh" | "arccoth" => { // ln((1 + y) / (1 - y)) / 2
+                need(1)?; let one = d.cst(1.0);
+                let y = if f == "arccoth" { d.mk(Div(one, a[0])) } else { a[0] };
+                let p = d.mk(Add(one, y)); let m = d.mk(Sub(one, y)); let q = d.mk(Div(p, m));
+                let l = d.mk(Ln(q)); let two = d.cst(2.0); d.mk(Div(l, two))
+            }
+            "quotient" | "rem" => { // C truncation, as libroadrunner: trunc(a/b), a - b trunc(a/b)
+                need(2)?; let q = d.mk(Div(a[0], a[1])); let zero = d.cst(0.0);
+                let neg = d.mk(Lt(q, zero)); let (cq, fq) = (d.mk(Ceil(q)), d.mk(Floor(q)));
+                let t = d.mk(Sel(neg, cq, fq));
+                if f == "quotient" { t } else { let bt = d.mk(Mul(a[1], t)); d.mk(Sub(a[0], bt)) }
+            }
+            "implies" => { need(2)?; let na = d.mk(Not(a[0])); d.mk(Or(na, a[1])) }
             "min" => fold(d, Min)?,
             "max" => fold(d, Max)?,
+            "plus" if a.is_empty() => d.cst(0.0),
+            "times" if a.is_empty() => d.cst(1.0),
+            "and" if a.is_empty() => d.cst(1.0),
+            "or" | "xor" if a.is_empty() => d.cst(0.0),
             "plus" => fold(d, Add)?,
             "times" => fold(d, Mul)?,
             "minus" => { need(2)?; d.mk(Sub(a[0], a[1])) }
@@ -415,7 +481,11 @@ pub struct Tape {
 const JIT_AFTER: u32 = 2000;
 
 impl Tape {
-    pub fn new(dag: &Dag, roots: &[N], ns: usize, np: usize) -> Tape {
+    pub fn new(dag: &Dag, roots: &[N], ns: usize, np: usize) -> Tape { Tape::new_dyn(dag, roots, ns, np, &[]) }
+
+    /// As `new`; parameters in `dynamic` change between runs without `prep` (e.g. delayed values), so
+    /// nothing that depends on them is hoisted into the parameter-only part.
+    pub fn new_dyn(dag: &Dag, roots: &[N], ns: usize, np: usize, dynamic: &[u32]) -> Tape {
         let mut need = vec![false; dag.nodes.len()];
         let mut st: Vec<N> = roots.to_vec();
         while let Some(i) = st.pop() {
@@ -444,7 +514,8 @@ impl Tape {
         for (i, op) in dag.nodes.iter().enumerate() {
             if !need[i] { continue; }
             stat[i] = match op {
-                Op::Const(_) | Op::Par(_) => true,
+                Op::Const(_) => true,
+                Op::Par(k) => !dynamic.contains(k),
                 Op::Var(_) | Op::Time => false,
                 _ => children(op).iter().flatten().all(|&c| stat[c as usize]),
             };
@@ -459,6 +530,7 @@ impl Tape {
                 PowI(a, k) => PowI(m(a), k), Exp(a) => Exp(m(a)), Ln(a) => Ln(m(a)), Log10(a) => Log10(m(a)),
                 Sqrt(a) => Sqrt(m(a)), Abs(a) => Abs(m(a)), Sign(a) => Sign(m(a)), Floor(a) => Floor(m(a)),
                 Ceil(a) => Ceil(m(a)), Sin(a) => Sin(m(a)), Cos(a) => Cos(m(a)), Tan(a) => Tan(m(a)),
+                Asin(a) => Asin(m(a)), Acos(a) => Acos(m(a)), Atan(a) => Atan(m(a)), Fact(a) => Fact(m(a)),
                 Lt(a, c) => Lt(m(a), m(c)), Le(a, c) => Le(m(a), m(c)), Eq(a, c) => Eq(m(a), m(c)),
                 Ne(a, c) => Ne(m(a), m(c)), And(a, c) => And(m(a), m(c)), Or(a, c) => Or(m(a), m(c)),
                 Xor(a, c) => Xor(m(a), m(c)), Not(a) => Not(m(a)), Sel(a, c, d) => Sel(m(a), m(c), m(d)),
@@ -578,7 +650,15 @@ mod tests {
     fn derivatives_match_finite_difference() {
         let fs = ["k*x*y/(1+x+y^2)", "pow(x, 2.5)*exp(-y)", "x^y", "sqrt(x)*ln(y)+log10(x*y)",
                   "abs(x-y)*sin(x)+cos(y)*tan(x/5)", "piecewise(x^2, x > y, y^3)", "min(x,y)*max(x,y)",
-                  "root(3, x*y)", "k/(x*x) - 1/y", "x^-2 * (1+y)^3"];
+                  "root(3, x*y)", "k/(x*x) - 1/y", "x^-2 * (1+y)^3",
+                  "asin(x/3) + acos(y/3) * atan(x)", "sec(x) + csc(y) + cot(x)", "sinh(x) * cosh(y) + tanh(x)",
+                  "arcsinh(x) + arccosh(y + 1) + arctanh(x/3)", "arcsech(x/3) + arccsch(y) + arccoth(x + 2)",
+                  "arcsec(x + 1) + arccsc(y + 1) + arccot(x)", "sech(x) + csch(y) + coth(x)"];
+        let v = |f: &str| eval(f, 0.0, 0.0, 0.0).0;
+        assert!((v("arcsech(0.42)") - 1.513306688).abs() < 1e-9);
+        assert!((v("arccoth(2)") - 0.5f64.atanh()).abs() < 1e-12);
+        assert_eq!((v("5 <= 5 <= 2"), v("1 < 2 < 3"), v("3 > 2 == 2")), (0.0, 1.0, 1.0));
+        assert_eq!((v("factorial(5)"), v("quotient(9, 2)"), v("rem(9, 2)"), v("plus()")), (120.0, 4.0, 1.0, 0.0));
         for f in fs {
             for &(x, y) in &[(0.7, 1.3), (2.0, 0.4), (1.5, 1.6)] {
                 let (_, dx, dy) = eval(f, x, y, 1.7);

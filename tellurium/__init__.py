@@ -116,6 +116,9 @@ from .analysis.gpu import gpu, getGPU, controlCoefficients
 # Rust engine (roadrunner_rs) behind simulate/steadyState/MCA, falls back to roadrunner
 from .roadrunner.extended_roadrunner import turbo
 
+# Rust Antimony reader (antimony-rs) by default; te.antimony(False) / te.SBML(False) for libantimony / libsbml
+from .tellurium import useRustAntimony as antimony, useRustSBML as SBML
+
 from .tellurium import (
     distributed_parameter_scanning, sample_plot, plotImage,
     distributed_stochastic_simulation, plot_distributed_stochastic, plot_stochastic_result, distributed_sensitivity_analysis

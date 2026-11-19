@@ -39,7 +39,7 @@ fn keys_of(m: &Model, k: &Bound<'_, PyAny>) -> PyResult<Vec<Key>> {
     }
 }
 
-type PyEvent = (String, Vec<(String, String)>, Option<String>, Option<String>, bool, bool, bool);
+type PyEvent = (String, Vec<(String, String)>, Option<String>, Option<String>, bool, bool, bool, Vec<Option<String>>, Vec<(String, String)>);
 
 /// Run f(work, sample) for 0..n: serially for threads=1, else on rayon (all cores for None).
 fn run_batch(m: &Model, n: usize, threads: Option<usize>, f: impl Fn(&mut Work, usize) + Sync + Send) -> PyResult<()> {
@@ -151,11 +151,12 @@ impl PyModel {
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (species, init, volumes, reactions, rates, stoich, param_names, param_values,
-                        rate_rules=None, assignment_rules=None, events=None))]
+                        rate_rules=None, assignment_rules=None, events=None, delays=None, algebraic=None))]
     fn new(species: Vec<String>, init: Vec<f64>, volumes: Vec<f64>, reactions: Vec<String>, rates: Vec<String>,
            stoich: PyReadonlyArray2<f64>, param_names: Vec<String>, param_values: Vec<f64>,
            rate_rules: Option<Vec<(String, String)>>, assignment_rules: Option<Vec<(String, String)>>,
-           events: Option<Vec<PyEvent>>) -> PyResult<Self> {
+           events: Option<Vec<PyEvent>>, delays: Option<Vec<(String, String, String, String)>>,
+           algebraic: Option<Vec<String>>) -> PyResult<Self> {
         let a = stoich.as_array();
         if a.dim() != (species.len(), reactions.len()) {
             return Err(verr(format!("stoich shape {:?} != (nSpecies, nReactions)", a.dim())));
@@ -164,8 +165,10 @@ impl PyModel {
         let x = Rules {
             rate: rate_rules.unwrap_or_default(),
             assign: assignment_rules.unwrap_or_default(),
-            events: events.unwrap_or_default().into_iter().map(|(trigger, assign, delay, priority, initial_value, persistent, u)|
-                EventDef { trigger, assign, delay, priority, initial_value, persistent, use_trigger_values: u }).collect(),
+            events: events.unwrap_or_default().into_iter().map(|(trigger, assign, delay, priority, initial_value, persistent, u, div, rescale)|
+                EventDef { trigger, assign, delay, priority, initial_value, persistent, use_trigger_values: u, div, rescale }).collect(),
+            delays: delays.unwrap_or_default(),
+            algebraic: algebraic.unwrap_or_default(),
         };
         Model::new(species, init, volumes, reactions, rates, st, param_names, param_values, x)
             .map(|m| PyModel { m, pool: Default::default(), names: Default::default() }).map_err(verr)
@@ -449,9 +452,20 @@ impl Session {
     }
 }
 
+/// Antimony source -> SBML Level 3 Version 2 text. ValueError lists the diagnostics on any error.
+#[pyfunction]
+fn antimony_to_sbml(source: &str) -> PyResult<String> {
+    let loaded = antimony::parse(source);
+    if loaded.has_errors() {
+        return Err(pyo3::exceptions::PyValueError::new_err(loaded.diagnostics.to_string()));
+    }
+    Ok(antimony::sbml::write_sbml(&loaded.document))
+}
+
 #[pymodule]
 fn roadrunner_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
+    m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_class::<Session>()?;
     m.add_class::<PyModel>()
 }
