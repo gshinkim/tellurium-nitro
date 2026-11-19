@@ -1,0 +1,2 @@
+# SPEC 5.7 / decision 14: a negative stoichiometric coefficient has no chemical meaning. libantimony emits this text and then cannot re-read it.
+dcNegativeStoichiometry 2

@@ -1,0 +1,2 @@
+# SPEC 6.3: a user-defined function called with the wrong number of arguments. Built-ins are exempt - piecewise is genuinely variadic.
+dcArityMismatch 5

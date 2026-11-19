@@ -1,0 +1,3 @@
+# SPEC 5.1: a string literal does not span lines. The second diagnostic follows because a string cannot be an expression, so the assignment has no value.
+dcUnterminatedString 2
+dcUnexpectedToken 2

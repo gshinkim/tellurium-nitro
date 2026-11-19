@@ -1,0 +1,13 @@
+[package]
+name = "sbml-io"
+description = "Read and write SBML Levels 2 and 3 (all of core, and the Layout and Render packages) as plain Rust data. Pure Rust, works in WebAssembly."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["sbml", "systems-biology", "biochemistry", "mathml"]
+categories = ["parser-implementations", "science"]
+
+[dependencies]
+# A read-only XML tree with line and column positions. Pure Rust.
+roxmltree = "0.21"

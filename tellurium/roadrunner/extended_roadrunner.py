@@ -19,6 +19,8 @@ try:
     _turbo = os.environ.get('TELLURIUM_ENGINE', '').strip().lower() != 'roadrunner'
 except ImportError:
     _has_rs = _turbo = False
+# strict: never hand a model or call to libroadrunner; raise NotSupportedByRust instead (te.turbo('strict'))
+_strict = _has_rs and os.environ.get('TELLURIUM_ENGINE', '').strip().lower() == 'strict'
 
 _NamedArray = roadrunner._roadrunner.NamedArray
 
@@ -42,13 +44,15 @@ _RS_INTEGRATORS = {k: (tuple(v), tuple(v.values())) for k, v in _RS_INTEGRATORS.
 def turbo(enable=None):
     """Use the Rust engine (roadrunner_rs) for simulate/steadyState/MCA when it supports the model.
 
-    :param enable: True/False to switch globally; None only queries.
+    :param enable: True/False to switch globally, 'strict' for Rust only (anything the Rust engine
+        can't do raises NotSupportedByRust instead of going to roadrunner); None only queries.
     :returns: whether turbo is on. On by default when roadrunner_rs is installed;
-        env ``TELLURIUM_ENGINE=roadrunner`` starts it off. Unsupported models,
-        integrators or settings always fall back to roadrunner.
+        env ``TELLURIUM_ENGINE=roadrunner`` starts it off, ``TELLURIUM_ENGINE=strict`` starts it strict.
+        Otherwise unsupported models, integrators or settings fall back to roadrunner.
     """
-    global _turbo
+    global _turbo, _strict
     if enable is not None:
+        _strict = enable == 'strict' and _has_rs
         if enable:
             try:
                 import roadrunner_rs  # noqa: F401
@@ -70,6 +74,15 @@ def _named(a, rows=None, cols=None):
 
 class _Fallback(Exception):
     """Raised inside a Rust-engine path: the call goes to roadrunner instead; the message is the reason."""
+
+
+class NotSupportedByRust(RuntimeError):
+    """te.turbo('strict'): the Rust engine can't do this and roadrunner fallback is off."""
+
+
+def _no_fallback(reason):
+    if _strict:
+        raise NotSupportedByRust(str(reason))
 
 
 class _Cols(object):
@@ -107,7 +120,7 @@ class _RsModel(object):
     volumes; ``nss``: no steady state (time-dependent rates or events)."""
     rd = L = ind = tk = ick = None  # filled on first use
 
-    def __init__(self, m, info, ids, vols, nss):
+    def __init__(self, m, info, ids, vols, nss, extra=False):
         ids, bids, gids, cids, rids = ids
         states, outs = list(m.state_ids), set(m.output_ids)
         if not set(ids) <= outs or sorted(rids) != sorted(m.reactions):
@@ -120,7 +133,13 @@ class _RsModel(object):
             except ValueError:
                 return False
         pidx, cidx, bidx, sidx = ([i for i, k in enumerate(l) if known(k)] for l in (gids, cids, bids, ids))
-        keys = [gids[i] for i in pidx] + [cids[i] for i in cidx] + [bids[i] for i in bidx] + [ids[i] for i in sidx]
+        keys = [gids[i] for i in pidx] + [cids[i] for i in cidx] + [bids[i] for i in bidx]
+        # extra (lazy models only): Rust states in none of roadrunner's groups, e.g. a species reference
+        # with a rate rule; they sit before the floating species and have no roadrunner array (xidx)
+        self.n_extra = len(keys)
+        keys += [k for k in states if extra and k not in keys and k not in ids]
+        self.n_extra = len(keys) - self.n_extra
+        keys += [ids[i] for i in sidx]
         comp_of, general = info['comp_of'], info['general']
         rx = [list(m.reactions).index(j) for j in rids]
         NR, Lc, _ = m.conservation()
@@ -147,7 +166,7 @@ class _RsModel(object):
                              [o2 + 2 * nb + i for i in sidx], dtype=int)
 
         def plan(chg):  # what sync writes back: species, and parameters/compartments/boundary species in chg
-            return [(f, idx, [names[i] for i in idx], np.array([oid[names[i]] for i in idx])) for f, idx, names in (
+            return [(f, idx, [names[i] for i in idx], np.array([oid[names[i]] for i in idx], dtype=int)) for f, idx, names in (
                 ('setCompartmentVolumes', [i for i in cidx if cids[i] in chg], cids),  # volumes first: species keep conc
                 ('setGlobalParameterValues', [i for i in pidx if gids[i] in chg], gids),
                 ('amount', [i for i, a in zip(bidx, self.bamt) if bids[i] in chg and a], bids),
@@ -262,27 +281,31 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         """A lazily compiled RoadRunner when turbo is on and the Rust engine takes the model, else None."""
         if _turbo and isinstance(sbml, str) and not roadrunner.Config.getValue(
                 roadrunner.Config.LOADSBMLOPTIONS_CONSERVED_MOIETIES):
-            text = sbml
+            text, base = sbml, None
             if not text.lstrip().startswith('<') and os.path.isfile(text):
+                base = os.path.dirname(os.path.abspath(text))
                 with open(text, encoding='utf-8') as f:
                     text = f.read()
             r = object.__new__(cls)
             roadrunner.roadrunner.RoadRunner._swig_init(r)  # empty roadrunner (no _makeProperties: no model)
             try:
                 if text.lstrip().startswith('<'):
-                    r._lz_init(text)
+                    r._lz_init(text, base)
                     return r
-            except (NotImplementedError, ValueError, _Fallback):
-                pass
+            except (NotImplementedError, ValueError, _Fallback) as e:
+                _no_fallback('model not supported by the Rust engine: %s' % e)
+        elif _turbo:
+            _no_fallback('model needs roadrunner (conserved moiety analysis or not SBML text)')
         return None
 
-    def _lz_init(self, sbml):
+    def _lz_init(self, sbml, base=None):
         from ..analysis.rrs_bridge import from_sbml, _names
         info = {}
-        m = from_sbml(sbml, info)
+        m = from_sbml(sbml, info, base)
         fids, bids, gids, cids, rids = ids = info['ids']
         doc = info['doc'].getModel()
-        st = _RsModel(m, info, ids, [info['values'][c] for c in cids], 'symbols/time' in sbml or doc.getNumEvents() > 0)
+        st = _RsModel(m, info, ids, [info['values'][c] for c in cids], 'symbols/time' in sbml or doc.getNumEvents() > 0,
+                      extra=True)
         if not set(st.states) <= set(st.keys) or not set(sum(ids, [])) <= st.outs:
             raise NotImplementedError("not all of the model is in the Rust model")
         oid = {n: i for i, n in enumerate(m.output_ids)}
@@ -303,9 +326,13 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         attr.update({k: k for k in gids + cids + rids})
         srefs = [sr for rx in doc.getListOfReactions() for l in (rx.getListOfReactants(), rx.getListOfProducts()) for sr in l]
         self.__dict__['_lz'] = dict(
-            sbml=sbml, info=info, st=st, x=x0.copy(), x0=x0, t=0.0, oid=oid, xo=np.array([oid[k] for k in st.keys]),
+            sbml=sbml, info=info, st=st, x=x0.copy(), x0=x0, t=0.0, oid=oid, xo=np.array([oid[k] for k in st.keys], dtype=int),
             o=lambda l: np.array([oid[k] for k in l], dtype=int), attr=attr, reset_ok=ok,
-            srefs=any(sr.isSetId() or sr.isSetStoichiometryMath() for sr in srefs),  # these SBML views: roadrunner
+            srefs=any(sr.isSetStoichiometryMath() for sr in srefs),  # these SBML views: roadrunner
+            # named stoichiometries: (row, reaction column, sign, id); their current values update N
+            nref=[(info['rows'].index(sr.getSpecies()), rids.index(sr.getParentSBMLObject().getParentSBMLObject().getId()),
+                   -1 if sr.getParentSBMLObject().getElementName() == 'listOfReactants' else 1, sr.getId())
+                  for sr in srefs if sr.isSetId() and sr.getSpecies() in info['rows']],
             tgt=np.array([st.kpos[k] for k in tgt], dtype=int), tgt_ids=tgt, model=_LazyModel(self),
             hosu={s for s in sp if sp[s].getHasOnlySubstanceUnits()},
             # roadrunner bakes these into the model: changing them needs roadrunner
@@ -314,9 +341,11 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
 
     def _load_rr(self):
         """Compile the model in roadrunner (once) and carry the lazy state over; returns self."""
-        lz = self.__dict__.pop('_lz', None)
+        lz = self.__dict__.get('_lz')
         if lz is None:
             return self
+        _no_fallback('this call needs roadrunner')
+        del self.__dict__['_lz']
         st = lz['st']
         roadrunner.roadrunner.RoadRunner.load(self, lz['sbml'])
         mdl = self.model
@@ -327,7 +356,7 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         roadrunner.roadrunner.RoadRunner._setSteadyStateSelections(self, lz['ssel'])
         ids = [list(f()) for f in (mdl.getFloatingSpeciesIds, mdl.getBoundarySpeciesIds, mdl.getGlobalParameterIds,
                                    mdl.getCompartmentIds, mdl.getReactionIds)]
-        if ids == [getattr(st, k) for k in ('ids', 'bids', 'gids', 'cids', 'rids')]:  # keep the Rust model (and event state)
+        if not st.n_extra and ids == [getattr(st, k) for k in ('ids', 'bids', 'gids', 'cids', 'rids')]:  # keep the Rust model
             cc = st.cconst
             self.__dict__['_rs_cache'] = ((self.conservedMoietyAnalysis, mdl.getCompartmentVolumes()[cc].tobytes()), st, cc)
         return self
@@ -521,7 +550,10 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         lz = self.__dict__.get('_lz')
         if lz is None or lz['srefs']:
             return self._super().getFullStoichiometryMatrix()
-        return _named(lz['info']['N'], lz['info']['rows'], lz['st'].rids)
+        N = np.array(lz['info']['N'], dtype=float)
+        for i, j, sg, sid in lz['nref']:
+            N[i, j] += sg * (self.getValue(sid) - lz['info']['values'][sid])
+        return _named(N, lz['info']['rows'], lz['st'].rids)
     getFullStoichiometryMatrix.__doc__ = roadrunner.roadrunner.RoadRunner.getFullStoichiometryMatrix.__doc__
 
     def setIntegrator(self, name):
@@ -561,6 +593,7 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         try:
             res = rust()
         except _Fallback as e:
+            _no_fallback('%s: %s' % (method, e))
             self.__dict__['_last_run'] = dict(method=method, engine='roadrunner', reason=str(e))
             return fallback()
         info = self.__dict__.pop('_run_info', None) or {}
@@ -679,7 +712,7 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
         mdl = self.model
         Y, final = st.advance(self._rs_x(st, mdl).tolist(), times, ores, rtol, atol,
                               st.atol_scale(mdl.getFloatingSpeciesInitConcentrations()))
-        if not np.isfinite(Y).all():
+        if not np.isfinite(Y).all() and (~np.isfinite(Y) & np.isfinite(Y[:1])).any():  # went non-finite during the run
             raise _Fallback('non-finite Rust output')
         self._rs_sync(st, final, mdl)
         mdl.setTime(times[-1])
@@ -780,7 +813,7 @@ class ExtendedRoadRunner(roadrunner.RoadRunner):
                 Y, tend = m.gillespie_batch(k, x[None], times, seed=run_seed, threads=1, outputs=outs + k)[0], times[-1]
         except ValueError:
             raise _Fallback('rate rules in a stochastic simulation')
-        if not np.isfinite(Y).all():
+        if not np.isfinite(Y).all() and (~np.isfinite(Y) & np.isfinite(Y[:1])).any():  # went non-finite during the run
             raise _Fallback('non-finite Rust output')
         st.reset_events()  # the next ODE run starts its events fresh
         self._rs_sync(st, dict(zip(k, Y[-1, len(outs):])))

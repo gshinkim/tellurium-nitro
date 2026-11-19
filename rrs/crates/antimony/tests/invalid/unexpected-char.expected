@@ -1,0 +1,3 @@
+# An unrecognised character is consumed, not re-examined, so the lexer cannot spin. '@' would NOT do: it is a real token in 5.1.
+dcUnexpectedChar 2
+dcUnexpectedToken 2

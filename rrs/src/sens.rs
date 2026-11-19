@@ -19,6 +19,7 @@ fn remap(op: Op, f: impl Fn(N) -> N) -> Op {
         PowI(a, k) => PowI(f(a), k), Exp(a) => Exp(f(a)), Ln(a) => Ln(f(a)), Log10(a) => Log10(f(a)),
         Sqrt(a) => Sqrt(f(a)), Abs(a) => Abs(f(a)), Sign(a) => Sign(f(a)), Floor(a) => Floor(f(a)),
         Ceil(a) => Ceil(f(a)), Sin(a) => Sin(f(a)), Cos(a) => Cos(f(a)), Tan(a) => Tan(f(a)),
+        Asin(a) => Asin(f(a)), Acos(a) => Acos(f(a)), Atan(a) => Atan(f(a)), Fact(a) => Fact(f(a)),
         Lt(a, c) => Lt(f(a), f(c)), Le(a, c) => Le(f(a), f(c)), Eq(a, c) => Eq(f(a), f(c)),
         Ne(a, c) => Ne(f(a), f(c)), And(a, c) => And(f(a), f(c)), Or(a, c) => Or(f(a), f(c)),
         Xor(a, c) => Xor(f(a), f(c)), Not(a) => Not(f(a)), Sel(a, c, d) => Sel(f(a), f(c), f(d)),
@@ -112,7 +113,8 @@ fn show(d: &Dag, n: N, nm: &dyn Fn(u32) -> String, o: &mut String) {
         Exp(a) => f(o, "exp", &[a]), Ln(a) => f(o, "ln", &[a]), Log10(a) => f(o, "log10", &[a]),
         Sqrt(a) => f(o, "sqrt", &[a]), Abs(a) => f(o, "abs", &[a]), Floor(a) => f(o, "floor", &[a]),
         Ceil(a) => f(o, "ceil", &[a]), Sin(a) => f(o, "sin", &[a]), Cos(a) => f(o, "cos", &[a]),
-        Tan(a) => f(o, "tan", &[a]),
+        Tan(a) => f(o, "tan", &[a]), Asin(a) => f(o, "asin", &[a]), Acos(a) => f(o, "acos", &[a]),
+        Atan(a) => f(o, "atan", &[a]), Fact(a) => f(o, "factorial", &[a]),
         Sign(a) => { o.push_str("piecewise(1,"); show(d, a, nm, o); o.push_str(">0,-1,"); show(d, a, nm, o); o.push_str("<0,0)"); }
         Lt(a, c) => f(o, "lt", &[a, c]), Le(a, c) => f(o, "leq", &[a, c]), Eq(a, c) => f(o, "eq", &[a, c]),
         Ne(a, c) => f(o, "neq", &[a, c]), And(a, c) => f(o, "and", &[a, c]), Or(a, c) => f(o, "or", &[a, c]),

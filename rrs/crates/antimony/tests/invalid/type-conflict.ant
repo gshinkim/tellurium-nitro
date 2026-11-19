@@ -1,0 +1,4 @@
+model *m()
+  compartment c;
+  species c;
+end

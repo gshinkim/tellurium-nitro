@@ -6,8 +6,10 @@
 //! Rate rules are pseudo-reactions: v = [reaction rates | rate-rule rhs], and the generalized
 //! stoichiometry (nx x nv) carries a unit entry per rate rule, so steady state, conservation and
 //! the Jacobian treat them uniformly. Every tape uses the register layout [x | params | time | ...].
-use crate::expr::{parse, Dag, Op, Tape};
+use crate::expr::{children, parse, Dag, Op, Tape};
 use rayon::prelude::*;
+use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::HashMap;
 
 /// Rules and events on top of the reaction network. Formulas use species/parameter ids and `time`.
@@ -19,6 +21,46 @@ pub struct Rules {
     /// (id, formula): output-only variables.
     pub assign: Vec<(String, String)>,
     pub events: Vec<EventDef>,
+    /// delay(expr, tau) calls: (parameter holding the delayed value, expr, tau, expr before the run).
+    /// The parameter is refilled with expr at time t - tau before every evaluation, from the run's
+    /// history; before the run starts, with the last formula at the initial state and time t - tau.
+    /// Inner delays come first (an expr or tau may use an earlier delay's parameter).
+    pub delays: Vec<(String, String, String, String)>,
+    /// rate-rule targets that are algebraic: their formula is a residual held at 0 (mass 0), so the
+    /// model is a DAE and time courses go through diffsol's BDF
+    pub algebraic: Vec<String>,
+}
+
+/// State history of the current run for delay(): (t, state, d state/dt) at accepted steps, and
+/// scratch registers of the delay tape.
+#[derive(Default)]
+pub struct Hist { t: Vec<f64>, y: Vec<f64>, f: Vec<f64>, rd: Mutex<Vec<f64>>, yt: Mutex<Vec<f64>> }
+
+impl Hist {
+    pub fn clear(&mut self) { self.t.clear(); self.y.clear(); self.f.clear(); }
+
+    /// State at tp into out (Hermite between recorded points; before the first: the first; after the
+    /// last: linear to (t_now, s_now)).
+    fn state_at(&self, tp: f64, s_now: &[f64], t_now: f64, out: &mut [f64]) {
+        let (n, nx) = (self.t.len(), s_now.len());
+        if n == 0 || tp >= t_now { out.copy_from_slice(s_now); return; }
+        if tp <= self.t[0] { out.copy_from_slice(&self.y[..nx]); return; }
+        let last = n - 1;
+        if tp >= self.t[last] {
+            let (ta, ya) = (self.t[last], &self.y[last * nx..]);
+            let th = if t_now > ta { (tp - ta) / (t_now - ta) } else { 1.0 };
+            for i in 0..nx { out[i] = ya[i] + th * (s_now[i] - ya[i]); }
+            return;
+        }
+        let i = self.t.partition_point(|&x| x <= tp) - 1; // t[i] <= tp < t[i+1]
+        let (ta, tb) = (self.t[i], self.t[i + 1]);
+        let (ya, yb) = (&self.y[i * nx..(i + 1) * nx], &self.y[(i + 1) * nx..(i + 2) * nx]);
+        let (fa, fb) = (&self.f[i * nx..(i + 1) * nx], &self.f[(i + 1) * nx..(i + 2) * nx]);
+        let h = tb - ta;
+        let u = (tp - ta) / h;
+        let (h00, h10, h01, h11) = ((1.0 + 2.0 * u) * (1.0 - u).powi(2), u * (1.0 - u).powi(2), u * u * (3.0 - 2.0 * u), u * u * (u - 1.0));
+        for k in 0..nx { out[k] = h00 * ya[k] + h10 * h * fa[k] + h01 * yb[k] + h11 * h * fb[k]; }
+    }
 }
 
 #[derive(Clone)]
@@ -30,10 +72,16 @@ pub struct EventDef {
     pub initial_value: bool,
     pub persistent: bool,
     pub use_trigger_values: bool,
+    /// per assignment (or empty): a formula the value is divided by at execution time (an amount set
+    /// with trigger-time values becomes a concentration with the volume when the event executes)
+    pub div: Vec<Option<String>>,
+    /// (state, its compartment's volume formula): concentrations scaled by V_before / V_after when the
+    /// event executes, so amounts survive a compartment the event resizes
+    pub rescale: Vec<(String, String)>,
 }
 
 /// Event compiled to registers of the aux tape; assignment targets are registers (< nx: state).
-struct Event { trig: u32, delay: Option<u32>, prio: Option<u32>, asg: Vec<(u32, u32)>, init: bool, persistent: bool, uvftt: bool }
+struct Event { trig: u32, delay: Option<u32>, prio: Option<u32>, asg: Vec<(u32, u32)>, div: Vec<Option<u32>>, rescale: Vec<(u32, u32)>, init: bool, persistent: bool, uvftt: bool }
 
 pub struct Model {
     pub event_src: Vec<EventDef>, // events as given (sensitivity models re-use them)
@@ -55,7 +103,11 @@ pub struct Model {
     rates: Tape,          // outs: v
     full: Tape,           // outs: v, jacobian entries, dv/dt entries
     aux: Tape,            // outs: assignment rules, rates, event expressions
+    dtape: Tape,          // outs: per delay, tau then expr
+    alg: Vec<bool>,       // per state: algebraic (mass 0)
+    dly: Vec<(u32, u32, u32, u32)>, // per delay: (parameter index, tau, expr, expr-before-start registers) in dtape
     events: Vec<Event>,
+    comps: Vec<u32>, // aux registers of the comparisons inside triggers: a step is cut where any flips
     col: Vec<Vec<(u32, f64)>>, // per reaction: (species, N_ij), for SSA
     jac: Vec<(u32, u32)>, // (rate j, state k) for each jacobian entry
     dt: Vec<u32>,         // reactions with explicit time dependence
@@ -150,10 +202,13 @@ pub struct Work {
     ra: Vec<f64>, // registers of the aux tape
     y0: Vec<f64>, d1: Vec<f64>, d2: Vec<f64>, // last step start + dense output coefficients
     prev: Vec<bool>, // trigger value at the current time
+    prevc: Vec<bool>, // value of each comparison inside the triggers at the current time
     pend: Vec<(f64, usize, Vec<f64>)>, // (execution time, event, values if fixed at trigger time)
     tmp: Vec<f64>,
     amt: Vec<f64>, // SSA amounts
     bdf: Bdf,
+    pub hist: Hist,
+    rng: Rng, // ties between simultaneous events of equal priority are broken at random (SBML L3)
     /// per-state multiplier of the absolute tolerance (roadrunner scales atol by initial values)
     pub atol_scale: Vec<f64>,
     /// solver counters since the last reset: [BDF steps, Rodas4 steps, rejected steps, BDF->Rodas4 switches]
@@ -440,6 +495,10 @@ impl Model {
             rr_row.push(i);
         }
         let (nx, nv) = (state_ids.len(), nr + x.rate.len());
+        for a in &x.algebraic {
+            if !x.rate.iter().any(|(n, _)| n == a) { return Err(format!("algebraic state '{a}' has no residual")); }
+        }
+        let alg: Vec<bool> = state_ids.iter().map(|s| x.algebraic.contains(s)).collect();
         let mut st = vec![0.0; nx * nv];
         for i in 0..ns { st[i * nv..i * nv + nr].copy_from_slice(&stoich[i * nr..(i + 1) * nr]); }
         for (q, &i) in rr_row.iter().enumerate() { st[i * nv + nr + q] = 1.0; }
@@ -469,9 +528,23 @@ impl Model {
                 if dag.val(d) != Some(0.0) { dt.push(j as u32); troots.push(d); }
             }
         }
-        let rates_tape = Tape::new(&dag, &roots, nx, np);
+        // delayed values: parameters refilled before every evaluation (never hoisted)
+        let mut dly = vec![];
+        let mut droots = vec![];
+        for (pn, e, tau, pre) in &x.delays {
+            let k = pnames.iter().position(|p| p == pn).ok_or(format!("delay parameter '{pn}' missing"))? as u32;
+            droots.push(p(tau, &format!("delay time of {pn}"), &mut dag)?);
+            droots.push(p(e, &format!("delayed expression of {pn}"), &mut dag)?);
+            droots.push(p(pre, &format!("delayed expression of {pn}"), &mut dag)?);
+            dly.push(k);
+        }
+        let dynp = dly.clone();
+        let dtape = Tape::new_dyn(&dag, &droots, nx, np, &dynp);
+        let o3 = |q: usize, i: usize| dtape.outs[3 * q + i];
+        let dly: Vec<(u32, u32, u32, u32)> = dly.iter().enumerate().map(|(q, &k)| (k, o3(q, 0), o3(q, 1), o3(q, 2))).collect();
+        let rates_tape = Tape::new_dyn(&dag, &roots, nx, np, &dynp);
         let all: Vec<_> = roots.iter().chain(&jroots).chain(&troots).copied().collect();
-        let full = Tape::new(&dag, &all, nx, np);
+        let full = Tape::new_dyn(&dag, &all, nx, np, &dynp);
 
         // aux tape: [assignment rules | reaction rates | per event: trigger, delay?, priority?, values]
         let mut aroots = vec![];
@@ -495,15 +568,36 @@ impl Model {
                 };
                 asg.push((r, at(f, &mut dag, &mut aroots)?));
             }
-            evs.push(Event { trig, delay, prio, asg, init: d.initial_value, persistent: d.persistent, uvftt: d.use_trigger_values });
+            let div = (0..asg.len()).map(|q| d.div.get(q).cloned().flatten().map(|f| at(&f, &mut dag, &mut aroots)).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut rescale = vec![];
+            for (sn, vf) in &d.rescale {
+                let Some(Op::Var(i)) = sym.get(sn.as_str()) else { return Err(format!("event {e}: '{sn}' is not a state")) };
+                rescale.push((*i, at(vf, &mut dag, &mut aroots)?));
+            }
+            evs.push(Event { trig, delay, prio, asg, div, rescale, init: d.initial_value, persistent: d.persistent, uvftt: d.use_trigger_values });
         }
-        let aux = Tape::new(&dag, &aroots, nx, np);
+        // every comparison inside a trigger is watched on its own (as CVODE root functions): a step
+        // can cross a whole window (t >= a && t <= b) with the trigger false at both ends
+        let mut cmp = vec![];
+        let mut stack: Vec<u32> = evs.iter().map(|e: &Event| aroots[e.trig as usize]).collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(nd) = stack.pop() {
+            if !seen.insert(nd) { continue; }
+            let op = dag.nodes[nd as usize];
+            if matches!(op, Op::Lt(..) | Op::Le(..) | Op::Eq(..) | Op::Ne(..)) { cmp.push(aroots.len() as u32); aroots.push(nd); }
+            stack.extend(children(&op).iter().flatten());
+        }
+        let aux = Tape::new_dyn(&dag, &aroots, nx, np, &dynp);
+        let comps: Vec<u32> = cmp.iter().map(|&i| aux.outs[i as usize]).collect();
         let o = |i: u32| aux.outs[i as usize];
         for ev in &mut evs {
             ev.trig = o(ev.trig);
             ev.delay = ev.delay.map(o);
             ev.prio = ev.prio.map(o);
             for a in &mut ev.asg { a.1 = o(a.1); }
+            for r in ev.div.iter_mut().flatten() { *r = o(*r); }
+            for r in &mut ev.rescale { r.1 = o(r.1); }
         }
         let na = x.assign.len();
         let mut outputs: Vec<(String, u32)> = state_ids.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
@@ -535,7 +629,7 @@ impl Model {
         let outmap = outputs.iter().cloned().collect();
         Ok(Model { event_src: x.events, species, reactions, pnames, state_ids, outputs, keymap, outmap, init, vol, pvals, stoich, ns, nr, nx, nv,
                    sp: SparseLu::new(nx, jfull.iter().map(|e| e.0 as usize)),
-                   rates: rates_tape, full, aux, events: evs, col, jac, dt, nz, jfull, indep, dep, l0, lc, nzr, jred, mca_c })
+                   rates: rates_tape, full, aux, dtape, dly, alg, events: evs, comps, col, jac, dt, nz, jfull, indep, dep, l0, lc, nzr, jred, mca_c })
     }
 
     pub fn ni(&self) -> usize { self.indep.len() }
@@ -561,9 +655,11 @@ impl Model {
             x: z(ni), xt: z(ni), dx: z(ni), f: z(ni), jr: z(ni * ni), piv: vec![0; ni.max(nx)],
             yn: z(nx), dy: z(nx), fx: z(nx), f0: z(nx), k: std::array::from_fn(|_| z(nx)), jf: z(nx * nx), pivf: vec![0; nx],
             lo: vec![], up: vec![], xm: z(ni * nr),
-            ra: self.aux.regs(), y0: z(nx), d1: z(nx), d2: z(nx), prev: vec![false; self.events.len()],
+            ra: self.aux.regs(), y0: z(nx), d1: z(nx), d2: z(nx), prev: vec![false; self.events.len()], prevc: vec![false; self.comps.len()],
             pend: vec![], tmp: vec![], amt: z(nx), atol_scale: vec![1.0; nx], stats: [0; 4],
             bdf: Bdf { d: z((BDF_MAX + 3) * nx), jev: z(self.jac.len() + self.dt.len()), sc: std::array::from_fn(|_| z(nx)), ..Default::default() },
+            hist: Hist { rd: Mutex::new(self.dtape.regs()), yt: Mutex::new(z(nx)), ..Default::default() },
+            rng: Rng::new(0x5eed_e7e7),
         }
     }
 
@@ -575,6 +671,7 @@ impl Model {
         for (k, &x) in keys.iter().zip(row) {
             match *k { Key::Par(i) => w.rr[nx + i] = x, Key::Spec(i) => w.s[i] = x }
         }
+        w.hist.clear();
         let a = &w.rr[nx..nx + np];
         w.rf[nx..nx + np].copy_from_slice(a);
         w.ra[nx..nx + np].copy_from_slice(a);
@@ -595,8 +692,9 @@ impl Model {
 
     /// Rates only at (s, t) into v.
     #[inline]
-    fn rates_at(&self, regs: &mut [f64], v: &mut [f64], s: &[f64], t: f64) {
+    fn rates_at(&self, hs: &Hist, regs: &mut [f64], v: &mut [f64], s: &[f64], t: f64) {
         let (nx, np) = (self.nx, self.pnames.len());
+        self.fill_delays(hs, regs, s, t);
         regs[..nx].copy_from_slice(s);
         regs[nx + np] = t;
         self.rates.run(regs);
@@ -605,8 +703,9 @@ impl Model {
 
     /// Rates, jacobian entries and dv/dt at (s, t).
     #[inline]
-    fn full_at(&self, regs: &mut [f64], v: &mut [f64], ev: &mut [f64], s: &[f64], t: f64) {
+    fn full_at(&self, hs: &Hist, regs: &mut [f64], v: &mut [f64], ev: &mut [f64], s: &[f64], t: f64) {
         let (nx, np, nv) = (self.nx, self.pnames.len(), self.nv);
+        self.fill_delays(hs, regs, s, t);
         regs[..nx].copy_from_slice(s);
         regs[nx + np] = t;
         self.full.run(regs);
@@ -616,17 +715,71 @@ impl Model {
 
     /// Aux tape (rules, rates, event expressions) at (s, t).
     #[inline]
-    fn aux_at(&self, regs: &mut [f64], s: &[f64], t: f64) {
+    fn aux_at(&self, hs: &Hist, regs: &mut [f64], s: &[f64], t: f64) {
         let (nx, np) = (self.nx, self.pnames.len());
+        self.fill_delays(hs, regs, s, t);
         regs[..nx].copy_from_slice(s);
         regs[nx + np] = t;
         self.aux.run(regs);
     }
 
+    /// delay(): write each delayed value (expr at t - tau, from the run's history) into its parameter.
+    fn fill_delays(&self, hs: &Hist, regs: &mut [f64], s: &[f64], t: f64) {
+        if self.dly.is_empty() { return; }
+        let (nx, np) = (self.nx, self.pnames.len());
+        let (mut rd, mut yt) = (hs.rd.lock().unwrap(), hs.yt.lock().unwrap());
+        rd[nx..nx + np].copy_from_slice(&regs[nx..nx + np]);
+        self.dtape.prep(&mut rd);
+        for &(k, tr, er, pr) in &self.dly { // in order: later delays see the earlier ones' new values
+            rd[..nx].copy_from_slice(s);
+            rd[nx + np] = t;
+            self.dtape.run(&mut rd);
+            let tp = t - rd[tr as usize];
+            let before = hs.t.first().is_some_and(|&t0| tp < t0);
+            hs.state_at(tp, s, t, &mut yt);
+            rd[..nx].copy_from_slice(&yt);
+            rd[nx + np] = tp.min(t);
+            self.dtape.run(&mut rd);
+            let x = rd[if before { pr } else { er } as usize];
+            regs[nx + k as usize] = x;
+            rd[nx + k as usize] = x;
+        }
+    }
+
+    /// Record (t, w.s, d w.s/dt) in the delay history (delay models only).
+    fn hist_push(&self, w: &mut Work, t: f64) {
+        if self.dly.is_empty() { return; }
+        let Work { rr, v, s, f0, hist, .. } = w;
+        self.rates_at(hist, rr, v, s, t);
+        self.rhs(v, f0);
+        if hist.t.last() == Some(&t) { // same time (event): the later state wins
+            let n = hist.t.len() - 1;
+            hist.y.truncate(n * self.nx);
+            hist.f.truncate(n * self.nx);
+            hist.t.truncate(n);
+        }
+        hist.t.push(t);
+        hist.y.extend_from_slice(s);
+        hist.f.extend_from_slice(f0);
+    }
+
+    /// Smallest positive delay time at the current state (step-size cap for delay models).
+    fn delay_cap(&self, w: &mut Work, t: f64) -> f64 {
+        if self.dly.is_empty() { return f64::INFINITY; }
+        let (nx, np) = (self.nx, self.pnames.len());
+        let Work { rr, s, hist, .. } = w;
+        let mut rd = hist.rd.lock().unwrap();
+        rd[nx..nx + np].copy_from_slice(&rr[nx..nx + np]);
+        rd[..nx].copy_from_slice(s);
+        rd[nx + np] = t;
+        self.dtape.run_all(&mut rd);
+        self.dly.iter().map(|&(_, tr, _, _)| rd[tr as usize]).filter(|&x| x > 0.0).fold(f64::INFINITY, f64::min)
+    }
+
     /// Full Jacobian d(dx/dt)/dx (nx x nx, row-major) at (w.s, t).
     pub fn jacobian(&self, w: &mut Work, t: f64, out: &mut [f64]) {
-        let Work { rf, v, ev, s, .. } = w;
-        self.full_at(rf, v, ev, s, t);
+        let Work { rf, v, ev, s, hist, .. } = w;
+        self.full_at(hist, rf, v, ev, s, t);
         out.fill(0.0);
         for &(d, e, c) in &self.jfull { out[d as usize] += c * ev[e as usize]; }
     }
@@ -667,14 +820,14 @@ impl Model {
 
     fn newton(&self, w: &mut Work) -> bool {
         let ni = self.ni();
-        let Work { rr, rf, v, ev, s, tc, x, xt, dx, f, jr, piv, .. } = w;
+        let Work { rr, rf, v, ev, s, tc, x, xt, dx, f, jr, piv, hist, .. } = w;
         self.expand(x, tc, s);
-        self.rates_at(rr, v, s, 0.0);
+        self.rates_at(hist, rr, v, s, 0.0);
         let (mut fn0, mut sc) = self.resid(v, f);
         for _ in 0..100 {
             if !fn0.is_finite() { return false; }
             if fn0 <= 1e-14 * sc { return true; }
-            self.full_at(rf, v, ev, s, 0.0);
+            self.full_at(hist, rf, v, ev, s, 0.0);
             jr.fill(0.0);
             for &(d, e, c) in &self.jred { jr[d as usize] += c * ev[e as usize]; }
             if !lu(jr, ni, piv, 1e-15) { return false; }
@@ -684,7 +837,7 @@ impl Model {
             loop {
                 for b in 0..ni { xt[b] = x[b] + lam * dx[b]; }
                 self.expand(xt, tc, s);
-                self.rates_at(rr, v, s, 0.0);
+                self.rates_at(hist, rr, v, s, 0.0);
                 let (fnt, sct) = self.resid(v, f);
                 if fnt.is_finite() && (fnt <= (1.0 - 1e-4 * lam) * fn0 || fnt <= 1e-14 * sct) {
                     x.copy_from_slice(xt);
@@ -719,8 +872,8 @@ impl Model {
             self.expand(&w.x.clone(), &w.tc.clone(), &mut w.s); // ponytail: alloc only on the rare fallback path
         }
         if ok {
-            let Work { rf, v, ev, s, .. } = w;
-            self.full_at(rf, v, ev, s, 0.0);
+            let Work { rf, v, ev, s, hist, .. } = w;
+            self.full_at(hist, rf, v, ev, s, 0.0);
             ok = self.valid(w);
         }
         ok
@@ -743,9 +896,9 @@ impl Model {
     fn step(&self, w: &mut Work, t: f64, t1: f64, h: &mut f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
         let nj = self.jac.len();
-        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, stats: w_stats, .. } = w;
+        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, stats: w_stats, hist, .. } = w;
         if !(*h > 0.0) { *h = (1e-6 * (t1 - t).abs()).max(1e-12); }
-        self.full_at(rf, v, ev, y, t);
+        self.full_at(hist, rf, v, ev, y, t);
         self.rhs(v, f0);
         if !self.dt.is_empty() {
             fx.fill(0.0);
@@ -784,7 +937,7 @@ impl Model {
                     let a = A[st - 1][j];
                     for (o, &x) in yn.iter_mut().zip(&k[j]) { *o += a * x; }
                 }
-                self.rates_at(rr, v, yn, t + CT[st] * hh);
+                self.rates_at(hist, rr, v, yn, t + CT[st] * hh);
                 self.rhs(v, dy);
                 let (head, tail) = k.split_at_mut(st);
                 let ks = &mut tail[0];
@@ -854,19 +1007,19 @@ impl Model {
     /// Returns the new time.
     fn bdf_step(&self, w: &mut Work, t: f64, t1: f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
-        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, stats: w_stats, .. } = w;
+        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, stats: w_stats, hist, .. } = w;
         let Bdf { d, order, h, t: bt, neq, lu: has_lu, lufac, crate_, jev, sc, nlu, jage, defer } = b;
         let [yp, psi, dd, yn, f, dy, wt] = sc; // wt: inverse error weights 1 / (atol * scale + rtol |y|)
         tmp.resize(BDF_MAX + 3, 0.0);
         let newton_tol = 10.0 * f64::EPSILON / rtol;
         if *order == 0 { // (re)start: order 1, Hairer's initial step, fresh Jacobian
-            self.rates_at(rr, v, y, t);
+            self.rates_at(hist, rr, v, y, t);
             self.rhs(v, f);
             for i in 0..nx { wt[i] = 1.0 / (atol * asc[i] + rtol * y[i].abs()); }
             let (d0, d1) = (rms(nx, |i| y[i] * wt[i]), rms(nx, |i| f[i] * wt[i]));
             let h0 = if d0 < 1e-5 || d1 < 1e-5 { 1e-6 } else { 0.01 * d0 / d1 }.min(t1 - t);
             for i in 0..nx { yn[i] = y[i] + h0 * f[i]; }
-            self.rates_at(rr, v, yn, t + h0);
+            self.rates_at(hist, rr, v, yn, t + h0);
             self.rhs(v, dy);
             let d2 = rms(nx, |i| (dy[i] - f[i]) * wt[i]) / h0;
             let h1 = if d1 <= 1e-15 && d2 <= 1e-15 { (h0 * 1e-3).max(1e-6) } else { (0.01 / d1.max(d2)).sqrt() };
@@ -880,7 +1033,7 @@ impl Model {
             *crate_ = 1.0;
             *jage = 0;
             *defer = false;
-            self.full_at(rf, v, ev, y, t);
+            self.full_at(hist, rf, v, ev, y, t);
             jev.copy_from_slice(ev);
         }
         // step size change by `fac`: re-interpolate the differences; the last correction (used only
@@ -912,7 +1065,7 @@ impl Model {
             let converged = loop {
                 if !*has_lu || (c * *lufac - 1.0).abs() > 0.3 || *nlu >= 20 {
                     if *jage >= 50 && !fresh_jac {
-                        self.full_at(rf, v, ev, yp, tn);
+                        self.full_at(hist, rf, v, ev, yp, tn);
                         jev.copy_from_slice(ev);
                         *jage = 0;
                         fresh_jac = true;
@@ -932,7 +1085,7 @@ impl Model {
                 let ntol = newton_tol.max(0.1 / BDF_ERR[k]);
                 let (mut old, mut conv) = (0.0, false);
                 for kk in 0..3 {
-                    self.rates_at(rr, v, yn, tn);
+                    self.rates_at(hist, rr, v, yn, tn);
                     self.rhs(v, f);
                     if !f.iter().all(|x| x.is_finite()) { break; }
                     for (((o, &x), &p), &e) in dy.iter_mut().zip(f.iter()).zip(psi.iter()).zip(dd.iter()) { *o = (c * x - p - e) * *lufac; }
@@ -948,7 +1101,7 @@ impl Model {
                     old = dn;
                 }
                 if conv || fresh_jac { break conv; }
-                self.full_at(rf, v, ev, yp, tn); // stale Jacobian: refresh once, then retry
+                self.full_at(hist, rf, v, ev, yp, tn); // stale Jacobian: refresh once, then retry
                 jev.copy_from_slice(ev);
                 *jage = 0;
                 *has_lu = false;
@@ -1021,9 +1174,10 @@ impl Model {
     // ------------------------------------------------------------ events
 
     /// Any trigger value at (s, t) differs from w.prev.
-    fn changed(&self, ra: &mut [f64], prev: &[bool], s: &[f64], t: f64) -> bool {
-        self.aux_at(ra, s, t);
+    fn changed(&self, hs: &Hist, ra: &mut [f64], prev: &[bool], prevc: &[bool], s: &[f64], t: f64) -> bool {
+        self.aux_at(hs, ra, s, t);
         self.events.iter().zip(prev).any(|(e, &p)| (ra[e.trig as usize] != 0.0) != p)
+            || self.comps.iter().zip(prevc).any(|(&r, &p)| (ra[r as usize] != 0.0) != p)
     }
 
     /// Earliest trigger change inside the last step (ta, tb]: bisection on the active solver's dense output
@@ -1035,8 +1189,8 @@ impl Model {
         while hi - lo > tol {
             let th = 0.5 * (lo + hi);
             if bdf { self.bdf_interp(w, ta + th * (tb - ta)) } else { self.interp(w, th) }
-            let Work { yn, ra, prev, .. } = w;
-            if self.changed(ra, prev, yn, ta + th * (tb - ta)) { hi = th } else { lo = th }
+            let Work { yn, ra, prev, prevc, hist, .. } = w;
+            if self.changed(hist, ra, prev, prevc, yn, ta + th * (tb - ta)) { hi = th } else { lo = th }
         }
         if hi == 1.0 { tb } else { ta + hi * (tb - ta) }
     }
@@ -1072,6 +1226,7 @@ impl Model {
 
     /// Reset event bookkeeping for a run starting at t0 (trigger state before t0 = initialValue).
     pub fn events_reset(&self, w: &mut Work) {
+        w.hist.clear(); // a fresh run: delay() sees the initial state before it
         w.pend.clear();
         for (p, e) in w.prev.iter_mut().zip(&self.events) { *p = e.init; }
     }
@@ -1081,10 +1236,11 @@ impl Model {
     /// Returns None if a cascade does not terminate, else whether any event executed.
     fn events_at(&self, w: &mut Work, t: f64) -> Option<bool> {
         let nx = self.nx;
-        let Work { rr, rf, ra, s, prev, pend, tmp, .. } = w;
+        let Work { rr, rf, ra, s, prev, prevc, pend, tmp, hist, rng, .. } = w;
         let mut fired = false;
         for _ in 0..10_000 {
-            self.aux_at(ra, s, t);
+            self.aux_at(hist, ra, s, t);
+            for (p, &r) in prevc.iter_mut().zip(&self.comps) { *p = ra[r as usize] != 0.0; }
             for (e, ev) in self.events.iter().enumerate() {
                 let cur = ra[ev.trig as usize] != 0.0;
                 if cur && !prev[e] {
@@ -1097,19 +1253,32 @@ impl Model {
                 prev[e] = cur;
             }
             let pr = |e: usize| self.events[e].prio.map_or(0.0, |r| ra[r as usize]);
-            let best = (0..pend.len()).filter(|&i| pend[i].0 <= t).max_by(|&a, &b|
-                pr(pend[a].1).total_cmp(&pr(pend[b].1)).then(pend[b].1.cmp(&pend[a].1)).then(b.cmp(&a)));
-            let Some(i) = best else { return Some(fired) };
+            let due: Vec<usize> = (0..pend.len()).filter(|&i| pend[i].0 <= t).collect();
+            if due.is_empty() { return Some(fired) }
+            let top = due.iter().map(|&i| pr(pend[i].1)).fold(f64::NEG_INFINITY, f64::max);
+            let tied: Vec<usize> = due.into_iter().filter(|&i| pr(pend[i].1) == top || top.is_nan()).collect();
+            // equal explicit priorities: uniformly random (SBML L3); otherwise document order
+            let i = if tied.len() > 1 && tied.iter().all(|&i| self.events[pend[i].1].prio.is_some()) {
+                tied[((rng.unif() * tied.len() as f64) as usize).min(tied.len() - 1)]
+            } else {
+                *tied.iter().min_by(|&&a, &&b| pend[a].1.cmp(&pend[b].1).then(a.cmp(&b))).unwrap()
+            };
             let (_, e, vals) = pend.remove(i);
             let ev = &self.events[e];
             tmp.clear();
             if ev.uvftt { tmp.extend(vals) } else { tmp.extend(ev.asg.iter().map(|&(_, r)| ra[r as usize])) }
+            let vold: Vec<f64> = ev.rescale.iter().map(|&(_, r)| ra[r as usize]).collect(); // ponytail: allocates per event
             let mut par = false;
-            for (&(tg, _), &x) in ev.asg.iter().zip(tmp.iter()) {
+            for ((&(tg, _), &x), dv) in ev.asg.iter().zip(tmp.iter()).zip(&ev.div) {
+                let x = dv.map_or(x, |r| x / ra[r as usize]);
                 let tg = tg as usize;
                 if tg < nx { s[tg] = x } else { rr[tg] = x; rf[tg] = x; ra[tg] = x; par = true }
             }
             if par { self.rates.prep(rr); self.full.prep(rf); self.aux.prep(ra); }
+            if !ev.rescale.is_empty() {
+                self.aux_at(hist, ra, s, t);
+                for (&(i, r), &v0) in ev.rescale.iter().zip(&vold) { s[i as usize] *= v0 / ra[r as usize]; }
+            }
             fired = true;
         }
         None
@@ -1117,18 +1286,18 @@ impl Model {
 
     /// Write the requested output registers at (w.s, t) into row.
     pub fn record(&self, w: &mut Work, t: f64, outs: &[u32], row: &mut [f64]) {
-        self.record_y(&mut w.ra, &w.s, t, outs, row);
+        self.record_y(&w.hist, &mut w.ra, &w.s, t, outs, row);
     }
 
-    fn record_y(&self, ra: &mut [f64], y: &[f64], t: f64, outs: &[u32], row: &mut [f64]) {
+    fn record_y(&self, hs: &Hist, ra: &mut [f64], y: &[f64], t: f64, outs: &[u32], row: &mut [f64]) {
         let (nx, tr) = (self.nx, self.nx + self.pnames.len()); // time register; params sit in between
-        if outs.iter().all(|&r| (r as usize) <= tr) { // states, parameters, time: no tape run
+        if self.dly.is_empty() && outs.iter().all(|&r| (r as usize) <= tr) { // states, parameters, time: no tape run
             for (o, &r) in row.iter_mut().zip(outs) {
                 let r = r as usize;
                 *o = if r < nx { y[r] } else if r == tr { t } else { ra[r] };
             }
         } else {
-            self.aux_at(ra, y, t);
+            self.aux_at(hs, ra, y, t);
             for (o, &r) in row.iter_mut().zip(outs) { *o = ra[r as usize]; }
         }
     }
@@ -1207,18 +1376,23 @@ impl Model {
     /// `simulate` keeping the event state (trigger values, pending delayed events) in `w`, as a
     /// roadrunner simulate call that continues from the previous one.
     pub fn simulate_cont(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
+        if self.alg.contains(&true) { return self.simulate_dae(w, times, rtol, atol, outs, out); }
         let (no, nt) = (outs.len(), times.len());
         let ev = self.has_events();
         let tend = times[nt - 1];
         let mut t = times[0];
         let mut bdf = rtol < BDF_BELOW_RTOL; // BDF wins at tight tolerances, Rodas4 at loose ones
+        let dl = !self.dly.is_empty(); // delay(): one-step Rodas4, steps no longer than the shortest delay
+        if dl { bdf = false; }
         w.bdf.order = 0;
         if ev && self.events_at(w, t).is_none() { return false; }
+        if dl && w.hist.t.last().is_none_or(|&x| x < t) { self.hist_push(w, t); }
         let (mut h, mut q) = (0.0, 0);
         for _ in 0..MAX_STEPS * 10 {
             while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; }
             if q == nt { return true; }
             let t1 = w.pend.iter().fold(tend, |m, p| m.min(p.0));
+            if dl { let cap = self.delay_cap(w, t); if h > cap { h = cap; } }
             let mut step = if bdf { self.bdf_step(w, t, t1, rtol, atol) } else { self.step(w, t, t1, &mut h, rtol, atol) };
             if step.is_none() && bdf { // BDF gave up (e.g. loose atol on a near-singular system): Rodas4 from here
                 bdf = false;
@@ -1228,15 +1402,15 @@ impl Model {
             let Some(tn) = step else { return false };
             let mut te = tn;
             if ev {
-                let Work { ra, s, prev, .. } = w;
-                if self.changed(ra, prev, s, tn) { te = self.locate(w, t, tn, bdf); }
+                let Work { ra, s, prev, prevc, hist, .. } = w;
+                if self.changed(hist, ra, prev, prevc, s, tn) { te = self.locate(w, t, tn, bdf); }
             }
             if q < nt && times[q] < te { // interior output points from the dense output
                 if !bdf { self.dense_coef(w); }
                 while q < nt && times[q] < te {
                     if bdf { self.bdf_interp(w, times[q]) } else { self.interp(w, (times[q] - t) / (tn - t)) }
-                    let Work { ra, yn, .. } = w;
-                    self.record_y(ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                    let Work { ra, yn, hist, .. } = w;
+                    self.record_y(hist, ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
                     q += 1;
                 }
             }
@@ -1249,11 +1423,57 @@ impl Model {
                 if !self.integrate(w, t, te, &mut h2, rtol, atol) { return false; }
             }
             t = te;
+            self.hist_push(w, t);
             if ev {
                 match self.events_at(w, t) { None => return false, Some(fired) => if fired || te < tn { w.bdf.order = 0 } }
+                if dl { self.hist_push(w, t); } // the state after the events, at the same time
             }
         }
         false
+    }
+
+    /// Time course of a DAE model (algebraic states: M = diag(1 | 0)) with diffsol's BDF, from a
+    /// consistent initial state (diffsol solves the algebraic part first). Events and delay() are
+    /// not supported here (returns false).
+    fn simulate_dae(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
+        use diffsol::{DenseMatrix, NalgebraLU, NalgebraMat, OdeBuilder, OdeSolverMethod};
+        if self.has_events() || !self.dly.is_empty() { return false; }
+        let nx = self.nx;
+        let (rr, rf) = (RefCell::new(w.rr.clone()), RefCell::new(w.rf.clone()));
+        let (v, ev) = (RefCell::new(vec![0.0; self.nv]), RefCell::new(vec![0.0; self.jac.len() + self.dt.len()]));
+        let hs = Hist::default(); // no delay() on this path
+        let y0 = w.s.clone();
+        let atols: Vec<f64> = (0..nx).map(|i| atol * w.atol_scale[i]).collect();
+        let rhs = |x: &[f64], _p: &[f64], t: f64, y: &mut [f64]| {
+            let mut v = v.borrow_mut();
+            self.rates_at(&hs, &mut rr.borrow_mut(), &mut v, x, t);
+            self.rhs(&v, y);
+        };
+        let jac = |x: &[f64], _p: &[f64], t: f64, u: &[f64], y: &mut [f64]| {
+            let (mut v, mut ev) = (v.borrow_mut(), ev.borrow_mut());
+            self.full_at(&hs, &mut rf.borrow_mut(), &mut v, &mut ev, x, t);
+            y.fill(0.0);
+            for &(d, e, c) in &self.jfull {
+                let (i, k) = (d as usize / nx, d as usize % nx);
+                y[i] += c * ev[e as usize] * u[k];
+            }
+        };
+        let mass = |u: &[f64], _p: &[f64], _t: f64, beta: f64, y: &mut [f64]| {
+            for i in 0..nx { y[i] = if self.alg[i] { 0.0 } else { u[i] } + beta * y[i]; }
+        };
+        let init = |_p: &[f64], _t: f64, y: &mut [f64]| y.copy_from_slice(&y0);
+        let Ok(problem) = OdeBuilder::<NalgebraMat<f64>>::new().t0(times[0]).rtol(rtol).atol(atols)
+            .rhs_implicit(rhs, jac).mass(mass).init(init, nx).build() else { return false };
+        let Ok(mut solver) = problem.bdf::<NalgebraLU<f64>>() else { return false };
+        let Ok((ys, _)) = solver.solve_dense(times) else { return false };
+        let no = outs.len();
+        let mut s = vec![0.0; nx];
+        for (q, &tq) in times.iter().enumerate() {
+            for (i, x) in s.iter_mut().enumerate() { *x = ys.get_index(i, q); }
+            self.record_y(&w.hist, &mut w.ra, &s, tq, outs, &mut out[q * no..(q + 1) * no]);
+        }
+        w.s.copy_from_slice(&s);
+        true
     }
 
     /// Gillespie direct method from the loaded state (concentrations; amounts = conc * volume,
@@ -1298,14 +1518,29 @@ impl Model {
         if self.has_events() && self.events_at(w, t).is_none() { return false; }
         resync(w);
         loop {
-            let Work { rr, v, s, .. } = w;
-            self.rates_at(rr, v, s, t);
+            let Work { rr, v, s, hist, .. } = w;
+            self.rates_at(hist, rr, v, s, t);
             let a0: f64 = v[..nr].iter().map(|&a| a.max(0.0)).sum();
             if !a0.is_finite() { return false; }
             let tn = if a0 > 0.0 { t - rng.unif().ln() / a0 } else { f64::INFINITY };
-            let te = w.pend.iter().fold(f64::INFINITY, |m, p| m.min(p.0));
+            let mut te = w.pend.iter().fold(f64::INFINITY, |m, p| m.min(p.0));
+            if self.has_events() { // a trigger that turns with time alone while the state waits (t >= 25)
+                let tb = tn.min(te).min(t + 1e6 * (1.0 + t.abs()));
+                let Work { ra, s, prev, prevc, hist, .. } = w;
+                if tb > t && self.changed(hist, ra, prev, prevc, s, tb) {
+                    let (mut lo, mut hi) = (t, tb);
+                    while hi - lo > 1e-12 * hi.abs().max(1.0) {
+                        let mid = 0.5 * (lo + hi);
+                        if self.changed(hist, ra, prev, prevc, s, mid) { hi = mid } else { lo = mid }
+                    }
+                    // a trigger like t >= 25 holds exactly at 25: prefer the round time if it already flips
+                    let r = { let sc = 10f64.powi(12 - hi.abs().max(1e-300).log10().ceil() as i32); (hi * sc).round() / sc };
+                    if r > t && r < hi && self.changed(hist, ra, prev, prevc, s, r) { hi = r; }
+                    te = te.min(hi);
+                }
+            }
             if at(w, t, tn.min(te)) { return true; }
-            if te <= tn {
+            if te <= tn { // an event time: no reaction fires; the next waiting time is drawn afresh (memoryless)
                 t = te;
             } else {
                 t = tn;
@@ -1413,6 +1648,23 @@ mod tests {
     }
 
     #[test]
+    fn dae_nonlinear_algebraic_state() {
+        // S' = -k S (S(0) = 10); algebraic p: p^3 + p - S = 0, started inconsistent at p = 0
+        let m = decay(Rules { rate: vec![("p".into(), "p^3 + p - S".into())], algebraic: vec!["p".into()], ..Default::default() });
+        let mut w = m.work();
+        m.load(&mut w, &[], &[]);
+        let times = [0.0, 0.5, 1.0, 2.0];
+        let outs = m.output_regs(&["S".into(), "p".into()]).unwrap();
+        let mut out = vec![0.0; times.len() * 2];
+        assert!(m.simulate(&mut w, &times, 1e-8, 1e-10, &outs, &mut out));
+        for (q, &t) in times.iter().enumerate() {
+            let (sv, p) = (out[2 * q], out[2 * q + 1]);
+            assert!((sv - 10.0 * (-t as f64).exp()).abs() < 1e-5, "S({t}) = {sv}");
+            assert!((p * p * p + p - sv).abs() < 1e-5, "p({t}) = {p} not on p^3 + p = {sv}");
+        }
+    }
+
+    #[test]
     fn dense_output() {
         let m = decay(Rules::default());
         let mut w = m.work();
@@ -1432,7 +1684,7 @@ mod tests {
     fn events_and_rate_rules() {
         let ev = |trig: &str, asg: &[(&str, &str)]| EventDef { trigger: trig.into(), delay: None, priority: None,
             assign: asg.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
-            initial_value: true, persistent: true, use_trigger_values: true };
+            initial_value: true, persistent: true, use_trigger_values: true, div: vec![], rescale: vec![] };
         // S < 5 -> S = 10, and p counts firings; p' rate rule-free parameter
         let m = decay(Rules { events: vec![ev("S < 5", &[("S", "10"), ("p", "p + 1")])], ..Default::default() });
         let mut w = m.work();

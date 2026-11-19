@@ -1,0 +1,2 @@
+# N2 / SPEC 5.4: DNA strand syntax is out of scope and must be named, not reported as a stray operator.
+dcDNANotSupported 2

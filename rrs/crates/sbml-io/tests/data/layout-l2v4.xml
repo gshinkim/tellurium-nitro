@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbml xmlns="http://www.sbml.org/sbml/level2/version4" level="2" version="4">
+  <model id="glycolysis_fragment">
+    <annotation>
+      <layout:listOfLayouts xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:layout="http://projects.eml.org/bcb/sbml/level2">
+        <layout:layout layout:id="layout1">
+          <layout:dimensions layout:width="400" layout:height="300"/>
+          <layout:listOfCompartmentGlyphs>
+            <layout:compartmentGlyph layout:id="cg_cell" layout:compartment="cell">
+              <layout:boundingBox layout:id="bb_cell">
+                <layout:position layout:x="5" layout:y="5"/>
+                <layout:dimensions layout:width="390" layout:height="290"/>
+              </layout:boundingBox>
+            </layout:compartmentGlyph>
+          </layout:listOfCompartmentGlyphs>
+          <layout:listOfSpeciesGlyphs>
+            <layout:speciesGlyph layout:id="sg_Glc" layout:species="Glc">
+              <layout:boundingBox layout:id="bb_Glc">
+                <layout:position layout:x="20" layout:y="20"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:speciesGlyph>
+            <layout:speciesGlyph layout:id="sg_G6P" layout:species="G6P">
+              <layout:boundingBox layout:id="bb_G6P">
+                <layout:position layout:x="300" layout:y="20"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:speciesGlyph>
+            <layout:speciesGlyph layout:id="sg_ATP" layout:species="ATP">
+              <layout:boundingBox layout:id="bb_ATP">
+                <layout:position layout:x="20" layout:y="200"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:speciesGlyph>
+            <layout:speciesGlyph layout:id="sg_ADP" layout:species="ADP">
+              <layout:boundingBox layout:id="bb_ADP">
+                <layout:position layout:x="300" layout:y="200"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:speciesGlyph>
+            <layout:speciesGlyph layout:id="sg_HK" layout:species="HK">
+              <layout:boundingBox layout:id="bb_HK">
+                <layout:position layout:x="160" layout:y="120"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:speciesGlyph>
+          </layout:listOfSpeciesGlyphs>
+          <layout:listOfReactionGlyphs>
+            <layout:reactionGlyph layout:id="rg_J0" layout:reaction="J0">
+              <layout:curve>
+                <layout:listOfCurveSegments>
+                  <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="LineSegment">
+                    <layout:start layout:x="180" layout:y="100"/>
+                    <layout:end layout:x="200" layout:y="100"/>
+                  </layout:curveSegment>
+                </layout:listOfCurveSegments>
+              </layout:curve>
+              <layout:listOfSpeciesReferenceGlyphs>
+                <layout:speciesReferenceGlyph layout:id="srg_Glc" layout:speciesReference="sr_glc" layout:speciesGlyph="sg_Glc" layout:role="substrate">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CubicBezier">
+                        <layout:start layout:x="190" layout:y="100"/>
+                        <layout:end layout:x="50" layout:y="35"/>
+                        <layout:basePoint1 layout:x="190" layout:y="60.5"/>
+                        <layout:basePoint2 layout:x="50" layout:y="60.25"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:speciesReferenceGlyph>
+                <layout:speciesReferenceGlyph layout:id="srg_ATP" layout:speciesReference="sr_atp" layout:speciesGlyph="sg_ATP" layout:role="sidesubstrate">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="LineSegment">
+                        <layout:start layout:x="190" layout:y="100"/>
+                        <layout:end layout:x="50" layout:y="215"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:speciesReferenceGlyph>
+                <layout:speciesReferenceGlyph layout:id="srg_G6P" layout:speciesReference="sr_g6p" layout:speciesGlyph="sg_G6P" layout:role="product">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CubicBezier">
+                        <layout:start layout:x="190" layout:y="100"/>
+                        <layout:end layout:x="330" layout:y="35"/>
+                        <layout:basePoint1 layout:x="190" layout:y="60.5"/>
+                        <layout:basePoint2 layout:x="330" layout:y="60.25"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:speciesReferenceGlyph>
+                <layout:speciesReferenceGlyph layout:id="srg_ADP" layout:speciesReference="sr_adp" layout:speciesGlyph="sg_ADP" layout:role="sideproduct">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="LineSegment">
+                        <layout:start layout:x="190" layout:y="100"/>
+                        <layout:end layout:x="330" layout:y="215"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:speciesReferenceGlyph>
+                <layout:speciesReferenceGlyph layout:id="srg_HK" layout:speciesReference="sr_hk" layout:speciesGlyph="sg_HK" layout:role="activator">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="LineSegment">
+                        <layout:start layout:x="190" layout:y="100"/>
+                        <layout:end layout:x="190" layout:y="135"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:speciesReferenceGlyph>
+              </layout:listOfSpeciesReferenceGlyphs>
+            </layout:reactionGlyph>
+          </layout:listOfReactionGlyphs>
+          <layout:listOfTextGlyphs>
+            <layout:textGlyph layout:id="tg_Glc" layout:originOfText="Glc" layout:graphicalObject="sg_Glc">
+              <layout:boundingBox layout:id="bbt_Glc">
+                <layout:position layout:x="20" layout:y="20"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:textGlyph>
+            <layout:textGlyph layout:id="tg_G6P" layout:originOfText="G6P" layout:graphicalObject="sg_G6P">
+              <layout:boundingBox layout:id="bbt_G6P">
+                <layout:position layout:x="300" layout:y="20"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:textGlyph>
+            <layout:textGlyph layout:id="tg_ATP" layout:originOfText="ATP" layout:graphicalObject="sg_ATP">
+              <layout:boundingBox layout:id="bbt_ATP">
+                <layout:position layout:x="20" layout:y="200"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:textGlyph>
+            <layout:textGlyph layout:id="tg_ADP" layout:originOfText="ADP" layout:graphicalObject="sg_ADP">
+              <layout:boundingBox layout:id="bbt_ADP">
+                <layout:position layout:x="300" layout:y="200"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:textGlyph>
+            <layout:textGlyph layout:id="tg_HK" layout:originOfText="HK" layout:graphicalObject="sg_HK">
+              <layout:boundingBox layout:id="bbt_HK">
+                <layout:position layout:x="160" layout:y="120"/>
+                <layout:dimensions layout:width="60" layout:height="30"/>
+              </layout:boundingBox>
+            </layout:textGlyph>
+          </layout:listOfTextGlyphs>
+          <layout:listOfAdditionalGraphicalObjects>
+            <layout:graphicalObject layout:id="legend">
+              <layout:boundingBox layout:id="bb_legend">
+                <layout:position layout:x="10" layout:y="260"/>
+                <layout:dimensions layout:width="80" layout:height="20"/>
+              </layout:boundingBox>
+            </layout:graphicalObject>
+            <layout:generalGlyph layout:id="gg_k1" layout:reference="k1">
+              <layout:boundingBox layout:id="bb_k1">
+                <layout:position layout:x="160" layout:y="60"/>
+                <layout:dimensions layout:width="40" layout:height="20"/>
+              </layout:boundingBox>
+              <layout:listOfReferenceGlyphs>
+                <layout:referenceGlyph layout:id="ref_k1" layout:glyph="rg_J0" layout:role="parameter">
+                  <layout:curve>
+                    <layout:listOfCurveSegments>
+                      <layout:curveSegment xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="LineSegment">
+                        <layout:start layout:x="180" layout:y="70"/>
+                        <layout:end layout:x="190" layout:y="100"/>
+                      </layout:curveSegment>
+                    </layout:listOfCurveSegments>
+                  </layout:curve>
+                </layout:referenceGlyph>
+              </layout:listOfReferenceGlyphs>
+              <layout:listOfSubGlyphs>
+                <layout:textGlyph layout:id="tg_k1" layout:text="k1">
+                  <layout:boundingBox layout:id="bb_tg_k1">
+                    <layout:position layout:x="160" layout:y="60"/>
+                    <layout:dimensions layout:width="40" layout:height="20"/>
+                  </layout:boundingBox>
+                </layout:textGlyph>
+              </layout:listOfSubGlyphs>
+            </layout:generalGlyph>
+          </layout:listOfAdditionalGraphicalObjects>
+        </layout:layout>
+      </layout:listOfLayouts>
+    </annotation>
+    <listOfCompartments>
+      <compartment id="cell" spatialDimensions="3" size="1" constant="true"/>
+    </listOfCompartments>
+    <listOfSpecies>
+      <species id="Glc" compartment="cell" initialConcentration="10" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="G6P" compartment="cell" initialConcentration="0" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="ATP" compartment="cell" initialConcentration="5" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="ADP" compartment="cell" initialConcentration="0" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+      <species id="HK" compartment="cell" initialConcentration="1" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+    </listOfSpecies>
+    <listOfParameters>
+      <parameter id="k1" value="0.1" constant="true"/>
+    </listOfParameters>
+    <listOfReactions>
+      <reaction id="J0" reversible="false" fast="false">
+        <listOfReactants>
+          <speciesReference id="sr_glc" species="Glc" stoichiometry="1"/>
+          <speciesReference id="sr_atp" species="ATP" stoichiometry="1"/>
+        </listOfReactants>
+        <listOfProducts>
+          <speciesReference id="sr_g6p" species="G6P" stoichiometry="1"/>
+          <speciesReference id="sr_adp" species="ADP" stoichiometry="1"/>
+        </listOfProducts>
+        <listOfModifiers>
+          <modifierSpeciesReference id="sr_hk" species="HK"/>
+        </listOfModifiers>
+        <kineticLaw>
+          <math xmlns="http://www.w3.org/1998/Math/MathML">
+            <apply>
+              <times/>
+              <ci> k1 </ci>
+              <ci> HK </ci>
+              <ci> Glc </ci>
+              <ci> ATP </ci>
+            </apply>
+          </math>
+        </kineticLaw>
+      </reaction>
+    </listOfReactions>
+  </model>
+</sbml>

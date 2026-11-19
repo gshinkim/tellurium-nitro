@@ -592,12 +592,21 @@ def antimonyToSBML(ant):
     :return: SBML
     :rtype: str
     """
-    antimony.clearPreviousLoads()
-    antimony.freeAll()
     try:
         isfile = os.path.isfile(ant)
     except ValueError:
         isfile = False
+    if _rust_antimony:
+        from roadrunner_rs import antimony_to_sbml
+        try:
+            if isfile:
+                with open(ant, encoding='utf-8') as f:
+                    return antimony_to_sbml(f.read())
+            return antimony_to_sbml(ant)
+        except ValueError:
+            pass  # libantimony below: it reads what the Rust parser rejects, or raises its own error
+    antimony.clearPreviousLoads()
+    antimony.freeAll()
     if isfile:
         code = antimony.loadAntimonyFile(ant)
     else:
@@ -605,6 +614,42 @@ def antimonyToSBML(ant):
     _checkAntimonyReturnCode(code)
     mid = antimony.getMainModuleName()
     return antimony.getSBMLString(mid)
+
+
+try:
+    from roadrunner_rs import antimony_to_sbml as _  # noqa: F401
+    _has_rust_antimony = True
+except ImportError:
+    _has_rust_antimony = False
+_rust_antimony = _has_rust_antimony
+_rust_sbml = False
+
+
+# exported as te.antimony (here it would shadow the antimony module)
+def useRustAntimony(enable=None):
+    """Use the Rust Antimony reader (antimony-rs) in antimonyToSBML / loada.
+
+    :param enable: True/False to switch globally; None only queries.
+    :returns: whether it is on. On by default when roadrunner_rs has it; False uses libantimony.
+        Antimony the Rust reader rejects always goes to libantimony.
+    """
+    global _rust_antimony
+    if enable is not None:
+        if enable and not _has_rust_antimony:
+            warnings.warn("te.antimony: roadrunner_rs without antimony_to_sbml; using libantimony.")
+        _rust_antimony = bool(enable) and _has_rust_antimony
+    return _rust_antimony
+
+
+def useRustSBML(enable=None):
+    """Switch for a Rust SBML reader (sbml-io). Not wired in yet: SBML is always read with libsbml.
+
+    :param enable: True/False to switch globally; None only queries.
+    :returns: False (until the Rust SBML loader exists).
+    """
+    if enable:
+        warnings.warn("te.SBML: the Rust SBML reader is not wired in yet; using libsbml.")
+    return _rust_sbml
 
 
 
