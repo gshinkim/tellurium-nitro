@@ -29,7 +29,7 @@ Full report, runners and per-case results: [`benchmarks/sts/`](benchmarks/sts/re
 reactions inside cells change over time. The part that does the actual math is called **roadrunner**.
 
 **Tellurium Nitro is the same tool with a much faster math engine.** We rewrote roadrunner's math in a faster
-language (Rust). Your results stay the same; you just get them sooner. Simple simulations run about 2-5 times faster,
+language (Rust). Your results stay the same; you just get them sooner. Simple simulations run about 2-8 times faster,
 and heavy analyses (steady states, control coefficients, sensitivities) can run hundreds to thousands of times faster.
 The benchmark tables below show the exact numbers.
 
@@ -133,6 +133,18 @@ roadrunner. Before that change the same task took 13.4 s, and roadrunner's load 
 
 \* There is no high-precision reference for `sens`, because roadrunner sensitivities at tight tolerance take
 more than 15 minutes. That row shows agreement with regular tellurium instead.
+
+**Big model (1000 species, 3400 reactions, 5952 parameters).** A synthetic kinetics model in Antimony, loaded with
+`te.loada` and run with `r.simulate(0, 100, 1000)`. Nitro was run in its default mode, and regular tellurium with
+`te.turbo(False)`. The machine was an Apple M5 Pro.
+
+| Task | Regular tellurium | Tellurium Nitro | Speedup |
+|---|---:|---:|---:|
+| load (`te.loada`) | 30.9 s | 1.03 s | **30x** |
+| first `simulate` | 284 ms | 42 ms | **6.8x** |
+| `reset()` + `simulate` again | 282 ms | 37 ms | **7.6x** |
+
+The largest difference from regular tellurium at any point is 2.9e-5.
 
 ### Why is Nitro 2x faster in one table and thousands of times faster in the other?
 
