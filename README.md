@@ -11,6 +11,7 @@ analyses (steady states, control coefficients, sensitivities) run hundreds to th
 - [How much faster is it?](#how-much-faster-is-it)
 - [How do we know the answers are right?](#how-do-we-know-the-answers-are-right)
 - [For experts: how it works](#for-experts-how-it-works)
+- [Every command, and what it does](#every-command-and-what-it-does)
 
 ## The story
 
@@ -818,3 +819,318 @@ For general questions, requesting help, or reporting bugs, feel free to use the 
 The source code for the Tellurium Python package is hosted at https://github.com/sys-bio/tellurium and is licensed under the [Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0). Tellurium uses third-party dependencies which may be licensed under different terms. Consult the documentation for the respective third-party packages for more details.
 
 TELLURIUM AND ALL SOFTWARE BUNDLED WITH TELLURIUM (HEREAFTER "THE SOFTWARE") IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+---
+
+## Every command, and what it does
+
+Everything you can call in Tellurium Nitro. `te` is `import tellurium as te`. `r` is a model you loaded, for
+example `r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')`.
+
+⚡ = runs on Nitro's fast Rust engine. Everything else works exactly as in regular tellurium.
+**New** = only in Nitro (or Tellurium Turbo), not in regular tellurium.
+
+### `te.` — loading models
+
+| Command | What it does |
+|---|---|
+| `te.loada(text)` | Load a model written in Antimony (the easy text format) and return `r`. Same as `te.loadAntimonyModel`. |
+| `te.loadAntimonyModel(text)` | Same as `te.loada`. |
+| `te.loadSBMLModel(sbml)` | Load a model from an SBML file path or SBML text and return `r`. Same as `te.loads`. |
+| `te.loads(sbml)` | Same as `te.loadSBMLModel`. |
+| `te.loadCellMLModel(cellml)` | Load a CellML model and return `r`. |
+| `te.loadTestModel(name)` | Load one of roadrunner's built-in test models. |
+| `te.getTestModel(name)` | Get a built-in test model as SBML text. |
+| `te.listTestModels()` | List the built-in test models. |
+| `te.model(name)` | Get back a model you loaded earlier, by its model name. |
+
+### `te.` — converting between formats
+
+| Command | What it does |
+|---|---|
+| `te.antimonyToSBML(text)` | Antimony text → SBML text. |
+| `te.sbmlToAntimony(sbml)` | SBML text or file → Antimony text. |
+| `te.antimonyToCellML(text)` | Antimony → CellML. |
+| `te.sbmlToCellML(sbml)` | SBML → CellML. |
+| `te.cellmlToAntimony(cellml)` | CellML → Antimony. |
+| `te.cellmlToSBML(cellml)` | CellML → SBML. |
+| `te.antimonyConverter()` | Converter object used by the notebook front end. |
+| `te.getODEsFromModel(r)` | Print the model's equations (how each chemical changes) as text. |
+| `te.getODEsFromSBMLFile(path)` | Same, from an SBML file. |
+| `te.getODEsFromSBMLString(sbml)` | Same, from SBML text. |
+
+### `te.` — Nitro switches (**new**)
+
+| Command | What it does |
+|---|---|
+| `te.turbo()` | Is the fast engine on? Returns `True` or `False`. |
+| `te.turbo(True)` / `te.turbo(False)` | Turn the fast engine on, or go back to the original roadrunner. |
+| `te.turbo('strict')` | Fast engine only: anything it can't do raises `NotSupportedByRust` instead of using roadrunner. |
+| `te.antimony()` / `te.antimony(False)` | Read Antimony with Nitro's Rust reader (default, ~4x faster) or with the original libantimony. |
+| `te.SBML(...)` | Reserved switch for a Rust SBML reader. SBML is always read with libsbml for now. |
+| `te.gpu(True)` / `te.gpu(False)` | Use the GPU (NVIDIA or Apple) for the matrix math in `te.controlCoefficients`. |
+| `te.getGPU()` | Which device `te.controlCoefficients` uses: `"cuda"`, `"mps"` or `"cpu"`. |
+
+Environment variable `TELLURIUM_ENGINE=roadrunner` starts with the fast engine off; `TELLURIUM_ENGINE=strict` starts
+in strict mode.
+
+### `te.` — analysis
+
+| Command | What it does |
+|---|---|
+| `te.controlCoefficients(r, samples)` ⚡ **new** | Control coefficients and elasticities for many parameter sets in one call, on all cores (and the GPU if on). Returns a dict with `fcc`, `ccc`, `elasticities`, `ufcc`, `uccc`, `species`, `reactions`, `ok`. |
+| `te.fba(model)` **new** | Flux balance analysis: the best steady-state fluxes of an SBML `fbc` model (file path or text). Returns a dict of flux values and the objective. |
+| `te.ParameterScan(r, ...)` | Run a time course for a range of values of one parameter and plot them. |
+| `te.ParameterScan2D(r, ...)` | Same, for two parameters at once. |
+| `te.SteadyStateScan(r, ...)` | Steady state for a range of values of one parameter. |
+| `te.plotBifurcation(r, parameter, lower, upper)` | Draw a bifurcation diagram (how steady states change, split or vanish as a parameter changes). |
+| `te.SensitivityAnalysis(...)` | Set up a sensitivity analysis to run with `te.distributed_sensitivity_analysis`. |
+| `te.StochasticSimulationModel(...)` | Set up many random (Gillespie) runs for `te.distributed_stochastic_simulation`. |
+| `te.ParameterEstimation(...)` | Fit parameters to data with a stochastic model. |
+| `te.UncertaintySingleP(...)` | How much one parameter's uncertainty changes the output, with a confidence band plot. |
+| `te.UncertaintyAllP(...)` | Same, for all parameters together. |
+| `te.distributed_parameter_scanning(sc, ...)` | Parameter scan on a Spark cluster (`sc` = SparkContext). |
+| `te.distributed_stochastic_simulation(sc, ...)` | Many stochastic runs on a Spark cluster. |
+| `te.distributed_sensitivity_analysis(sc, ...)` | Sensitivity analysis on a Spark cluster. |
+| `te.plot_distributed_stochastic(data)` / `te.plot_stochastic_result(result)` | Plot the results of those runs. |
+| `te.sample_plot(result)` | Quick plot of a distributed result. |
+| `te.getEigenvalues(matrix)` | Eigenvalues of a matrix. |
+| `te.rank(A)` / `te.nullspace(A)` / `te.rref(A)` | Rank, null space and reduced row echelon form of a matrix. |
+
+### `te.` — plotting
+
+| Command | What it does |
+|---|---|
+| `te.plot(x, y)` | Make a line/scatter plot. |
+| `te.show()` | Show the current figure. |
+| `te.plotArray(result)` | Plot a result array, one line per column. |
+| `te.plotWithLegend(r, result)` | Plot a result with a legend from `r`'s names. |
+| `te.plotImage(img)` | Show an image. |
+| `te.nextFigure()` | Start a new figure. |
+| `te.tiledFigure()` / `te.newTiledFigure(...)` | Start a grid of small plots. |
+| `te.newLowerTriFigure(...)` | Start a lower-triangle grid of plots. |
+| `te.clearTiledFigure()` | Clear the grid. |
+| `te.getPlottingEngine()` | Get the plotting engine (`matplotlib` or `plotly`). |
+| `te.getDefaultPlottingEngine()` / `te.setDefaultPlottingEngine(name)` | Get or set the default plotting engine. |
+| `te.disablePlotting()` | Turn all plotting off (useful on servers). |
+| `te.setSavePlotsToPDF(True)` | Save plots to PDF as well. |
+| `te.SBMLDiagram(sbml)` | Draw the reaction network as a diagram (needs graphviz). |
+| `te.LatexExport(r, ...)` | Export a simulation plot as LaTeX. |
+
+### `te.` — SED-ML, COMBINE archives and OMEX (sharing simulations)
+
+| Command | What it does |
+|---|---|
+| `te.executeSEDML(file)` | Run the simulations described in a SED-ML file or `.omex` archive. |
+| `te.sedmlToPython(file)` | Turn a SED-ML file into the equivalent Python script. |
+| `te.executeCombineArchive(path)` | Run every SED-ML simulation in a COMBINE archive (`.omex`). |
+| `te.convertCombineArchive(path)` | Read an archive and convert its contents to inline OMEX text. |
+| `te.convertAndExecuteCombineArchive(path)` | Read an archive, convert it and run it. |
+| `te.createCombineArchive(path, files, ...)` | Make a new archive from files. |
+| `te.addFileToCombineArchive(...)` / `te.addFilesToCombineArchive(...)` | Add files to an archive (saved as a new archive). |
+| `te.extractFileFromCombineArchive(path, entry)` | Get one file out of an archive as text. |
+| `te.inlineOmex(...)` | Combine Antimony and phraSED-ML text into inline OMEX. |
+| `te.executeInlineOmex(text)` | Run inline OMEX (Antimony model + phraSED-ML simulation). |
+| `te.executeInlineOmexFromFile(path)` | Same, from a file. |
+| `te.exportInlineOmex(text, path)` | Save inline OMEX as an archive file. |
+| `te.getLastReport()` / `te.setLastReport(report)` | Get or set the last report a SED-ML run produced. |
+
+### `te.` — files, versions and other helpers
+
+| Command | What it does |
+|---|---|
+| `te.saveToFile(path, text)` / `te.readFromFile(path)` | Write or read a text file. |
+| `te.listFiles(pattern)` | List files matching a pattern, such as `'*.xml'`. |
+| `te.runTool(name)` | Run an external program. |
+| `te.getVersionInfo()` / `te.printVersionInfo()` | Versions of tellurium and every library it uses. |
+| `te.getTelluriumVersion()` / `te.__version__` | Tellurium's version number. |
+| `te.noticesOff()` / `te.noticesOn()` | Hide or show tellurium's notices. |
+| `te.getSupportedTestCases(begin, end)` | Which SBML test cases tellurium supports. |
+| `te.getAppDir()` / `te.DumpJSONInfo()` | Internal helpers for the app folder and archive metadata. |
+
+### `r.` — simulating
+
+| Command | What it does |
+|---|---|
+| `r.simulate(start, end, points)` ⚡ | Run the model forward in time and return a table (time + each chemical). |
+| `r.simulateBatch({'k1': [...]}, start, end, points)` ⚡ **new** | Many simulations at once on all cores, one per set of values. Returns an array of shape (runs, points, columns). |
+| `r.gillespie(start, end, points)` ⚡ | Random (stochastic) simulation that counts individual molecules. |
+| `r.oneStep(time, step)` ⚡ | Move the model forward by one step. |
+| `r.internalOneStep(...)` | One internal solver step. |
+| `r.plot()` | Plot the last simulation. |
+| `r.show()` | Show the plot. |
+| `r.lastRun` **new** | What the last call did: which engine ran it (`'rust'` or `'roadrunner'`), and if roadrunner, why. |
+| `r.timeCourseSelections = [...]` | Choose which columns `simulate` returns, for example `['time', 'S1', '[S2]']`. |
+| `r.integrator.relative_tolerance = 1e-8` | Set accuracy (also `absolute_tolerance`, `maximum_num_steps`, `variable_step_size`, ...). |
+| `r.setIntegrator('gillespie')` / `r.getIntegrator()` | Choose the time-stepping method (`cvode`, `gillespie`, `rk4`, `rk45`, `euler`). |
+| `r.setIntegratorSetting(name, key, value)` | Change one setting of an integrator. |
+| `r.getIntegratorByName(name)` / `r.makeIntegrator(name)` / `r.integratorExists(name)` | Look up or make integrators. |
+| `r.getAvailableIntegrators()` / `r.getExistingIntegratorNames()` / `r.getRegisteredIntegratorNames()` | List integrators. |
+| `r.setSeed(n)` / `r.getSeed()` / `r.resetSeed()` | Set, read or reset the random seed for stochastic runs. |
+| `r.getSimulationData()` | The last simulation's results. |
+
+### `r.` — steady state
+
+| Command | What it does |
+|---|---|
+| `r.steadyState()` ⚡ | Find where the model settles (nothing changes any more); returns how close it got. |
+| `r.steadyStateNamedArray()` ⚡ | Steady state values with names. |
+| `r.getSteadyStateValues()` / `r.getSteadyStateValuesNamedArray()` ⚡ | Solve the steady state and return the selected values. |
+| `r.mcaSteadyState()` ⚡ | Steady state prepared for control analysis. |
+| `r.steadyStateSelections = [...]` / `r.getSteadyStateSelectionStrings()` | Choose or list what steady-state calls return. |
+| `r.setSteadyStateSolver(name)` / `r.getSteadyStateSolver()` / `r.getSteadyStateSolverByName(name)` / `r.makeSteadyStateSolver(name)` / `r.steadyStateSolverExists(name)` | Choose or look up the steady-state solver. |
+| `r.getExistingSteadyStateSolverNames()` / `r.getRegisteredSteadyStateSolverNames()` | List steady-state solvers. |
+| `r.getSteadyStateThreshold()` / `r.setSteadyStateThreshold(x)` | How close to "no change" counts as steady. |
+
+### `r.` — control analysis (MCA): which reaction controls what
+
+| Command | What it does |
+|---|---|
+| `r.getScaledFluxControlCoefficientMatrix()` ⚡ | How much each reaction controls each flow, in percent terms. |
+| `r.getUnscaledFluxControlCoefficientMatrix()` ⚡ | Same, in absolute units. |
+| `r.getScaledConcentrationControlCoefficientMatrix()` ⚡ | How much each reaction controls each chemical level, in percent terms. |
+| `r.getUnscaledConcentrationControlCoefficientMatrix()` ⚡ | Same, in absolute units. |
+| `r.getScaledElasticityMatrix()` ⚡ | How sensitive each reaction is to each chemical, in percent terms. |
+| `r.getUnscaledElasticityMatrix()` ⚡ | Same, in absolute units. |
+| `r.getCC(variable, parameter)` ⚡ | One scaled control coefficient for a parameter. |
+| `r.getuCC(variable, parameter)` ⚡ | One unscaled control coefficient. |
+| `r.getEE(reaction, parameter)` / `r.getuEE(reaction, parameter)` | One scaled / unscaled elasticity. |
+| `r.getScaledFloatingSpeciesElasticity(reaction, species)` | One scaled species elasticity. |
+| `r.getUnscaledSpeciesElasticity(reaction, species)` | One unscaled species elasticity. |
+| `r.getUnscaledParameterElasticity(reaction, parameter)` | One unscaled parameter elasticity. |
+| `r.getDiffStepSize()` / `r.setDiffStepSize(x)` | Step size roadrunner uses to estimate slopes (Nitro uses exact slopes instead). |
+| `r.getFluxThreshold()` / `r.setFluxThreshold(x)` | Flux below which `getCC` treats a flux as zero. |
+
+### `r.` — Jacobians, eigenvalues and stability
+
+| Command | What it does |
+|---|---|
+| `r.getFullJacobian()` / `r.fjac()` ⚡ | Table of how every rate changes when every chemical changes. |
+| `r.getReducedJacobian()` ⚡ | Same, for the independent chemicals only. |
+| `r.getFullEigenValues()` / `r.getFullEigenValuesNamedArray()` ⚡ | Eigenvalues of the full Jacobian (negative real parts = stable). |
+| `r.getReducedEigenValues()` / `r.getReducedEigenValuesNamedArray()` ⚡ | Eigenvalues of the reduced Jacobian. |
+| `r.getEigenValueIds()` | Names used to select eigenvalues. |
+| `r.getFrequencyResponse(...)` | How the model responds to a signal wiggling at different frequencies. |
+
+### `r.` — sensitivities
+
+| Command | What it does |
+|---|---|
+| `r.timeSeriesSensitivities(start, end, points)` ⚡ | How much every chemical's time course shifts when each parameter is nudged. |
+| `r.setSensitivitySolver(name)` / `r.getSensitivitySolver()` / `r.getSensitivitySolverByName(name)` / `r.makeSensitivitySolver(name)` / `r.sensitivitySolverExists(name)` | Choose or look up the sensitivity solver. |
+| `r.getExistingSensitivitySolverNames()` / `r.getRegisteredSensitivitySolverNames()` | List sensitivity solvers. |
+
+### `r.` — reading and changing values
+
+| Command | What it does |
+|---|---|
+| `r.S1` / `r['[S1]']` / `r['S1']` | Read a value. `r.S1` and `r['[S1]']` give the concentration; `r['S1']` gives the amount. |
+| `r.S1 = 5` / `r['k1'] = 2` | Change a value. |
+| `r.getValue(name)` / `r.setValue(name, value)` | Read or change any value by name. |
+| `r.setValues(names, values)` | Change several values at once. |
+| `r.keys()` / `r.values()` / `r.items()` (and `iterkeys`, `itervalues`, `iteritems`) | Every name and value in the model, like a dictionary. |
+| `r.getIds()` / `r.getSupportedIdTypes()` | Every name you can select or set. |
+| `r.createSelection(name)` | Make a reusable selection object. |
+| `r.getSelectedValues()` | Current values of the selected columns. |
+| `r.resetSelectionLists()` | Put the selections back to the defaults. |
+| `r.getGlobalParameterByName(name)` / `r.setGlobalParameterByName(name, value)` | Read or change a parameter. |
+| `r.reset()` | Put chemicals back to their starting amounts (parameters stay as you changed them). |
+| `r.resetAll()` | Put everything back to the current starting values, parameters too. |
+| `r.resetParameter()` | Put parameters back to their starting values. |
+| `r.resetToOrigin()` | Put the model back exactly as it was when first loaded. |
+| `r.getCurrentTime()` | The model's current time. |
+
+### `r.` — listing what is in the model
+
+| Command | What it does |
+|---|---|
+| `r.getFloatingSpeciesIds()` / `r.fs()` | Chemicals that change. |
+| `r.getBoundarySpeciesIds()` / `r.bs()` | Chemicals held fixed. |
+| `r.getReactionIds()` / `r.rs()` | Reactions. |
+| `r.getGlobalParameterIds()` / `r.ps()` | Parameters. |
+| `r.getCompartmentIds()` / `r.vs()` | Compartments. |
+| `r.getFloatingSpeciesConcentrations()` / `r.sv()` | Current concentrations. |
+| `r.getFloatingSpeciesAmounts()` | Current amounts. |
+| `r.getBoundarySpeciesConcentrations()` / `r.getBoundarySpeciesAmounts()` | Fixed chemicals' levels. |
+| `r.getReactionRates()` / `r.rv()` | Current reaction speeds. |
+| `r.getRatesOfChange()` / `r.dv()` | How fast each chemical is changing now. |
+| `r.getIndependentRatesOfChange()` / `r.getDependentRatesOfChange()` | Same, split into independent and dependent chemicals. |
+| `r.getGlobalParameterValues()` / `r.getCompartmentVolumes()` | Parameter values / compartment sizes. |
+| `r.getConservedMoietyIds()` / `r.getConservedMoietyValues()` | Totals that never change (like total enzyme). |
+| `r.getIndependentFloatingSpeciesIds()` / `r.getDependentFloatingSpeciesIds()` | Which chemicals are independent / determined by the totals. |
+| `r.getFloatingSpeciesConcentrationIds()` / `r.getBoundarySpeciesConcentrationIds()` / `r.getFloatingSpeciesInitialConcentrationIds()` | Names for selecting concentrations or starting values. |
+| `r.getAssignmentRuleIds()` / `r.getRateRuleIds()` / `r.getInitialAssignmentIds()` | Things set by rules or starting formulas. |
+| `r.getNumFloatingSpecies()`, `r.getNumBoundarySpecies()`, `r.getNumReactions()`, `r.getNumGlobalParameters()`, `r.getNumCompartments()`, `r.getNumEvents()`, `r.getNumRateRules()`, `r.getNumConservedMoieties()`, `r.getNumIndFloatingSpecies()`, `r.getNumDepFloatingSpecies()`, `r.getNumberOfIndependentSpecies()`, `r.getNumberOfDependentSpecies()` | How many of each. |
+| `...NamedArray` versions (e.g. `r.getFloatingSpeciesConcentrationsNamedArray()`, `r.getRatesOfChangeNamedArray()`, `r.getIndependentFloatingSpeciesAmountsNamedArray()`) | The same values with names attached. `...V` versions return plain lists. |
+| `r.getKineticLaw(reaction)` | A reaction's rate formula. |
+| `r.getHasOnlySubstanceUnits(species)` | Whether a chemical is measured as an amount only. |
+| `r.getStoichiometryIds()` | Names of the stoichiometry values. |
+| `r.getModelId()` / `r.getModelName()` / `r.setModelId(id)` / `r.setModelName(name)` | The model's id and name. |
+| `r.getInfo()` | A summary of the loaded model and settings. |
+| `r.isModelLoaded()` | Whether a model is loaded. |
+| `r.getModel()` | The low-level model object. |
+
+### `r.` — structure (stoichiometry and conservation)
+
+| Command | What it does |
+|---|---|
+| `r.getFullStoichiometryMatrix()` / `r.sm()` | Which reactions make or use which chemicals. |
+| `r.getReducedStoichiometryMatrix()` / `r.getNrMatrix()` | Same, for independent chemicals only. |
+| `r.getExtendedStoichiometryMatrix()` | Same, including fixed chemicals. |
+| `r.getReactantsStoichiometryMatrix()` / `r.getProductsStoichiometryMatrix()` | Only what reactions use / only what they make. |
+| `r.getLinkMatrix()` / `r.getL0Matrix()` | How dependent chemicals follow from independent ones. |
+| `r.getKMatrix()` | Null space of the reduced stoichiometry (steady-state flux patterns). |
+| `r.getConservationMatrix()` | The totals that never change, as a matrix. |
+| `r.conservedMoietyAnalysis = True` | Detect and use those totals (needed for some steady states). |
+
+### `r.` — editing the model
+
+| Command | What it does |
+|---|---|
+| `r.addSpecies(...)` / `r.addSpeciesConcentration(...)` / `r.addSpeciesAmount(...)` / `r.removeSpecies(id)` | Add or remove a chemical. |
+| `r.addReaction(...)` / `r.removeReaction(id)` | Add or remove a reaction. |
+| `r.addParameter(...)` / `r.removeParameter(id)` | Add or remove a parameter. |
+| `r.addCompartment(...)` / `r.removeCompartment(id)` | Add or remove a compartment. |
+| `r.addAssignmentRule(...)` / `r.addRateRule(...)` / `r.removeRules(id)` | Add or remove rules (formulas that set or change a value). |
+| `r.addInitialAssignment(...)` / `r.removeInitialAssignment(id)` | Add or remove a starting-value formula. |
+| `r.addEvent(...)` / `r.addTrigger(...)` / `r.addDelay(...)` / `r.addPriority(...)` / `r.addEventAssignment(...)` / `r.removeEvent(id)` / `r.removeEventAssignments(...)` | Build or remove events (things that happen when a condition becomes true). |
+| `r.setPersistent(...)` / `r.setTriggerInitialValue(...)` | Event settings. |
+| `r.setKineticLaw(reaction, formula)` | Change a reaction's rate formula. |
+| `r.setReversible(reaction, True)` | Make a reaction reversible or not. |
+| `r.setBoundary(species, True)` | Hold a chemical fixed or let it change. |
+| `r.setConstant(id, True)` | Mark a value as constant. |
+| `r.setHasOnlySubstanceUnits(species, True)` | Measure a chemical as an amount only. |
+| `r.setInitAmount(...)` / `r.setInitConcentration(...)` / `r.setInitValue(...)` / `r.setInitStoichiometryValue(...)` | Change starting values. |
+| `r.regenerateModel()` | Rebuild the model after edits. |
+| `r.clearModel()` | Unload the model. |
+| `r.load(sbml)` | Load a different model into `r`. |
+| `r.validateCurrentSBML()` | Check the edited model is valid SBML. |
+
+### `r.` — exporting and saving
+
+| Command | What it does |
+|---|---|
+| `r.getSBML()` / `r.getCurrentSBML()` | SBML of the model as loaded / as it is now. |
+| `r.getAntimony()` / `r.getCurrentAntimony()` | Antimony text, as loaded / as now. |
+| `r.getCellML()` / `r.getCurrentCellML()` | CellML, as loaded / as now. |
+| `r.getMatlab()` / `r.getCurrentMatlab()` | Matlab code, as loaded / as now. |
+| `r.exportToSBML(path)` / `r.exportToAntimony(path)` / `r.exportToCellML(path)` / `r.exportToMatlab(path)` | Save the model in that format. |
+| `r.getParamPromotedSBML(sbml)` | SBML with local parameters turned into global ones. |
+| `r.saveState(path)` / `r.loadState(path)` | Save or restore the whole model and its state to a file. |
+| `r.saveStateS()` / `r.loadStateS(data)` | Same, to and from memory. |
+| `r.draw()` | Draw the reaction network (needs graphviz). |
+
+### `r.` — engine information
+
+| Command | What it does |
+|---|---|
+| `r.getCompiler()` | The roadrunner compiler object. |
+| `r.getExtendedVersionInfo()` | roadrunner and library versions. |
+| `r.getInstanceCount()` / `r.getInstanceID()` | How many roadrunner objects exist / this one's id. |
+| `r.setOptions(...)` / `r.registerSolvers()` | Low-level roadrunner options. |
+
+### Plain roadrunner code (**new**)
+
+| Command | What it does |
+|---|---|
+| `import tellurium.nitro as roadrunner` | Use instead of `import roadrunner`. Everything in libroadrunner is there, but `roadrunner.RoadRunner(sbml)` loads the model into the fast engine, so every ⚡ method above is fast. |

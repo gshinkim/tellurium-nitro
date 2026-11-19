@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tellurium Nitro - specJIT</title>
+<!-- Source of docs/specJIT.pdf. Rebuild the PDF with:
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --no-pdf-header-footer \
+     --print-to-pdf=docs/specJIT.pdf docs/specJIT.html -->
+<style>
+  @page { size: Letter; margin: 0.7in 0.75in; }
+  body { font: 10.5pt/1.45 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1a1a1a; }
+  h1 { font-size: 24pt; margin: 0 0 4pt; }
+  .sub { color: #555; margin: 0 0 18pt; }
+  h2 { font-size: 15pt; margin: 22pt 0 6pt; border-bottom: 1.5px solid #333; padding-bottom: 2pt; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 14pt 0 4pt; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  ul, ol { margin: 4pt 0; padding-left: 18pt; }
+  li { margin: 2pt 0; }
+  table { border-collapse: collapse; width: 100%; margin: 6pt 0 10pt; font-size: 9.5pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #bbb; padding: 3pt 5pt; text-align: left; vertical-align: top; }
+  th { background: #eee; }
+  td.n, th.n { text-align: right; white-space: nowrap; }
+  code { font: 9pt Menlo, Consolas, monospace; background: #f3f3f3; padding: 0 2pt; }
+  pre { font: 8.8pt/1.35 Menlo, Consolas, monospace; background: #f5f5f5; border: 1px solid #ddd; padding: 6pt 8pt; white-space: pre-wrap; page-break-inside: avoid; }
+  .box { border: 1.5px solid #333; padding: 8pt 10pt; margin: 8pt 0; background: #fafafa; page-break-inside: avoid; }
+  .flow { font: 9pt Menlo, Consolas, monospace; line-height: 1.3; }
+  .pb { page-break-before: always; }
+  b.big { font-size: 11pt; }
+</style>
+</head>
+<body>
+
+<h1>Tellurium Nitro</h1>
+<p class="sub">What changed from regular tellurium, how the new engine is built, and how to build it again yourself.<br>
+specJIT · plain-language edition · updated November 18, 2026</p>
+
+<div class="box">
+<p><b>The one-paragraph version.</b> Tellurium is a Python tool biologists use to simulate how the chemicals in a cell
+change over time. All the real number-crunching inside it is done by a C++ engine called <b>roadrunner</b>.
+Tellurium Nitro replaces that engine's work with a new engine written in the Rust programming language. The new
+engine solves the same equations, but it wastes far less work, it calculates exact answers where the old one used
+approximations, it uses every processor core, and it translates each model into native machine code (the "JIT").
+It reads model files itself, so loading a big model no longer waits for roadrunner. Your Python code does not
+change: the same <code>te.loada()</code>, <code>r.simulate()</code> and <code>r.steadyState()</code> calls just come
+back faster. If the new engine ever meets something it can't handle, it quietly hands that job to the original
+engine. With that backup switched off, it passes every one of the 1,923 cases of the official SBML Test Suite on
+its own.</p>
+</div>
+
+<h3>Headline results (Apple M5 Pro, same Python and roadrunner version for both)</h3>
+<table>
+<tr><th>Task</th><th class="n">Regular tellurium</th><th class="n">Nitro</th><th class="n">Faster by</th></tr>
+<tr><td>Load a 1,000-chemical, 3,400-reaction model</td><td class="n">30.9 s</td><td class="n">1.03 s</td><td class="n">30x</td></tr>
+<tr><td>Simulate that model (0 to 100, 1,000 points)</td><td class="n">284 ms</td><td class="n">42 ms</td><td class="n">6.8x</td></tr>
+<tr><td>Simulate it again after <code>reset()</code></td><td class="n">282 ms</td><td class="n">37 ms</td><td class="n">7.6x</td></tr>
+<tr><td>Simulate a 40-chemical model</td><td class="n">1.14 ms</td><td class="n">0.221 ms</td><td class="n">5.1x</td></tr>
+<tr><td>Roadrunner's own benchmark models (time courses)</td><td class="n">0.02-5.3 ms</td><td class="n">0.015-2.8 ms</td><td class="n">1.4-2.4x</td></tr>
+<tr><td>Find the steady state (40-chemical model)</td><td class="n">244 ms</td><td class="n">0.048 ms</td><td class="n">5,133x</td></tr>
+<tr><td>Control coefficients (which reaction controls the flow)</td><td class="n">590 ms</td><td class="n">0.039 ms</td><td class="n">14,979x</td></tr>
+<tr><td>Sensitivities over time (86 parameters)</td><td class="n">9.3 s</td><td class="n">22 ms</td><td class="n">419x</td></tr>
+<tr><td>Control analysis for 200 parameter sets</td><td class="n">251 s</td><td class="n">14 ms</td><td class="n">18,165x</td></tr>
+<tr><td>SBML Test Suite, new engine only</td><td class="n">—</td><td class="n">1,923 / 1,923</td><td class="n">100%</td></tr>
+</table>
+<p>The biggest wins are steady states and control analysis, because that is where the old engine wasted the most
+work. Plain time-course simulation gains less, because the old engine was already good at it.</p>
+
+<h2>Contents</h2>
+<ol>
+<li>The three versions</li>
+<li>The problem being solved, in pictures</li>
+<li>Why regular tellurium is slow</li>
+<li>What Nitro does instead (the big ideas)</li>
+<li>How it is built (architecture)</li>
+<li>The building blocks, file by file</li>
+<li>Every SBML feature, and how Nitro handles it</li>
+<li>Rebuild it yourself: a step-by-step recipe</li>
+<li>How we know the answers are right</li>
+<li>Full benchmark results</li>
+<li>What still goes to roadrunner, and known differences</li>
+<li>Everything that changed, file by file</li>
+<li>Glossary</li>
+</ol>
+
+<h2>1. The three versions</h2>
+<table>
+<tr><th>Version</th><th>What it is</th><th>What does the math</th></tr>
+<tr><td>Regular tellurium</td><td>The official release from the Sauro lab (sys-bio/tellurium), installed with pip.</td><td>roadrunner (C++) for everything.</td></tr>
+<tr><td>Tellurium Turbo</td><td>Our first fork. Adds <code>te.controlCoefficients()</code>, which runs many parameter sets in parallel worker processes, and optional GPU math (<code>te.gpu</code>).</td><td>Still roadrunner for every single calculation; only the batching is new.</td></tr>
+<tr><td><b>Tellurium Nitro</b></td><td>This version. Keeps everything from Turbo and adds a new engine written in Rust, a JIT compiler, its own model reader, and many new features.</td><td>The Rust engine for almost everything; roadrunner only as a backup.</td></tr>
+</table>
+
+<h2>2. The problem being solved, in pictures</h2>
+<p>A biological model is a list of chemical reactions, for example "S1 turns into S2 at a speed of k1 × S1". Each
+reaction has a <b>rate law</b> (a small formula) and some <b>parameters</b> (numbers like k1). From those, the
+software builds a set of equations saying how fast each chemical's amount is changing. Then it answers questions:</p>
+<ul>
+<li><b>Time course:</b> start from some amounts and step forward in time to see how they change (like a movie).</li>
+<li><b>Steady state:</b> find the point where nothing changes any more (where the movie ends up).</li>
+<li><b>Control analysis (MCA):</b> if I nudge one reaction, how much does each chemical level or flow change?
+Biologists use this to find which enzymes really control a pathway.</li>
+<li><b>Sensitivities:</b> how much does the whole time course shift if I nudge each parameter?</li>
+<li><b>Stochastic simulation:</b> when there are only a few molecules, simulate random individual reaction events
+(the Gillespie method).</li>
+<li><b>Flux balance (FBA):</b> given only which reactions exist and their limits, what is the best possible set of
+flows (for example, the fastest growth)? This is a different kind of problem: a linear program, not a simulation.</li>
+</ul>
+<p>Models can also contain <b>rules</b> (a value is always given by a formula), <b>events</b> ("when the
+concentration passes 5, add a dose"), <b>delays</b> ("the rate depends on what S1 was 2 seconds ago"), <b>random
+numbers</b> drawn inside the model, <b>fast reactions</b> (so fast they are always in balance) and <b>algebraic
+constraints</b> (equations that must always hold). All of these boil down to evaluating the rate-law formulas,
+and their slopes (derivatives), millions of times. How quickly and how cleverly you do that decides the speed.</p>
+
+<h2>3. Why regular tellurium is slow</h2>
+<p>We read roadrunner's source code and timed it. The slowness is not because C++ is slow; it comes from how the
+work is organised:</p>
+<table>
+<tr><th>What roadrunner does</th><th>Everyday analogy</th><th>Cost</th></tr>
+<tr><td>Compiles every model with LLVM (a heavy compiler) the moment it is loaded.</td><td>Building a factory before making one item.</td><td>About 30 s for a 1,000-chemical model, even for one quick answer.</td></tr>
+<tr><td>Every <code>steadyState()</code> call can rebuild and re-compile the whole model, sometimes twice.</td><td>Rebuilding your kitchen every time you cook dinner.</td><td>Tens to hundreds of milliseconds per call.</td></tr>
+<tr><td>Slopes (elasticities) are found by "finite differences": change each value a tiny bit, re-run, see what moves.</td><td>Finding how steep a hill is by stepping in every direction and measuring your height.</td><td>About 170,000 extra model resets on a 40-chemical model; only approximately right (errors around 1e-8).</td></tr>
+<tr><td>Control-coefficient calls re-solve the steady state every time, even if it was just solved.</td><td>Re-measuring a room for every piece of furniture.</td><td>The same expensive work repeated.</td></tr>
+<tr><td>Its steady-state solver keeps shared global memory, so two copies cannot run at the same time.</td><td>One checkout lane in a big supermarket.</td><td>Cannot use more than one CPU core.</td></tr>
+<tr><td>Refuses some valid models: delays, algebraic rules, fast reactions.</td><td>A shop that won't take some coins.</td><td>Those models can't be simulated at all.</td></tr>
+</table>
+
+<h2>4. What Nitro does instead (the big ideas)</h2>
+<p><b>4.1 Exact slopes by algebra, not by trial.</b> When the model is loaded, Nitro works out the derivative of
+every rate law symbolically, the way you would in a calculus class (the derivative of k1 × S1 with respect to S1 is
+k1). So "how steep is the hill" is answered with a formula, instantly and exactly, instead of 170,000 test steps.
+This is the single biggest reason steady-state and control analysis are thousands of times faster, and why Nitro's
+answers are more accurate.</p>
+<p><b>4.2 Build once, reuse forever.</b> The model is converted once and kept in memory. Later calls just plug in new
+numbers. Changing a parameter does not trigger a rebuild; only changing the model's structure (adding a reaction)
+does.</p>
+<p><b>4.3 Control analysis in one shot.</b> Control coefficients come from a known matrix formula,
+C = −L (N<sub>R</sub> E L)<sup>−1</sup> N<sub>R</sub> and F = I + E C. Nitro computes the pieces once at the steady
+state and solves it in a single step.</p>
+<p><b>4.4 Every core at once.</b> The Rust engine has no shared global memory, so it runs thousands of parameter sets
+side by side on all CPU cores (with the Rust library <i>rayon</i>), without Python's one-thing-at-a-time lock (the
+GIL) getting in the way. This powers <code>te.controlCoefficients</code>, <code>r.simulateBatch</code>, sensitivities
+and the 10,000-run stochastic tests.</p>
+<p><b>4.5 Native machine code (the JIT).</b> The engine stores each formula as a "tape": a list of tiny instructions
+("load k1, load S1, multiply..."), read one by one each time. That is like reading a recipe out loud step by step
+every time you cook. The JIT ("just-in-time compiler") translates the tape into the processor's own instructions
+with the Rust library <i>Cranelift</i>. It only does this after a formula has been used 2,000 times, so short one-off
+runs don't pay the compile cost. The compiled code gives bit-for-bit the same numbers as the tape.</p>
+<p><b>4.6 Smarter time stepping.</b> For time courses Nitro has two integrators (step-forward methods). At
+roadrunner's default accuracy and tighter (relative tolerance 1e-5 or below) it uses a variable-order <b>BDF</b>
+method, the same family as roadrunner's CVODE, with CVODE-style step-size and Newton control. At looser accuracy it
+uses <b>Rodas4</b>, which is faster there on small or event-heavy models. We chose the switch point by testing 10
+models at 5 accuracy levels. Both reuse expensive work between steps and order their matrix math to avoid wasted
+work ("sparse LU with fill-reducing ordering"). If a run blows up, Nitro retries once with tighter accuracy.</p>
+<p><b>4.7 Loading without roadrunner.</b> Nitro reads the model file itself (with libsbml, the standard SBML reader),
+works out the starting values with its own formula evaluator, and builds its engine in a fraction of a second.
+Antimony text (the easy model language) is turned into SBML by a pure-Rust reader, about 4x faster than the
+original libantimony. Roadrunner is still installed, but it is only woken up ("lazy loading") the first time you ask
+for something Nitro does not do, such as editing the model's structure. It is then handed the current state, so
+results carry on seamlessly.</p>
+<p><b>4.8 One traffic controller, and it never breaks your code.</b> Every call goes through one decision point. It
+asks: can Rust do this exactly the way roadrunner would? If yes, Rust does it; if not, the call goes to roadrunner
+untouched. <code>r.lastRun</code> tells you which happened and why. <code>te.turbo(False)</code> switches the new
+engine off; <code>te.turbo('strict')</code> switches the backup off, so you can prove everything ran in Rust.</p>
+<p><b>4.9 Models roadrunner refuses.</b> Nitro handles delays, algebraic rules, fast reactions, multi-part ("comp")
+models and random numbers inside models ("distrib"). Section 7 explains how, feature by feature.</p>
+
+<h2 class="pb">5. How it is built (architecture)</h2>
+<p>What happens when your code calls, for example, <code>r.steadyState()</code>:</p>
+<pre class="flow">
+   Your Python code:  te.loada(...), r.simulate(), r.steadyState(), ...
+                                   |
+                                   v
+   tellurium:  Antimony text --(Rust Antimony reader)--> SBML model text
+                                   |
+                                   v
+   Bridge (rrs_bridge.py): reads the SBML with libsbml, flattens comp models,
+   rewrites fast reactions and algebraic rules, computes starting values,
+   hands the equations to Rust
+                                   |
+                                   v
+   Traffic controller (ExtendedRoadRunner._run): can Rust do this call?
+          | yes                                             | no
+          v                                                 v
+   Rust model (roadrunner_rs)                       roadrunner (C++), unchanged,
+   formulas as a "tape" + exact derivatives;        not even loaded until a rare
+   JIT turns hot tapes into machine code            call needs it ("lazy"), then
+          |                                         handed the current state
+          v
+   +------------------+------------------+------------------+
+   | Steady state     | Time course      | Events, rules,   |
+   | Newton +         | BDF / Rodas4;    | delays,          |
+   | conservation laws| diffsol for DAEs | random draws     |
+   +------------------+------------------+------------------+
+   | Control analysis | Sensitivities    | Stochastic       |
+   | one matrix solve | exact, one       | Gillespie,       |
+   |                  | parameter / core | hybrid SSA       |
+   +------------------+------------------+------------------+
+          |
+          v
+   All CPU cores (rayon): thousands of runs side by side, no Python lock
+          |
+          v
+   Results come back as the same numpy arrays with column names as before.
+</pre>
+<ul>
+<li>Your code calls tellurium as usual. Antimony text becomes SBML.</li>
+<li>The bridge reads that SBML and builds the Rust model; roadrunner is not asked to compile it.</li>
+<li>The Rust model holds every formula as a tape, its exact derivatives, the conservation laws (totals that never
+change, like free + bound enzyme), events, rules and delay histories. Hot tapes are compiled to machine code.</li>
+<li>A <code>Session</code> object keeps the event state between <code>simulate</code> calls, counts solver steps,
+and retries a failed run with tighter accuracy.</li>
+<li>The right solver runs. Batches fan out across all CPU cores.</li>
+<li>Results come back in the same form as before, so plots, selections and getters keep working.</li>
+</ul>
+
+<h2>6. The building blocks, file by file</h2>
+<table>
+<tr><th>Part (file)</th><th>What it does, in plain words</th></tr>
+<tr><td>Expression tape (<code>rrs/src/expr.rs</code>)</td><td>Stores each formula as a compact list of steps; works out exact derivatives by algebra; pre-computes pieces that only depend on fixed parameters; knows every SBML math function (powers, logs, trig and inverse trig, hyperbolics, factorial, piecewise, comparisons, logic, <code>rateOf</code>, <code>delay</code>, random draws).</td></tr>
+<tr><td>JIT compiler (<code>rrs/src/jit.rs</code>)</td><td>Turns a tape into native machine code with Cranelift after 2,000 uses. Falls back to the tape for anything it does not translate.</td></tr>
+<tr><td>Model core (<code>rrs/src/model.rs</code>)</td><td>The solvers: Newton steady state with conservation laws; BDF and Rodas4 integrators; sparse matrix solver; events (delays, priorities, persistence, ties broken at random); rules; delay history; Gillespie and the hybrid SSA; control analysis; the DAE path through diffsol.</td></tr>
+<tr><td>Sensitivities (<code>rrs/src/sens.rs</code>)</td><td>Tracks how the whole time course shifts for each parameter, using exact derivatives, one parameter per CPU core.</td></tr>
+<tr><td>Random draws (<code>rrs/src/rand.rs</code>)</td><td>The 12 distributions of SBML "distrib" (normal, uniform, exponential, gamma, poisson, binomial, bernoulli, cauchy, chi-square, laplace, lognormal, rayleigh), optionally cut off at lower/upper limits. One random stream per thread, seeded per run.</td></tr>
+<tr><td>Python bindings (<code>rrs/src/py.rs</code>)</td><td>Lets Python call the Rust engine (via PyO3 and maturin), passing numpy arrays without copying where possible.</td></tr>
+<tr><td>Antimony / SBML readers (<code>rrs/crates/antimony</code>, <code>rrs/crates/sbml-io</code>)</td><td>Pure-Rust Antimony-to-SBML reader, copied from sys-bio/PathwayDesigner-rs. Anything it rejects goes to libantimony.</td></tr>
+<tr><td>Bridge (<code>tellurium/analysis/rrs_bridge.py</code>)</td><td>Reads the SBML (species, reactions, compartments, rules, events, initial assignments, unit conversions); flattens comp models; turns fast reactions and algebraic rules into solvable form; computes starting values; builds the Rust model.</td></tr>
+<tr><td>Traffic controller (<code>tellurium/roadrunner/extended_roadrunner.py</code>)</td><td>One decision point (<code>_run</code>) for every call; records <code>r.lastRun</code>; lazy roadrunner; <code>simulateBatch</code>; <code>te.turbo()</code>.</td></tr>
+<tr><td>Drop-in roadrunner (<code>tellurium/nitro.py</code>)</td><td><code>import tellurium.nitro as roadrunner</code> gives libroadrunner with the fast <code>RoadRunner</code>.</td></tr>
+<tr><td>Batch control analysis (<code>tellurium/analysis/gpu.py</code>)</td><td><code>te.controlCoefficients()</code>: thousands of parameter sets in one call; Rust first, parallel roadrunner workers as backup, optional GPU.</td></tr>
+<tr><td>Flux balance (<code>tellurium/analysis/fba.py</code>)</td><td><code>te.fba()</code>: reads the SBML fbc package (v1 and v2) and solves the linear program with SciPy's HiGHS solver.</td></tr>
+</table>
+
+<h2>7. Every SBML feature, and how Nitro handles it</h2>
+<table>
+<tr><th>Feature</th><th>What it means</th><th>How Nitro does it</th></tr>
+<tr><td>Reactions, parameters, compartments</td><td>The basics.</td><td>Each species' rate of change = sum of (stoichiometry × reaction rate), divided by compartment size for concentrations.</td></tr>
+<tr><td>Assignment and rate rules</td><td>"x is always this formula" / "x changes at this rate".</td><td>Assignment rules are evaluated in dependency order before each rate evaluation; rate rules become extra equations.</td></tr>
+<tr><td>Algebraic rules</td><td>"this equation must always be 0".</td><td>If the equation can be solved for one variable, the bridge turns it into an assignment rule. If not, the model is a DAE (differential-algebraic equation) and goes to the <i>diffsol</i> BDF solver, which first finds a consistent starting state.</td></tr>
+<tr><td>Fast reactions</td><td>So fast they are always in balance.</td><td>Each fast reaction's "extent" is an unknown fixed by "its rate = 0"; each fast species = its slow-driven base amount + stoichiometry × extent. Works even when stoichiometry changes over time or an event switches the reaction off.</td></tr>
+<tr><td>Events</td><td>"When the trigger becomes true, change these values" (optionally after a delay, with a priority).</td><td>Every comparison inside a trigger is watched, so a short trigger window is never stepped over. Delay, priority (ties broken at random, as SBML requires), persistence, "use values from trigger time" and "initial value = false" are all supported. Waiting events carry over between <code>simulate</code> calls.</td></tr>
+<tr><td><code>delay(x, d)</code></td><td>The value of x, d time units ago.</td><td>The engine keeps a history of every state and looks up past values with smooth (Hermite) interpolation. Values before the start, nested delays and changing delays are handled; steps are kept shorter than the shortest delay. The history keeps both the value just before and just after an event.</td></tr>
+<tr><td>comp (hierarchical models)</td><td>Models built from sub-models.</td><td>The bridge flattens them into one ordinary model with libsbml's flattening converter.</td></tr>
+<tr><td>distrib (random numbers in formulas)</td><td>e.g. <code>normal(0, 1)</code> inside a rate or event.</td><td>Every evaluation draws a fresh number (never cached or simplified away). Each run has its own seeded random stream, so batches are reproducible.</td></tr>
+<tr><td>Variable compartments, conversion factors, variable stoichiometry, function definitions, <code>avogadro</code>, <code>rateOf</code></td><td>Less common SBML features.</td><td>All built into the equation builder. <code>rateOf</code> of a rule is differentiated with the chain rule.</td></tr>
+<tr><td>Stochastic (Gillespie)</td><td>Random individual reaction events.</td><td>Standard SSA. If the model also has rate rules, a "hybrid SSA" integrates the rules and the total reaction propensity with RK4 and fires a reaction when the propensity integral reaches −ln(U), where U is a uniform random number.</td></tr>
+<tr><td>Flux balance (fbc)</td><td>Best flows under limits.</td><td><code>te.fba</code>: maximise or minimise the objective subject to N·v = 0 and the flux bounds, with SciPy HiGHS. An infeasible problem returns NaN.</td></tr>
+</table>
+
+<h2 class="pb">8. Rebuild it yourself: a step-by-step recipe</h2>
+<p>This is the order we built Nitro in. Each step works on its own and is checked before the next starts. A
+programmer comfortable with Python and willing to learn some Rust can follow it.</p>
+
+<h3>Step 0. Tools</h3>
+<ul>
+<li>Python 3.9+ with regular tellurium and libroadrunner 2.10 installed (the reference to compare against).</li>
+<li>Rust (<code>rustup</code>), and <code>maturin</code> to build Rust code as a Python module (<code>pip install maturin</code>).</li>
+<li>Rust libraries: <code>pyo3</code> and <code>numpy</code> (Python bindings), <code>rayon</code> (all cores),
+<code>cranelift-*</code> (JIT), <code>diffsol</code> (DAEs only).</li>
+<li>Python: numpy, scipy (for FBA), python-libsbml.</li>
+</ul>
+
+<h3>Step 1. Measure before changing anything</h3>
+<p>Write a benchmark script (ours is <code>benchmarks/run.py</code>) that times steady state, control coefficients,
+simulate, sensitivities and loading on a few models, and records the error against a very-high-accuracy reference
+(roadrunner at relative tolerance 1e-12, absolute 1e-14). Read roadrunner's source to see <i>why</i> each slow call
+is slow (section 3). This tells you where the big wins are.</p>
+
+<h3>Step 2. Formulas as a tape, with exact derivatives</h3>
+<ol>
+<li>Turn each rate-law formula (from libsbml's math tree) into a flat list of instructions: load a constant, load a
+variable, add, multiply, power, call a function, and so on. Evaluate it with a simple loop and a small stack.</li>
+<li>Write a function that takes a tape and a variable and returns a new tape for the derivative, using the normal
+calculus rules (sum rule, product rule, quotient rule, chain rule). Simplify as you go (0 × anything = 0).</li>
+<li>Pre-compute parts that only depend on fixed parameters, once.</li>
+<li>Check: every formula's value and derivative must match a numerical estimate to many digits on random inputs.</li>
+</ol>
+
+<h3>Step 3. Steady state and control analysis</h3>
+<ol>
+<li>Build the stoichiometry matrix N (which reaction makes or uses which chemical). Find the conservation laws (rows
+of N that combine to zero) to get the link matrix L and reduced matrix N<sub>R</sub>.</li>
+<li>Steady state: Newton's method on the independent chemicals, using the exact Jacobian from step 2, with damped
+steps. If Newton fails, run the model forward in time to t = 1, 10, 100, ... up to 1,000,000 and try Newton again
+from each point, until it finds a valid answer (finite, no negative chemicals).</li>
+<li>Elasticities E come straight from the derivative tapes. Then C = −L (N<sub>R</sub> E L)<sup>−1</sup> N<sub>R</sub>
+and F = I + E C. Scale by values and fluxes for the scaled versions.</li>
+<li>Check: match roadrunner's matrices. They will differ by about 1e-8 because roadrunner's slopes are approximate;
+tighten roadrunner's step size and the gap shrinks to about 1e-12, which proves the Rust answer is the exact one.</li>
+</ol>
+
+<h3>Step 4. Time courses</h3>
+<ol>
+<li>Implement Rodas4 (a stiff Rosenbrock method) with error control, then a variable-order BDF with CVODE-style
+step-size and Newton control. Both solve linear systems with a sparse LU that reorders rows to avoid fill-in.</li>
+<li>Choose BDF at relative tolerance 1e-5 and below, Rodas4 above (pick your own switch point by testing).</li>
+<li>Output on a fixed grid by interpolating between steps. If a run blows up, retry once with a tighter absolute
+tolerance.</li>
+<li>Check: compare with roadrunner at its own tolerances and with the high-accuracy reference.</li>
+</ol>
+
+<h3>Step 5. Rules, events and the rest of SBML</h3>
+<p>Add assignment and rate rules, then events (watch each comparison in the trigger for a sign change, locate the
+exact crossing, apply assignments, handle delay and priority), then variable compartments, conversion factors and
+the other features in section 7. After each feature, run the matching SBML Test Suite cases.</p>
+
+<h3>Step 6. Sensitivities, Gillespie and batches</h3>
+<ul>
+<li>Sensitivities: integrate the extra equations dS/dt = J·S + ∂f/∂p with exact derivatives, one parameter per core.</li>
+<li>Gillespie: pick the next reaction and time from the propensities; seed each run.</li>
+<li>Batches: run many parameter sets in parallel with rayon; each gets its own copy of the state.</li>
+</ul>
+
+<h3>Step 7. Connect it to tellurium</h3>
+<ol>
+<li>Expose the Rust engine to Python with PyO3 (<code>roadrunner_rs</code>), built with <code>pip install ./rrs</code>.</li>
+<li>Write the bridge: read SBML with libsbml and build the Rust model (step 2's tapes plus stoichiometry, rules,
+events). Compute starting values with your own formula evaluator, including initial assignments.</li>
+<li>Subclass tellurium's <code>ExtendedRoadRunner</code>. Route every expensive method through one function that tries
+Rust and, if Rust raises "can't do this exactly", calls the original roadrunner method. Record what happened.</li>
+<li>Make loading lazy: create an empty roadrunner object and only compile the model in roadrunner when a call needs it,
+passing it the current state.</li>
+<li>Check: run tellurium's own test suite with the new engine on and off; the results must be identical.</li>
+</ol>
+
+<h3>Step 8. The JIT</h3>
+<p>For each tape, count uses. After 2,000, translate the tape instruction by instruction into Cranelift's
+intermediate language, compile it, and call the compiled function from then on. Check: the compiled result must be
+bit-identical to the tape on random inputs.</p>
+
+<h3>Step 9. The hard SBML features</h3>
+<p>Add delays (state history + Hermite interpolation), comp flattening, fast-reaction rewriting, algebraic rules
+(eliminate when possible, otherwise diffsol), random draws, and the hybrid SSA (section 7). Then switch on strict mode
+and run the whole SBML Test Suite with <code>benchmarks/sts/run.py</code> and <code>run_stochastic.py</code>. Fix
+every failing case until all pass.</p>
+
+<h3>Step 10. Publish the numbers</h3>
+<p>Rerun the benchmarks (<code>benchmarks/run.py</code>, <code>benchmarks/bigmodel/run.py</code>) and both test
+suites, and report time, cores used, memory and error for every version.</p>
+
+<h2>9. How we know the answers are right</h2>
+<ul>
+<li><b>SBML Test Suite, 1,923 / 1,923 with the backup off.</b> The official suite (sbmlteam/sbml-test-suite, commit
+<code>bbcbc80</code>). All 1,789 semantic time courses run in Rust and match the expected numbers within each case's
+own tolerances; all 34 flux-balance cases pass in <code>te.fba</code>; all 100 stochastic cases pass with 10,000
+runs each, judged by the suite's own rule ("Z or Y failing 0-1 times per test"). With the suite's standard-deviation
+test applied strictly, 96 of 100 pass; the other 4 have very skewed distributions, and at up to a million runs their
+averages and spreads match the expected values. Before this work: 1,405 / 1,789 with the backup on.</li>
+<li><b>Tellurium's own tests.</b> The upstream test suite (385 tests) gives identical results with regular
+tellurium, Turbo and Nitro. Nitro's own suite passes in full: 417 passed, 0 failed, 8 skipped (need internet or
+optional extras).</li>
+<li><b>Side-by-side checks.</b> Every Rust feature has a test that runs the same model through roadrunner and compares
+(<code>tellurium/tests/test_turbo.py</code>, <code>rrs/check.py</code>, Rust unit tests). The random distributions
+are checked against their known averages and spreads.</li>
+<li><b>Against the truth, not just each other.</b> The benchmark compares all versions with a very-high-accuracy
+reference, so it shows who is closer to the true answer.</li>
+<li><b>Where answers differ, we found out why.</b> Control coefficients differ by about 5e-8 because roadrunner's
+trial-step slopes are approximate. We also found cases where roadrunner itself is wrong (sensitivities when an event
+changes a value, uninitialised numbers in <code>getDependentRatesOfChange</code>); Nitro gives the correct values.</li>
+</ul>
+
+<h3>Old tellurium bugs fixed along the way</h3>
+<ul>
+<li>SED-ML files that load experimental data (CSV, TSV, NuML) crashed; fixed (13 failing tests).</li>
+<li><code>te.executeSEDML("file.omex")</code> crashed with <code>NameError: CombineArchive</code>; fixed.</li>
+<li>Tiled figures crashed after <code>te.disablePlotting()</code>; fixed.</li>
+<li>Missing <code>phrasedml</code> silently hid the inline OMEX tools; now it says so.</li>
+<li>Inline OMEX left a temporary folder behind each run; fixed.</li>
+<li><code>distributed_sensitivity_analysis</code> bounds check and <code>run_case(..., py_code=True)</code> fixed;
+the Python 2 <code>six</code> import removed.</li>
+</ul>
+
+<h2 class="pb">10. Full benchmark results</h2>
+<p>Apple M5 Pro (18 cores, 48 GB), macOS, Python 3.12, libroadrunner 2.10.0. Each task runs in a fresh process.
+Time is per call; "error" is the distance from a very-high-accuracy reference answer (smaller is better).</p>
+
+<h3>Roadrunner's own benchmark models (sosbench)</h3>
+<table>
+<tr><th>Model</th><th class="n">Regular</th><th class="n">Turbo</th><th class="n">Nitro</th><th class="n">Nitro vs regular</th><th>Error regular / Nitro</th></tr>
+<tr><td>00009</td><td class="n">1.41 ms</td><td class="n">1.47 ms</td><td class="n">0.70 ms</td><td class="n">2.0x</td><td>2e-11 / 2e-11</td></tr>
+<tr><td>00014</td><td class="n">1.50 ms</td><td class="n">1.37 ms</td><td class="n">0.62 ms</td><td class="n">2.4x</td><td>5e-6 / 6e-6</td></tr>
+<tr><td>00022</td><td class="n">5.32 ms</td><td class="n">5.31 ms</td><td class="n">2.77 ms</td><td class="n">1.9x</td><td>2e-5 / 3e-5</td></tr>
+<tr><td>00033</td><td class="n">0.89 ms</td><td class="n">0.89 ms</td><td class="n">0.40 ms</td><td class="n">2.2x</td><td>2e-9 / 3e-10</td></tr>
+<tr><td>10001</td><td class="n">21.9 µs</td><td class="n">21.6 µs</td><td class="n">15.2 µs</td><td class="n">1.4x</td><td>9e-6 / 3e-5</td></tr>
+<tr><td>10000</td><td class="n">fails</td><td class="n">fails</td><td class="n">109 ms</td><td class="n">only Nitro finishes</td><td>— / 1e-8</td></tr>
+<tr><td>repressilator</td><td class="n">fails</td><td class="n">fails</td><td class="n">111 ms</td><td class="n">only Nitro finishes</td><td>— / 1e-8</td></tr>
+</table>
+
+<h3>The 40-chemical model from Tellurium Turbo</h3>
+<table>
+<tr><th>Task</th><th class="n">Regular</th><th class="n">Turbo</th><th class="n">Nitro</th><th class="n">Nitro vs regular</th><th class="n">Nitro vs Turbo</th></tr>
+<tr><td>Steady state</td><td class="n">244 ms</td><td class="n">243 ms</td><td class="n">0.048 ms</td><td class="n">5,133x</td><td class="n">5,125x</td></tr>
+<tr><td>Control coefficients</td><td class="n">590 ms</td><td class="n">581 ms</td><td class="n">0.039 ms</td><td class="n">14,979x</td><td class="n">14,742x</td></tr>
+<tr><td>Simulate</td><td class="n">1.14 ms</td><td class="n">1.14 ms</td><td class="n">0.221 ms</td><td class="n">5.1x</td><td class="n">5.2x</td></tr>
+<tr><td>Sensitivities (86 parameters)</td><td class="n">9.3 s</td><td class="n">9.2 s</td><td class="n">22 ms</td><td class="n">419x</td><td class="n">413x</td></tr>
+<tr><td>200 parameter sets (MCA)</td><td class="n">251 s</td><td class="n">8.2 s</td><td class="n">14 ms</td><td class="n">18,165x</td><td class="n">595x</td></tr>
+</table>
+
+<h3>Big model: 1,000 chemicals, 3,400 reactions, 5,952 parameters</h3>
+<table>
+<tr><th>Task</th><th class="n">Regular tellurium</th><th class="n">Nitro</th><th class="n">Faster by</th></tr>
+<tr><td>Load (<code>te.loada</code>)</td><td class="n">30.9 s</td><td class="n">1.03 s</td><td class="n">30x</td></tr>
+<tr><td>First <code>simulate(0, 100, 1000)</code></td><td class="n">284 ms</td><td class="n">42 ms</td><td class="n">6.8x</td></tr>
+<tr><td><code>reset()</code> + simulate again</td><td class="n">282 ms</td><td class="n">37 ms</td><td class="n">7.6x</td></tr>
+</table>
+<p>The largest difference from regular tellurium at any point is 2.9e-5. Model and script:
+<code>benchmarks/bigmodel/</code>.</p>
+
+<p><b>Accuracy.</b> Control coefficients are about 1,000x more accurate than roadrunner's (1e-11 vs 4e-8) because
+Nitro uses exact derivatives; time courses are within roadrunner's own error range.</p>
+<p><b>Why some numbers are 2x and others thousands of times.</b> When both programs do the same work (playing a model
+forward in time), Nitro is just leaner: about 1.4-8x. Where roadrunner takes a big detour (rebuilding the model,
+trial-and-error slopes, one core), Nitro skips almost all of the work: 400 to 18,000x.</p>
+
+<h2>11. What still goes to roadrunner, and known differences</h2>
+<p>Roadrunner is not loaded at all for normal work. It is loaded once, on demand, for:</p>
+<ul>
+<li>Editing the model's structure (<code>addReaction</code> and similar) and exporting to CellML / Matlab.</li>
+<li>Link and conservation matrices, and <code>conservedMoietyAnalysis = True</code>: these must pick the same
+"independent" chemicals as roadrunner's structural analysis.</li>
+<li>Integrators other than CVODE and Gillespie (for example Euler or RK4).</li>
+<li><code>getFrequencyResponse</code>: there is no trustworthy reference to check a new version against.</li>
+<li>Second-order sensitivities.</li>
+<li>Small getters (about 1 µs in C++), where calling into Rust would cost more than it saves.</li>
+</ul>
+<p>Known limits: <code>delay()</code> inside a DAE model with algebraic constraints that can't be eliminated is not
+supported; the hybrid SSA uses fixed tolerances and is slower than the pure SSA on large models.</p>
+<p>Known differences, where Nitro is right and roadrunner is not: roadrunner carries sensitivity state into the next
+call even after <code>reset()</code>; it ignores event changes inside sensitivities; it returns uninitialised values
+from <code>getDependentRatesOfChange</code> when moiety analysis is on.</p>
+
+<h2>12. Everything that changed, file by file</h2>
+<table>
+<tr><th>File</th><th>Status</th><th>Purpose</th></tr>
+<tr><td><code>rrs/</code> (whole folder)</td><td>new</td><td>The Rust engine <code>roadrunner_rs</code>: <code>src/expr.rs</code>, <code>jit.rs</code>, <code>model.rs</code>, <code>sens.rs</code>, <code>rand.rs</code>, <code>py.rs</code>, <code>lib.rs</code>; <code>crates/antimony</code>, <code>crates/sbml-io</code>; <code>check.py</code>.</td></tr>
+<tr><td><code>tellurium/analysis/rrs_bridge.py</code></td><td>new</td><td>Reads SBML directly and builds the Rust model.</td></tr>
+<tr><td><code>tellurium/roadrunner/extended_roadrunner.py</code></td><td>changed</td><td>Traffic controller, <code>lastRun</code>, lazy roadrunner, <code>simulateBatch</code>, <code>te.turbo()</code>.</td></tr>
+<tr><td><code>tellurium/nitro.py</code></td><td>new</td><td>Drop-in <code>import tellurium.nitro as roadrunner</code>.</td></tr>
+<tr><td><code>tellurium/analysis/fba.py</code></td><td>new</td><td><code>te.fba()</code> flux balance analysis.</td></tr>
+<tr><td><code>tellurium/tellurium.py</code></td><td>changed</td><td>Loaders create the lazy model; <code>te.antimony()</code>, <code>te.SBML()</code> switches.</td></tr>
+<tr><td><code>tellurium/analysis/gpu.py</code></td><td>new in Turbo, changed</td><td><code>te.controlCoefficients</code>, <code>te.gpu</code>; now Rust first.</td></tr>
+<tr><td><code>tellurium/__init__.py</code></td><td>changed</td><td>Exports <code>te.turbo</code>, <code>te.gpu</code>, <code>te.getGPU</code>, <code>te.controlCoefficients</code>, <code>te.antimony</code>, <code>te.SBML</code>, <code>te.fba</code>.</td></tr>
+<tr><td><code>tellurium/sedml/*</code>, <code>teconverters</code>, <code>plotting/engine_null.py</code></td><td>changed</td><td>Upstream bug fixes (section 9).</td></tr>
+<tr><td><code>tellurium/visualization/sbmldiagram.py</code></td><td>changed</td><td>Removed an old Python 2 import that broke <code>import tellurium</code>.</td></tr>
+<tr><td><code>tellurium/tests/test_turbo.py</code>, <code>test_gpu.py</code></td><td>new</td><td>Rust vs roadrunner comparison tests, including sosbench.</td></tr>
+<tr><td><code>setup.py</code></td><td>changed</td><td>Optional <code>gpu</code> extra (PyTorch).</td></tr>
+<tr><td><code>benchmarks/</code></td><td>new</td><td><code>run.py</code>, <code>tests.py</code>, <code>sosbench/</code>, <code>sts/</code> (SBML Test Suite), <code>bigmodel/</code>.</td></tr>
+<tr><td><code>docs/specJIT.html</code> / <code>.pdf</code></td><td>new</td><td>This document (the HTML is the source).</td></tr>
+<tr><td><code>docs/roadrunner-rs-spec.md</code></td><td>new</td><td>Technical rewrite specification with source references.</td></tr>
+<tr><td><code>README.md</code></td><td>changed</td><td>Story, install steps, results, full command list.</td></tr>
+</table>
+
+<h2>13. Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>Rust</td><td>A modern, fast programming language that is safe to run on many cores at once.</td></tr>
+<tr><td>roadrunner</td><td>The original C++ simulation engine inside tellurium.</td></tr>
+<tr><td>SBML / Antimony</td><td>Standard file format for biological models / a human-friendly way to write them.</td></tr>
+<tr><td>SBML Test Suite</td><td>The official set of test models, each with its correct answer.</td></tr>
+<tr><td>Rate law</td><td>Formula for how fast one reaction runs.</td></tr>
+<tr><td>Steady state</td><td>The point where no amounts change any more.</td></tr>
+<tr><td>Jacobian</td><td>Table of how every rate changes when every amount changes; needed by fast solvers.</td></tr>
+<tr><td>Elasticity</td><td>How sensitive one reaction's speed is to one chemical's level.</td></tr>
+<tr><td>Control coefficient (MCA)</td><td>How much a whole pathway's output depends on one reaction.</td></tr>
+<tr><td>Finite differences</td><td>Estimating a slope by trying small steps; slow and approximate.</td></tr>
+<tr><td>Symbolic derivative</td><td>The exact slope formula, worked out by algebra.</td></tr>
+<tr><td>Integrator</td><td>The method that steps a model forward in time (Rodas4, BDF, CVODE).</td></tr>
+<tr><td>Tolerance</td><td>How much error the integrator may make per step; smaller = more accurate and slower.</td></tr>
+<tr><td>Newton's method</td><td>Fast way to solve equations by repeatedly following the slope.</td></tr>
+<tr><td>Conservation law</td><td>A total that never changes (e.g. free + bound enzyme).</td></tr>
+<tr><td>DAE</td><td>Differential-algebraic equations: some values change over time, others must always satisfy an equation.</td></tr>
+<tr><td>Hermite interpolation</td><td>A smooth way to estimate a value between two saved points, using their slopes too.</td></tr>
+<tr><td>Gillespie / SSA</td><td>Simulation of random individual reaction events.</td></tr>
+<tr><td>Linear program</td><td>Finding the best value of a straight-line formula under straight-line limits (used by FBA).</td></tr>
+<tr><td>Tape</td><td>The engine's compact step-by-step list representing a formula.</td></tr>
+<tr><td>JIT (just-in-time compiler)</td><td>Turns the tape into the processor's native instructions while the program runs.</td></tr>
+<tr><td>Cranelift / LLVM</td><td>Code-generator libraries; Nitro uses Cranelift, roadrunner uses LLVM.</td></tr>
+<tr><td>Facade / traffic controller</td><td>The layer that routes each call to Rust or to the original engine.</td></tr>
+<tr><td>Strict mode</td><td><code>te.turbo('strict')</code>: backup off; Rust or an error.</td></tr>
+<tr><td>GIL</td><td>Python's lock that lets only one thread run Python code at a time.</td></tr>
+<tr><td>libsbml</td><td>The standard library for reading and writing SBML model files.</td></tr>
+<tr><td>Lazy loading</td><td>Not doing an expensive step (here: compiling the model in roadrunner) until something needs it.</td></tr>
+</table>
+
+</body>
+</html>
