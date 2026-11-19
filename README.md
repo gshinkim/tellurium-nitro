@@ -36,15 +36,17 @@ It does the same jobs, but:
   accurate;
 - it uses every core of your computer when there is a lot of work to share.
 
-Everything else is still tellurium. You write `import tellurium as te`, `te.loada(...)`, `r.simulate(...)` exactly
-as before. If the new engine ever meets something it can't handle, Nitro quietly hands that one job to the
+Everything else is still tellurium. The only change to your code is the import line: `import tellurium_nitro as te`
+instead of `import tellurium as te`. After that, `te.loada(...)`, `r.simulate(...)` and the rest work exactly as
+before. If the new engine ever meets something it can't handle, Nitro quietly hands that one job to the
 original roadrunner, so your code never breaks.
 
 ## What is different from regular tellurium?
 
 | | Regular tellurium | Tellurium Nitro |
 |---|---|---|
-| How you write code | `import tellurium as te` | **The same.** Nothing to learn. |
+| Package names | `tellurium`, `libroadrunner` | `tellurium_nitro`, `libroadrunner_nitro`, so both can be installed side by side |
+| How you write code | `import tellurium as te` | `import tellurium_nitro as te`; every command after that is **the same** |
 | Results | roadrunner's answers | **The same answers** (within the solver's normal error), and more exact for control coefficients |
 | Math engine | roadrunner (C++) | New Rust engine; roadrunner only as a backup |
 | Simulate a model over time | baseline | **about 1.4-8x faster** |
@@ -62,15 +64,17 @@ New things you can do that regular tellurium can't:
 - **See which engine did the work:** after any call, `r.lastRun` tells you whether the fast engine ran it, and if
   not, why.
 - **Use it from plain roadrunner code:** if your scripts start with `import roadrunner`, change that one line to
-  `import tellurium.nitro as roadrunner` and the rest runs on the fast engine.
+  `import tellurium_nitro.nitro as roadrunner` and the rest runs on the fast engine.
 - **Flux balance analysis:** `te.fba(model)` solves flux balance problems (linear programs), which roadrunner
   doesn't do.
 
 ## Install Tellurium Nitro (step by step)
 
-> **Do not run `pip install tellurium`.** That installs *regular* tellurium from PyPI. Tellurium Nitro is installed
-> from this GitHub repo instead; it brings all of tellurium's dependencies with it. Nitro still imports as
-> `import tellurium as te`, so use a fresh virtual environment to keep it separate from any regular tellurium.
+> **Its own names, so it can't clash with regular tellurium.** Nitro installs as the package `tellurium_nitro`
+> (`import tellurium_nitro as te`), and its engine as `libroadrunner_nitro` (`import roadrunner_nitro`). Your
+> existing `tellurium` and `libroadrunner` are never replaced or changed by name. Nitro still uses the regular
+> libroadrunner, libsbml and antimony packages underneath, and pip may update their versions, so a fresh virtual
+> environment (step 4) is still the safest way to keep your current setup exactly as it is.
 
 **1. Install Python 3.9 or newer, and git.** Check with `python3 --version` and `git --version`.
 
@@ -113,7 +117,7 @@ pip install ./rrs
 **7. Check that it works:**
 
 ```bash
-python -c "import tellurium as te; print('Nitro engine on:', te.turbo())"
+python -c "import tellurium_nitro as te; print('Nitro engine on:', te.turbo())"
 ```
 
 It should print `Nitro engine on: True`. If it prints `False`, step 6 didn't finish; run it again and read
@@ -127,10 +131,10 @@ Tested on macOS (Apple Silicon). Linux and Windows should work, but they're unte
 
 ### Your first simulation
 
-Write it exactly as you would in regular tellurium:
+Write it exactly as you would in regular tellurium; only the import line is different:
 
 ```python
-import tellurium as te
+import tellurium_nitro as te
 
 r = te.loada('''
     S1 -> S2; k1*S1      # S1 turns into S2 at rate k1*S1
@@ -147,7 +151,7 @@ print(r.getScaledFluxControlCoefficientMatrix())   # which reaction controls the
 Change only the import line. Everything below it stays the same.
 
 ```python
-import tellurium.nitro as roadrunner     # was: import roadrunner
+import tellurium_nitro.nitro as roadrunner     # was: import roadrunner
 r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
 r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
@@ -158,7 +162,7 @@ Give each setting you want to change a list of values. Nitro runs one simulation
 at the same time:
 
 ```python
-import tellurium as te
+import tellurium_nitro as te
 r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')
 results = r.simulateBatch({'k1': [0.1, 0.5, 1.0, 2.0]}, 0, 10, 100)
 print(results.shape)        # (4, 100, 3): 4 runs x 100 time points x 3 columns (time, S1, S2)
@@ -247,7 +251,7 @@ Three versions are compared:
 |---|---|
 | Regular tellurium (PyPI 2.2.13.1, libroadrunner 2.10.0) | roadrunner (C++) |
 | [Tellurium Turbo](https://github.com/gshinkim/tellurium-turbo) | roadrunner (C++); adds batched, parallel `te.controlCoefficients` and optional GPU |
-| **Tellurium Nitro** (this repo) | Rust engine `roadrunner_rs` + JIT; roadrunner only as a fallback |
+| **Tellurium Nitro** (this repo) | Rust engine `roadrunner_nitro` + JIT; roadrunner only as a fallback |
 
 Each task runs in a fresh process. Reproduce with `python benchmarks/run.py`, which writes `benchmarks/results.md`
 and `benchmarks/results.json`.
@@ -365,7 +369,7 @@ mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation
 ### 3. Old tellurium bugs, now fixed
 
 Nitro also fixes those 14 failures and a few other long-standing tellurium bugs. Its own test suite
-(`pytest tellurium/tests`) passes in full: 417 passed, 0 failed, 8 skipped (the skips need internet access or
+(`pytest tellurium_nitro/tests`) passes in full: 417 passed, 0 failed, 8 skipped (the skips need internet access or
 optional extras). What that means for you:
 
 - **Reading data files in SED-ML now works.** Simulation descriptions that load experimental data from CSV, TSV or
@@ -388,7 +392,7 @@ You can also compare Nitro with roadrunner on your own machine: `python rrs/chec
 A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) in which roadrunner's compute engine is
 rewritten in Rust: steady states, time courses, events, rules, control analysis (MCA), sensitivities and
 Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and batches run on every CPU core.
-`tellurium.nitro` re-exports libroadrunner with a Rust-backed `RoadRunner`, so `roadrunner.RoadRunner(sbml)` loads
+`tellurium_nitro.nitro` re-exports libroadrunner with a Rust-backed `RoadRunner`, so `roadrunner.RoadRunner(sbml)` loads
 the model straight into the Rust engine (no LLVM compile).
 
 Plain-language explainer of what changed and how it is built: [`docs/specJIT.pdf`](docs/specJIT.pdf).
@@ -398,10 +402,10 @@ Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.m
   Rust path raises `_Fallback(reason)` for anything it can't do exactly like roadrunner; the call then goes to
   roadrunner, and `r.lastRun` records the engine, the reason and (for time courses) the solver's step counts.
 - **Rust model per runner** (`_RsModel` in `extended_roadrunner.py`): the Rust model, the index maps between
-  roadrunner's ids and it, the output-column plans (`_Cols`) and a `roadrunner_rs.Session`, which keeps the event
+  roadrunner's ids and it, the output-column plans (`_Cols`) and a `roadrunner_nitro.Session`, which keeps the event
   state between `simulate`/`oneStep` calls and retries a failed run with a tighter tolerance. `simulateBatch` and
   `te.controlCoefficients` reuse the same model.
-- **Rust engine** (`rrs/`, Python module `roadrunner_rs`):
+- **Rust engine** (`rrs/`, Python module `roadrunner_nitro`):
   - Rate laws become a flat tape with exact symbolic derivatives (Jacobians, elasticities, parameter derivatives).
   - The tape is JIT-compiled to native code with Cranelift after 2000 evaluations, so short one-shot runs don't pay
     the compile cost. The JIT output is bit-identical to the interpreter.
@@ -418,7 +422,7 @@ Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.m
   - **MCA:** closed form, `C = -L (N_R E L)^-1 N_R` and `F = I + E C`.
   - **Sensitivities:** forward, one parameter per core.
   - **Gillespie SSA.**
-- **Bridge** (`tellurium/analysis/rrs_bridge.py`): builds the Rust model straight from the SBML (libsbml). No
+- **Bridge** (`tellurium_nitro/analysis/rrs_bridge.py`): builds the Rust model straight from the SBML (libsbml). No
   roadrunner compile is needed.
 - **Antimony:** read by a pure-Rust reader (`rrs/crates/antimony`, from
   [PathwayDesigner-rs](https://github.com/sys-bio/PathwayDesigner-rs)), about 4x faster to load than libantimony.
@@ -436,7 +440,7 @@ Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.m
     - model edits (`addReaction`, etc.)
     - integrators other than cvode or gillespie
     - anything else Nitro doesn't serve
-- **Facade** (`tellurium/roadrunner/extended_roadrunner.py`): for each call, it decides between Rust and roadrunner
+- **Facade** (`tellurium_nitro/roadrunner/extended_roadrunner.py`): for each call, it decides between Rust and roadrunner
   and keeps the roadrunner object in sync, so selections, getters and plotting keep working.
 - **What Rust handles:**
   - `simulate`, including the gillespie integrator and `oneStep`
@@ -465,7 +469,7 @@ Call `te.gpu(True)` **once** per session. After that, every `te.controlCoefficie
 automatically; you don't pass anything else.
 
 ```python
-import tellurium as te, numpy as np
+import tellurium_nitro as te, numpy as np
 
 if __name__ == '__main__':             # needed in .py scripts (uses all CPU cores); not needed in Jupyter
     te.gpu(True)                       # once: picks NVIDIA (CUDA) or Apple (MPS), else CPU
@@ -489,7 +493,7 @@ Only `te.controlCoefficients` uses the GPU. Regular roadrunner calls (`r.simulat
 ### Full API
 
 ```python
-import tellurium as te, numpy as np
+import tellurium_nitro as te, numpy as np
 
 te.gpu("true")        # finds an NVIDIA (CUDA) or Apple Silicon (MPS) GPU, falls back to CPU
 te.getGPU()           # -> "cuda", "mps" or "cpu"
@@ -546,17 +550,17 @@ for large models with many samples. CUDA was not benchmarked.
 
 ## Changed files (vs sys-bio/tellurium)
 
-- `rrs/` (new): Rust engine `roadrunner_rs` (`src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT,
+- `rrs/` (new): Rust engine `roadrunner_nitro` (`src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT,
   `src/model.rs` solvers/integrators/events/SSA/MCA, `src/sens.rs` sensitivities, `src/rand.rs` `distrib` random draws, `src/py.rs` bindings, `check.py`)
-- `tellurium/analysis/rrs_bridge.py` (new): roadrunner model -> Rust model
-- `tellurium/roadrunner/extended_roadrunner.py`: facade routing roadrunner calls to Rust, `te.turbo()`
-- `tellurium/analysis/gpu.py` (new): `te.gpu()`, `te.getGPU()`, `te.controlCoefficients()` (Rust first)
-- `tellurium/__init__.py`: exports `te.turbo`, `te.gpu`, `te.getGPU`, `te.controlCoefficients`
-- `tellurium/tests/test_turbo.py`, `tellurium/tests/test_gpu.py` (new): Rust / batched results vs plain roadrunner
-- `tellurium/visualization/sbmldiagram.py`: removed the Python 2 `six` import
+- `tellurium_nitro/analysis/rrs_bridge.py` (new): roadrunner model -> Rust model
+- `tellurium_nitro/roadrunner/extended_roadrunner.py`: facade routing roadrunner calls to Rust, `te.turbo()`
+- `tellurium_nitro/analysis/gpu.py` (new): `te.gpu()`, `te.getGPU()`, `te.controlCoefficients()` (Rust first)
+- `tellurium_nitro/__init__.py`: exports `te.turbo`, `te.gpu`, `te.getGPU`, `te.controlCoefficients`
+- `tellurium_nitro/tests/test_turbo.py`, `tellurium_nitro/tests/test_gpu.py` (new): Rust / batched results vs plain roadrunner
+- `tellurium_nitro/visualization/sbmldiagram.py`: removed the Python 2 `six` import
 - `setup.py`: optional extra `gpu` (`torch>=2.0`)
 - `benchmarks/` (new): `run.py` (speed/efficiency/accuracy), `tests.py` (pytest suite on all three), `sosbench/`
-- `tellurium/analysis/fba.py` (new): `te.fba()`, flux balance analysis with SciPy HiGHS
+- `tellurium_nitro/analysis/fba.py` (new): `te.fba()`, flux balance analysis with SciPy HiGHS
 - `benchmarks/sts/` (new): SBML Test Suite runners, report and per-case results
 - `benchmarks/bigmodel/` (new): 1000-species benchmark model and runner
 - `docs/specJIT.pdf` (plain-language explainer), `docs/roadrunner-rs-spec.md` (technical spec)
@@ -824,7 +828,7 @@ TELLURIUM AND ALL SOFTWARE BUNDLED WITH TELLURIUM (HEREAFTER "THE SOFTWARE") IS 
 
 ## Every command, and what it does
 
-Everything you can call in Tellurium Nitro. `te` is `import tellurium as te`. `r` is a model you loaded, for
+Everything you can call in Tellurium Nitro. `te` is `import tellurium_nitro as te`. `r` is a model you loaded, for
 example `r = te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10')`.
 
 ⚡ = runs on Nitro's fast Rust engine. Everything else works exactly as in regular tellurium.
@@ -1133,4 +1137,4 @@ in strict mode.
 
 | Command | What it does |
 |---|---|
-| `import tellurium.nitro as roadrunner` | Use instead of `import roadrunner`. Everything in libroadrunner is there, but `roadrunner.RoadRunner(sbml)` loads the model into the fast engine, so every ⚡ method above is fast. |
+| `import tellurium_nitro.nitro as roadrunner` | Use instead of `import roadrunner`. Everything in libroadrunner is there, but `roadrunner.RoadRunner(sbml)` loads the model into the fast engine, so every ⚡ method above is fast. |

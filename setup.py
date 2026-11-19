@@ -13,10 +13,10 @@ try:
         version = f.read().rstrip()
 except IOError:
     # fallback location
-    with open(os.path.join(os.path.dirname(__file__), 'tellurium/VERSION.txt'), 'r') as f:
+    with open(os.path.join(os.path.dirname(__file__), 'tellurium_nitro/VERSION.txt'), 'r') as f:
         version = f.read().rstrip()
 
-setup(name='tellurium',
+setup(name='tellurium_nitro',
       version=version,
       author='J. Kyle Medley, Kiri Choi, Matthias König, Lucian Smith, Herbert M. Sauro',
       description='Tellurium: An biological modeling environment for Python',
@@ -24,23 +24,23 @@ setup(name='tellurium',
       long_description=open('README.md', "r").read(),
       long_description_content_type='text/markdown',
       packages=[
-          'tellurium',
-          'tellurium.analysis',
-          'tellurium.notebooks',
-          'tellurium.plotting',
-          'tellurium.roadrunner',
-          'tellurium.sedml',
-          'tellurium.teconverters',
-          'tellurium.teio',
-          'tellurium.utils',
-          #'tellurium.optimization',
-          'tellurium.visualization',
-          #'tellurium.tests',
-          #'tellurium.tests.testdata',
+          'tellurium_nitro',
+          'tellurium_nitro.analysis',
+          'tellurium_nitro.notebooks',
+          'tellurium_nitro.plotting',
+          'tellurium_nitro.roadrunner',
+          'tellurium_nitro.sedml',
+          'tellurium_nitro.teconverters',
+          'tellurium_nitro.teio',
+          'tellurium_nitro.utils',
+          #'tellurium_nitro.optimization',
+          'tellurium_nitro.visualization',
+          #'tellurium_nitro.tests',
+          #'tellurium_nitro.tests.testdata',
       ],
       package_data={
-          "tellurium": ["*.txt"],
-          "tellurium.sedml": ["templates/*.template"],
+          "tellurium_nitro": ["*.txt"],
+          "tellurium_nitro.sedml": ["templates/*.template"],
       },
       install_requires=[
           # general

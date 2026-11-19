@@ -33,7 +33,7 @@ def tags(path):
 def fba_case(d, cid, rec):
     """FluxBalanceSteadyState: te.fba on the newest level, compared like a time course row."""
     import numpy as np
-    import tellurium as te
+    import tellurium_nitro as te
     st = {k.strip(): v.strip() for k, v in (l.split(':', 1) for l in open(os.path.join(d, cid + '-settings.txt')) if ':' in l)}
     names = [x.strip() for x in st['variables'].split(',') if x.strip()]
     atol, rtol = float(st['absolute']), float(st['relative'])
@@ -56,7 +56,7 @@ def fba_case(d, cid, rec):
 
 def run_case(root, cid):
     import numpy as np
-    import tellurium as te
+    import tellurium_nitro as te
     d = os.path.join(root, cid)
     rec = dict(id=cid, **tags(os.path.join(d, cid + '-model.m')))
     if 'FluxBalanceSteadyState' in rec.get('testType', []):

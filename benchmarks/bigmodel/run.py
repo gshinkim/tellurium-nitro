@@ -5,7 +5,7 @@ python benchmarks/bigmodel/run.py
 import os
 import time
 import numpy as np
-import tellurium as te
+import tellurium_nitro as te
 
 MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'synthetic_1000_species.ant')
 

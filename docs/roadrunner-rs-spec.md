@@ -9,7 +9,7 @@ references below are relative to that tree's root.
 ## 1. Goal, non-goals, baseline, targets
 
 ### Goal
-A Rust SBML simulation engine, exposed to Python as `roadrunner_rs`, that:
+A Rust SBML simulation engine, exposed to Python as `roadrunner_nitro`, that:
 1. Is numerically equivalent to libRoadRunner (within the tolerances in §6) for everything tellurium uses.
 2. Is as fast as the hardware allows: no redundant work, exact derivatives, all CPU cores, SIMD where it pays, optional GPU for large batched linear algebra.
 3. Can replace `roadrunner.RoadRunner` in tellurium behind a compatibility layer (§4.10), one API group at a time.
@@ -87,13 +87,13 @@ The Rust design must be share-nothing per sample: an immutable `Arc<CompiledMode
 ### 2.3 Why `steadyState` and MCA are slow (concrete evidence)
 
 **A. `steadyState()` recompiles the model twice per call when `conservedMoietyAnalysis` is off.**
-Off is the default for `te.loada`, `tellurium/tellurium.py:539`.
+Off is the default for `te.loada`, `tellurium_nitro/tellurium.py:539`.
 - `auto_moiety_analysis` defaults to `true` (`source/SteadyStateSolver.cpp:44`).
 - When it is true and moiety conversion is off, `steadyState` calls `setConservedMoietyAnalysis(true)` (`rrRoadRunner.cpp:1772`). If the model has 0 moieties it then calls `setConservedMoietyAnalysis(false)` (`:1775`). Otherwise it restores the old setting after the solve (`:1864`).
 - Every `setConservedMoietyAnalysis` sets `RECOMPILE` and calls `regenerateModel(true)` (`rrRoadRunner.cpp:1890-1897`).
 - `LLVMModelGenerator::regenerateModel` (`source/llvm/LLVMModelGenerator.cpp:278-294`) builds a fresh `ModelGeneratorContext` with no cache lookup. That means libsbml moiety conversion (`ModelGeneratorContext.cpp:121-150`), `doc->toSBML()` plus MD5, full LLVM codegen and JIT. It also clones the SBML document (`rrRoadRunner.cpp:1894`).
 - Net effect: two full model builds per `steadyState()`. `getUnscaledConcentrationControlCoefficientMatrix` calls `steadyState()` once or twice (`:4884-4885`), so FCC and CCC pay the same cost again.
-- *Verify first:* time `steadyState()` with `r.conservedMoietyAnalysis=True` set beforehand, or with `r.steadyStateSolver.auto_moiety_analysis=False`. If the 0.24 s falls by an order of magnitude, A dominates. This is also a zero-code speedup for the roadrunner fallback in `tellurium/analysis/gpu.py:_init_worker`.
+- *Verify first:* time `steadyState()` with `r.conservedMoietyAnalysis=True` set beforehand, or with `r.steadyStateSolver.auto_moiety_analysis=False`. If the 0.24 s falls by an order of magnitude, A dominates. This is also a zero-code speedup for the roadrunner fallback in `tellurium_nitro/analysis/gpu.py:_init_worker`.
 
 **B. NLEQ2 uses a finite-difference Jacobian.**
 - `NLEQ2(&n, &ModelFunction, NULL, …)` (`rrNLEQ2Interface.cpp:214-216`) passes `JAC = NULL`, so NLEQ2 builds J by numerical differencing: n extra RHS evaluations per Jacobian.
@@ -151,7 +151,7 @@ Counted with `grep` over `tellurium/**/*.py`, including SED-ML codegen templates
 | 1–2 | `getUnscaledElasticityMatrix`, `getScaledFluxControlCoefficientMatrix`, `getScaledConcentrationControlCoefficientMatrix`, `getLinkMatrix`, `getReducedStoichiometryMatrix`, `getSteadyStateValuesNamedArray`, `steadyStateNamedArray`, `getConservedMoietyValues`, `getNum*`, `getKineticLaw`, `addReaction`, `setSteadyStateSolver`, `gillespie`, `plot` |
 | 4 | `roadrunner.Config.LOADSBMLOPTIONS_RECOMPILE` |
 
-The heavy users are `tellurium/tellurium.py`, `tellurium/roadrunner/extended_roadrunner.py`, `tellurium/sedml/tesedml.py`, `tellurium/analysis/{gpu,parameterscan,sensitivityanalysis,bifurcation,parameterestimation,simulator,stochasticmodel}.py`, `tellurium/utils/{misc,uncertainty}.py`, and `tellurium/notebooks/parameterslider.py`.
+The heavy users are `tellurium_nitro/tellurium.py`, `tellurium_nitro/roadrunner/extended_roadrunner.py`, `tellurium_nitro/sedml/tesedml.py`, `tellurium_nitro/analysis/{gpu,parameterscan,sensitivityanalysis,bifurcation,parameterestimation,simulator,stochasticmodel}.py`, `tellurium_nitro/utils/{misc,uncertainty}.py`, and `tellurium_nitro/notebooks/parameterslider.py`.
 
 ---
 
@@ -184,8 +184,8 @@ rrs/
     rr-stoch/       Gillespie direct / next-reaction / tau-leap
     rr-mca/         elasticities, CCC/FCC, parameter sensitivities, eigenvalues
     rr-batch/       rayon drivers, SoA/SIMD ensemble kernels, optional GPU (wgpu/cuda) [features]
-    rr-py/          PyO3 + numpy bindings (crate name `roadrunner_rs`)
-  python/roadrunner_rs/compat.py   RoadRunner-compatible facade, NamedArray
+    rr-py/          PyO3 + numpy bindings (crate name `roadrunner_nitro`)
+  python/roadrunner_nitro/compat.py   RoadRunner-compatible facade, NamedArray
 ```
 YAGNI: start with `rr-ir`, `rr-codegen` (tape only), `rr-solve`, `rr-mca` and `rr-py`. Split the other crates out only when their code exists.
 
@@ -325,14 +325,14 @@ Notes:
 - PyO3 (abi3, py ≥ 3.9) plus `numpy` crate. Zero-copy output: allocate the `PyArray` and fill it in Rust. Release the GIL (`py.allow_threads`) around every solve.
 - Native API (fast path, already started in `rrs/`):
   ```python
-  m = roadrunner_rs.Model.from_sbml(sbml) | from_roadrunner(r)   # compile once
+  m = roadrunner_nitro.Model.from_sbml(sbml) | from_roadrunner(r)   # compile once
   m.species, m.reactions, m.parameters, m.conservation() -> (Nr, L, T)
   m.steady_state_batch(keys, vals[B,k], threads=None) -> (S[B,n], v[B,R], E[B,R,n], ok[B])
   m.mca_batch(keys, vals, threads=None) -> dict(ccc, fcc, elasticities, uccc, ufcc, ok)
   m.simulate_batch(keys, vals, t[T], selections, threads=None) -> [B,T,len(sel)]
   m.ssa_ensemble(n, t, selections, seed) -> [n,T,len(sel)]
   ```
-- Compat facade `roadrunner_rs.compat.RoadRunner(sbml_or_antimony_sbml)`:
+- Compat facade `roadrunner_nitro.compat.RoadRunner(sbml_or_antimony_sbml)`:
   - Mirrors the API surface in §2.4, the dynamic attributes (`r.k1`, `r['[S1]']`, `r['init(S1)']`, `r.S1 = …`), and `NamedArray` results (reuse `roadrunner.NamedArray` if importable, otherwise a small `ndarray` subclass with `rownames`/`colnames`).
   - Also: `.integrator` / `.steadyStateSolver` objects with `setValue`/`getValue`/attribute access; `simulate(start, end, points, selections, steps, times)`; `timeCourseSelections`; `steadyStateSelections`; `conservedMoietyAnalysis` (runtime toggle, no recompile); `getCurrentSBML()`.
   - `getCurrentSBML()` writes the current values into the stored libsbml document in Python.
@@ -403,15 +403,15 @@ Notes:
    - Structural invariants on random integer N.
    - Newton on known analytic steady states.
    - LU batched kernel vs `faer`.
-2. **Golden tests vs roadrunner** (Python, `pytest`, `tellurium/tests/rrs/`, roadrunner as oracle):
-   - Corpus: models in `roadrunner-src/test/models/**` (ModelAnalysis, SBMLFeatures, BioModelsTiming: 4 BioModels), `tellurium/tests` models, the 40-species benchmark model, and a set of ≥ 50 BioModels curated with steady states.
+2. **Golden tests vs roadrunner** (Python, `pytest`, `tellurium_nitro/tests/rrs/`, roadrunner as oracle):
+   - Corpus: models in `roadrunner-src/test/models/**` (ModelAnalysis, SBMLFeatures, BioModelsTiming: 4 BioModels), `tellurium_nitro/tests` models, the 40-species benchmark model, and a set of ≥ 50 BioModels curated with steady states.
    - For each model: RHS at random states; steady state; E; CCC/FCC; `getFullJacobian`; `getReducedJacobian`; eigenvalues; `simulate(0, 100, 101)`.
 3. **SBML Test Suite:**
    - `roadrunner-src/test/sbml-test-suite/semantic/` has 1824 cases. Each has `*-sbml-l3v2.xml`, `*-results.csv` and `*-settings.txt`.
    - `stochastic/` has 102 cases.
    - Track pass counts per phase. The target is roadrunner's pass set: run roadrunner over the same cases once to produce `sts_roadrunner_pass.txt`, then diff.
 4. **MCA comparison:** `te.controlCoefficients` on 1000 samples. The Rust and roadrunner paths must agree per §6.1, and `ok` masks must agree on ≥ 99 %. Investigate every disagreement, because these are often roadrunner FD failures near zero flux.
-5. **tellurium test suite:** `pytest tellurium/tests` with `TELLURIUM_ENGINE=rs` (phase 5 gate).
+5. **tellurium test suite:** `pytest tellurium_nitro/tests` with `TELLURIUM_ENGINE=rs` (phase 5 gate).
 6. **Determinism:** batch results must be bit-identical across thread counts (1, 2, N) and across runs.
 
 ### 6.3 Benchmark plan
@@ -432,12 +432,12 @@ Notes:
 
 | phase | scope | exit criteria |
 |---|---|---|
-| **0 — hot-path engine** (in progress in `rrs/`, crate `roadrunner_rs`) | Python-bridge import (`rrs_bridge.from_roadrunner`); tape plus forward AD; Newton with conservation laws; Rosenbrock presimulation; exact E; MCA batch; rayon | (a) `te.controlCoefficients` on the 40-species model: Rust and roadrunner agree per §6.1; (b) ≥ 300× single-thread speedup per sample vs the §1 baseline; ≥ 0.85·cores scaling at B=1024; (c) unsupported models raise `NotImplementedError` and fall back cleanly (already wired in `tellurium/analysis/gpu.py:139-148`) |
+| **0 — hot-path engine** (in progress in `rrs/`, crate `roadrunner_nitro`) | Python-bridge import (`rrs_bridge.from_roadrunner`); tape plus forward AD; Newton with conservation laws; Rosenbrock presimulation; exact E; MCA batch; rayon | (a) `te.controlCoefficients` on the 40-species model: Rust and roadrunner agree per §6.1; (b) ≥ 300× single-thread speedup per sample vs the §1 baseline; ≥ 0.85·cores scaling at B=1024; (c) unsupported models raise `NotImplementedError` and fall back cleanly (already wired in `tellurium_nitro/analysis/gpu.py:139-148`) |
 | **1 — steady-state & MCA API parity** | `steadyState`, `getFullJacobian`, `getReducedJacobian`, eigenvalues, all `get{Un,}Scaled*` matrices, `getEE`/`getuEE`/`getCC`/`getuCC`, structural getters with roadrunner labels; MCA cache (§4.8); initial assignments; Cranelift backend | golden tests pass on the corpus; `getCC` ≥ 10⁴× faster than roadrunner's 4-SS FD; Cranelift RHS ≥ 3× faster than tape |
 | **2 — simulate parity** | pure-Rust L3V2 parser (§4.2 B); rate and assignment rules on all variable kinds; variable compartments; conversion factors; BDF (sundials-sys or diffsol) plus RK4/RK45/Euler; dense output; selections; `simulate` in the compat facade | ≥ 95 % of roadrunner's STS pass set on non-event cases; `simulate` ≥ 5× faster than roadrunner on BioModelsTiming; batch simulate scales ≥ 0.85·cores |
 | **3 — events & discontinuities** | full event semantics (§4.10), piecewise root finding, `rateOf`, variable stoichiometry | 100 % of roadrunner's STS pass set (semantic); event-heavy BioModels match time courses within §6.1 |
 | **4 — stochastic, sensitivities, misc** | SSA plus tau-leap, ensembles, `distrib`, constraints, forward sensitivities (`timeSeriesSensitivities`) | STS stochastic suite passes at roadrunner parity; sensitivities vs CVODES within rtol 1e-4 |
-| **5 — full tellurium drop-in** | compat facade complete for §2.4; model editing via the libsbml round-trip; `engine='rs'` switch; SED-ML (`tesedml.py`) runs | `pytest tellurium/tests` green with `TELLURIUM_ENGINE=rs`; all tellurium notebooks/examples run; documented gaps list |
+| **5 — full tellurium drop-in** | compat facade complete for §2.4; model editing via the libsbml round-trip; `engine='rs'` switch; SED-ML (`tesedml.py`) runs | `pytest tellurium_nitro/tests` green with `TELLURIUM_ENGINE=rs`; all tellurium notebooks/examples run; documented gaps list |
 | 6 (stretch) | DAE (algebraic rules), `delay` csymbol (DDE), GPU lockstep ensembles, AOT backend | each feature passes its STS cases |
 
 ---
@@ -459,4 +459,4 @@ Notes:
 | 11 | Open: should `conservedMoietyAnalysis=False` with a singular Jacobian auto-reduce (as roadrunner does), or warn? | proposal: always reduce internally (free at runtime); report full-space results |
 | 12 | Open: do we need roadrunner's `steadyState()` return value semantics (residual norm) and its throw-on-failure? | compat layer: yes; native batch API: `ok` mask plus residuals |
 | 13 | Open: thread-count default on Apple (P-cores only vs all) | benchmark; default to P-cores |
-| 14 | `rrs/` is untracked work in progress and `tellurium/analysis/rrs_bridge.py` does not exist yet (as of this spec) | phase 0 owner lands them; this spec assumes the API used by `gpu.py:139-162` (`from_roadrunner`, `mca_batch`, `steady_state_batch`, `conservation`, `species`, `reactions`) |
+| 14 | `rrs/` is untracked work in progress and `tellurium_nitro/analysis/rrs_bridge.py` does not exist yet (as of this spec) | phase 0 owner lands them; this spec assumes the API used by `gpu.py:139-162` (`from_roadrunner`, `mca_batch`, `steady_state_batch`, `conservation`, `species`, `reactions`) |

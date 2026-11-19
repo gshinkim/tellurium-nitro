@@ -14,7 +14,7 @@ import sys
 import time
 
 import numpy as np
-import tellurium as te
+import tellurium_nitro as te
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.environ.get('BENCH_REF') == '1'  # high-precision reference run (plain roadrunner, tight tolerances)
