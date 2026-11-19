@@ -34,6 +34,7 @@ extern "C" fn asin(a: f64) -> f64 { a.asin() }
 extern "C" fn acos(a: f64) -> f64 { a.acos() }
 extern "C" fn atan(a: f64) -> f64 { a.atan() }
 extern "C" fn fact(a: f64) -> f64 { crate::expr::factorial(a) }
+extern "C" fn rnd(k: f64, a: f64, b: f64, c: f64, d: f64) -> f64 { crate::rand::draw(k as u8, a, b, c, d) }
 
 /// Compile `ins` (as in `Tape::ins`); registers in `outs` that `ins` writes are stored back.
 pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
@@ -53,7 +54,7 @@ pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
     let mut fctx = FunctionBuilderContext::new();
     {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let (s1, s2) = (b.import_signature(sig(1)), b.import_signature(sig(2)));
+        let (s1, s2, s5) = (b.import_signature(sig(1)), b.import_signature(sig(2)), b.import_signature(sig(5)));
         let blk = b.create_block();
         b.append_block_params_for_function_params(blk);
         b.switch_to_block(blk);
@@ -69,7 +70,7 @@ pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
                 ($f:expr, $($a:expr),+) => {{
                     let args = [$(r(&mut b, $a)),+];
                     let p = b.ins().iconst(ptr, $f as usize as i64);
-                    let c = b.ins().call_indirect(if args.len() == 1 { s1 } else { s2 }, p, &args);
+                    let c = b.ins().call_indirect(match args.len() { 1 => s1, 2 => s2, _ => s5 }, p, &args);
                     b.inst_results(c)[0]
                 }};
             }
@@ -105,6 +106,13 @@ pub fn compile(ins: &[(u32, Op)], outs: &[u32], nregs: usize) -> Option<Jit> {
                 Acos(a) => call!(acos as extern "C" fn(f64) -> f64, a),
                 Atan(a) => call!(atan as extern "C" fn(f64) -> f64, a),
                 Fact(a) => call!(fact as extern "C" fn(f64) -> f64, a),
+                Rand(k, _, x, y, lo, hi) => {
+                    let kc = b.ins().f64const(k as f64);
+                    let args = [kc, r(&mut b, x), r(&mut b, y), r(&mut b, lo), r(&mut b, hi)];
+                    let p = b.ins().iconst(ptr, rnd as extern "C" fn(f64, f64, f64, f64, f64) -> f64 as usize as i64);
+                    let c = b.ins().call_indirect(s5, p, &args);
+                    b.inst_results(c)[0]
+                }
                 Sqrt(a) => { let a = r(&mut b, a); b.ins().sqrt(a) }
                 Abs(a) => { let a = r(&mut b, a); b.ins().fabs(a) }
                 Floor(a) => { let a = r(&mut b, a); b.ins().floor(a) }

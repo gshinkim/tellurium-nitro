@@ -35,6 +35,25 @@ _OUT = libsbml.L3ParserSettings()
 _OUT.setParseUnits(False)  # no '1 dimensionless' in formulas
 
 
+def _fix_divide(ast):
+    """libsbml's ASTNode.derivative writes the quotient rule's u * v' / v^2 term as a 3-argument divide
+    (-1, u * v', v^2), which means -1 * u * v' / v^2 and has no infix form: rebuild it as (a * b) / c."""
+    if ast is None:
+        return None
+    for i in range(ast.getNumChildren()):
+        _fix_divide(ast.getChild(i))
+    if _type(ast) == libsbml.AST_DIVIDE and ast.getNumChildren() == 3:
+        t = libsbml.ASTNode(libsbml.AST_TIMES)
+        t.addChild(ast.getChild(0).deepCopy())
+        t.addChild(ast.getChild(1).deepCopy())
+        c = ast.getChild(2).deepCopy()
+        while ast.getNumChildren():
+            ast.removeChild(0)
+        ast.addChild(t)
+        ast.addChild(c)
+    return ast
+
+
 def _l3(ast):
     """Infix text; constants spelled so no model id can shadow them (a parameter may be called INF or pi)."""
     def plain(a):
@@ -206,7 +225,7 @@ def _compile(m, om, rows, reactions, Nm, conc, val, sref, info, dae=(), pre=None
         if t == libsbml.AST_NAME_AVOGADRO:
             return libsbml.parseL3Formula(repr(ast.getReal()))
         if t == libsbml.AST_NAME_TIME:
-            return _name('time')
+            return _name('__time__')  # the clock, even when a model id is named 'time'
         if t == libsbml.AST_FUNCTION_RATE_OF:
             return _name('__rateof__' + ast.getChild(0).getName())
         if t == libsbml.AST_FUNCTION_DELAY:  # a parameter the engine refills with the delayed value
@@ -217,9 +236,6 @@ def _compile(m, om, rows, reactions, Nm, conc, val, sref, info, dae=(), pre=None
                 params[delays[key]] = 0.0
                 known.add(delays[key])
             return _name(delays[key])
-        if libsbml.AST_DISTRIB_FUNCTION_NORMAL <= t <= libsbml.AST_DISTRIB_FUNCTION_RAYLEIGH:
-            # ponytail: roadrunner draws a fresh random number per evaluation; add an RNG op if needed
-            raise NotImplementedError("distrib random function %s()" % ast.getName())
         if t == libsbml.AST_NAME and ast.getName() in kl_math:
             return kinetic(ast.getName())
         out = ast.deepCopy()
@@ -279,7 +295,7 @@ def _compile(m, om, rows, reactions, Nm, conc, val, sref, info, dae=(), pre=None
                     ast.replaceIDWithFunction(v, new)
         raise ValueError("cyclic assignment rules")
 
-    known = floating | set(params) | {'time'}
+    known = floating | set(params) | {'time', '__time__'}
 
     def formula(math, what):
         ast = inline(expand(math))
@@ -314,10 +330,10 @@ def _compile(m, om, rows, reactions, Nm, conc, val, sref, info, dae=(), pre=None
                 return '(%s) * %s + %s * (%s)' % (dconc(x), V, x, rate_of(comp_of[x]))
             if x in rules:  # total time derivative of the rule expression
                 e = inline(expand(rules[x]))
-                ds = [(e.derivative(v), v) for v in _names(e, set())]
+                ds = [(_fix_divide(e.derivative(v)), v) for v in _names(e, set())]
                 if any(d is None for d, _ in ds):
                     raise NotImplementedError("rateOf(%s): libsbml cannot differentiate its assignment rule" % x)
-                terms = [_l3(d) + ('' if v == 'time' else ' * __rateof__' + v) for d, v in ds]
+                terms = ['(%s)' % _l3(d) + ('' if v == '__time__' else ' * __rateof__' + v) for d, v in ds]
                 return formula(libsbml.parseL3Formula(' + '.join(terms) or '0'), "rateOf(%s)" % x)
             return '0'
         return lazy(('d', x), f)
@@ -430,6 +446,29 @@ _REL = {_A.AST_RELATIONAL_EQ: np.equal, _A.AST_RELATIONAL_NEQ: np.not_equal, _A.
         _A.AST_RELATIONAL_LT: np.less, _A.AST_RELATIONAL_GEQ: np.greater_equal, _A.AST_RELATIONAL_LEQ: np.less_equal}
 
 
+_RNG = np.random.default_rng()
+
+
+def _draw(name, a):
+    """One distrib draw (as the engine's rand::draw; trailing two arguments = truncation bounds)."""
+    g = _RNG
+    one = {'cauchy': 1, 'laplace': 1}.get(name) if len(a) in (1, 3) else None
+    npar = 1 if one or name in ('exponential', 'poisson', 'bernoulli', 'chisquare', 'rayleigh') else 2
+    lo, hi = (a[npar], a[npar + 1]) if len(a) == npar + 2 else (-np.inf, np.inf)
+    p = ([0.0] + a[:1]) if one else a[:npar]
+    f = {'normal': lambda: g.normal(p[0], p[1]), 'uniform': lambda: g.uniform(p[0], p[1]),
+         'exponential': lambda: g.exponential(1 / p[0]), 'gamma': lambda: g.gamma(p[0], p[1]),
+         'poisson': lambda: g.poisson(p[0]), 'binomial': lambda: g.binomial(int(round(p[0])), p[1]),
+         'bernoulli': lambda: g.binomial(1, p[0]), 'cauchy': lambda: p[0] + p[1] * g.standard_cauchy(),
+         'chisquare': lambda: g.chisquare(p[0]), 'laplace': lambda: g.laplace(p[0], p[1]),
+         'lognormal': lambda: g.lognormal(p[0], p[1]), 'rayleigh': lambda: g.rayleigh(p[0])}[name]
+    for _ in range(1000000):
+        x = float(f())
+        if lo <= x <= hi:
+            return np.float64(x)
+    return np.float64(np.nan)
+
+
 def evaluate(ast, get, fdefs):
     """Value of a libsbml AST at time 0; names through get(name). NotImplementedError if unsupported."""
     if ast.isConstant():  # by name: libsbml's SWIG binding can return an unusable type for pi
@@ -487,6 +526,8 @@ def evaluate(ast, get, fdefs):
             return (min if t == _A.AST_FUNCTION_MIN else max)(e(i) for i in range(n))
         if t == _A.AST_FUNCTION_RATE_OF:
             return np.float64(get('__rateof__' + ast.getChild(0).getName()))
+        if _A.AST_DISTRIB_FUNCTION_NORMAL <= t <= _A.AST_DISTRIB_FUNCTION_RAYLEIGH:  # a fresh draw
+            return _draw(ast.getName(), [e(i) for i in range(n)])
         if t == _A.AST_FUNCTION_DELAY:  # before the start, every value is its initial one
             return e(0)
         if t == _A.AST_FUNCTION_PIECEWISE:
@@ -607,16 +648,30 @@ def _left_null(rows, cols, a):
     return basis, len(piv)
 
 
-def _fast_to_algebraic(m, pre=None):  # returns the fast species, which the new algebraic rules determine
-    """SBML fast reactions are at equilibrium at every instant. Rewrite them as: a rate-rule parameter
-    per conserved total of the fast species' amounts (driven by the slow reactions), algebraic rules
-    v_fast = 0 and sum(l_i n_i) = total, and the fast species as boundary species (rule-set)."""
+def _fresh_param(m, stem):
+    """Id of a new non-constant parameter, named stem (plus underscores if taken)."""
+    i = stem
+    while m.getElementBySId(i) is not None:
+        i += '_'
+    p = m.createParameter()
+    p.setId(i)
+    p.setConstant(False)
+    return i
+
+
+def _fast_to_algebraic(m, pre=None):  # returns the fast reactions' extents, which the new algebraic rules determine
+    """SBML fast reactions are at equilibrium at every instant. Write each fast species' amount (over its
+    conversion factor) as base + sum_j n_j * extent_j: base a rate-rule parameter the slow reactions drive,
+    extent_j fast reaction j's extent, determined by an algebraic rule v_j = 0. The fast species become
+    boundary species set by assignment rules. Stoichiometries may be symbolic (stoichiometryMath, rules,
+    events) as long as they only jump: an event that assigns a fast species or a stoichiometry moves the
+    bases so the amounts take the assigned values, and the fast reactions re-equilibrate from there."""
     fast = [rx for rx in m.getListOfReactions() if rx.getFast()]
     if not fast:
         return set()
     # a fast reaction whose rate is 0 for any values (e.g. k * A * ln(1)) never moves anything: drop it
     rng = np.random.default_rng(2)
-    fd = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
+    fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
     rnd = {}
     dead = set()
     for rx in fast:
@@ -624,7 +679,7 @@ def _fast_to_algebraic(m, pre=None):  # returns the fast species, which the new 
         if kl is None or kl.getMath() is None:
             continue
         try:
-            vals = [evaluate(kl.getMath(), lambda x: rnd.setdefault(x, rng.uniform(0.5, 2.0)), fd) for _ in range(2)]
+            vals = [evaluate(kl.getMath(), lambda x: rnd.setdefault(x, rng.uniform(0.5, 2.0)), fdefs) for _ in range(2)]
         except NotImplementedError:
             continue
         if all(v == 0 for v in vals):
@@ -644,16 +699,18 @@ def _fast_to_algebraic(m, pre=None):  # returns the fast species, which the new 
                 x = sr.getSpecies()
                 if not sp[x].getBoundaryCondition() and not sp[x].getConstant() and x not in fs:
                     fs.append(x)
-    fdefs = {f.getId(): f.getMath() for f in m.getListOfFunctionDefinitions() if f.getMath() is not None}
     ias = {a.getSymbol(): a for a in m.getListOfInitialAssignments()}
-    moving = {r.getVariable() for r in m.getListOfRules()} | \
-        {a.getVariable() for ev in m.getListOfEvents() for a in ev.getListOfEventAssignments()}
+    asg = {r.getVariable(): r.getMath() for r in m.getListOfRules() if r.isAssignment()}
+    targets = {a.getVariable() for ev in m.getListOfEvents() for a in ev.getListOfEventAssignments()}
+    moving = {r.getVariable() for r in m.getListOfRules()} | targets
 
-    def const(x):  # value of a symbol fixed for the whole run (stoichiometries, conversion factors)
-        if x in moving:
-            raise NotImplementedError("fast reaction with stoichiometry or conversion factor %s that changes" % x)
+    def val0(x):  # initial value of a symbol a stoichiometry uses; it may jump (events) but not drift
+        if x in moving and x not in asg and x not in targets:
+            raise NotImplementedError("fast reaction with stoichiometry %s that changes continuously" % x)
+        if x in asg:
+            return float(evaluate(asg[x], val0, fdefs))
         if x in ias:
-            return float(evaluate(ias[x].getMath(), const, fdefs))
+            return float(evaluate(ias[x].getMath(), val0, fdefs))
         e = m.getElementBySId(x)
         if isinstance(e, libsbml.SpeciesReference):
             return e.getStoichiometry() if e.isSetStoichiometry() else 1.0
@@ -662,24 +719,32 @@ def _fast_to_algebraic(m, pre=None):  # returns the fast species, which the new 
         if isinstance(e, libsbml.Compartment) and e.isSetSize():
             return e.getSize()
         raise NotImplementedError("fast reaction: no constant value for %s" % x)
-    if any(sr.isSetStoichiometryMath() for rx in m.getListOfReactions()
-           for lst in (rx.getListOfReactants(), rx.getListOfProducts()) for sr in lst if sr.getSpecies() in fs):
-        raise NotImplementedError("fast reaction with stoichiometryMath")
 
-    def n(rx, x):  # net stoichiometry of species x in reaction rx
-        return sum(sg * (const(sr.getId()) if sr.isSetId() else sr.getStoichiometry())
-                   for sg, lst in ((-1, rx.getListOfReactants()), (1, rx.getListOfProducts()))
-                   for sr in lst if sr.getSpecies() == x)
+    def stoich(sr):  # a species reference's stoichiometry, as a formula
+        if sr.isSetStoichiometryMath() and sr.getStoichiometryMath().getMath() is not None:
+            return '(%s)' % _l3(sr.getStoichiometryMath().getMath())
+        if sr.isSetId() and (sr.getId() in moving or sr.getId() in ias):
+            return sr.getId()
+        return repr(sr.getStoichiometry() if sr.isSetStoichiometry() else 1.0)
+
+    def ns(rx, x):  # net stoichiometry of species x in reaction rx, as a formula ('' if none)
+        return ' + '.join('%d * %s' % (sg, stoich(sr))
+                          for sg, lst in ((-1, rx.getListOfReactants()), (1, rx.getListOfProducts()))
+                          for sr in lst if sr.getSpecies() == x)
+
+    def n(rx, x):  # its initial value
+        f = ns(rx, x)
+        return float(evaluate(libsbml.parseL3Formula(f), val0, fdefs)) if f else 0.0
 
     def cf(x):  # conversion factor id of species x, or None
         return sp[x].getConversionFactor() if sp[x].isSetConversionFactor() else (m.getConversionFactor() or None)
     for x in fs:
-        if cf(x):
-            const(cf(x))
-    basis, rank = _left_null(len(fs), len(fast), [[n(rx, x) for rx in fast] for x in fs])
+        if cf(x) and cf(x) in moving:
+            raise NotImplementedError("fast reaction with conversion factor %s that changes" % cf(x))
+    _, rank = _left_null(len(fs), len(fast), [[n(rx, x) for rx in fast] for x in fs])
     if rank < len(fast):
         raise NotImplementedError("dependent fast reactions")
-    # amounts over the conversion factor: reactions change these by n * rate, so totals are conserved
+    # amounts over the conversion factor: reactions change these by n * rate
     amt = {x: (x if sp[x].getHasOnlySubstanceUnits() else '%s * %s' % (x, sp[x].getCompartment()))
            + (' / %s' % cf(x) if cf(x) else '') for x in fs}
 
@@ -693,73 +758,123 @@ def _fast_to_algebraic(m, pre=None):  # returns the fast species, which the new 
         else:
             v = '%s * %s' % (repr(s.getInitialConcentration() if s.isSetInitialConcentration() else 0.0), c)
         return '(%s) / %s' % (v, cf(x)) if cf(x) else v
+
+    def conc_from(x, u):  # species value (SBML units) from an amount over the conversion factor
+        a = '(%s) * %s' % (u, cf(x)) if cf(x) else u
+        return a if sp[x].getHasOnlySubstanceUnits() else '(%s) / %s' % (a, sp[x].getCompartment())
+
+    xi = {rx.getId(): _fresh_param(m, '__fast_extent_%s' % rx.getId()) for rx in fast}
+    base = {x: _fresh_param(m, '__fast_base_%s' % x) for x in fs}
     slow = [rx for rx in m.getListOfReactions() if not rx.getFast()]
-    for k, y in enumerate(basis):
-        tid = '__fast_total_%d' % k
-        while m.getElementBySId(tid) is not None:
-            tid += '_'
-        p = m.createParameter()
-        p.setId(tid)
-        p.setConstant(False)
-        tot = ' + '.join('(%s) * (%s)' % (float(c), amt[x]) for c, x in zip(y, fs) if c)
+    now = {}  # fast species -> its amount (over the conversion factor): base + extents
+    for x in fs:
         ia = m.createInitialAssignment()
-        ia.setSymbol(tid)
-        ia.setMath(libsbml.parseL3Formula(' + '.join('(%s) * (%s)' % (float(c), amt0(x)) for c, x in zip(y, fs) if c)))
-        d = ' + '.join('(%s) * %s' % (float(c * n(rx, x)), rx.getId()) for rx in slow for c, x in zip(y, fs) if c and n(rx, x))
+        ia.setSymbol(base[x])
+        ia.setMath(libsbml.parseL3Formula(amt0(x)))
         rr = m.createRateRule()
-        rr.setVariable(tid)
-        rr.setMath(libsbml.parseL3Formula(d or '0'))
-        ar = m.createAlgebraicRule()
-        ar.setMath(libsbml.parseL3Formula('%s - %s' % (tot, tid)))
-    for rx in fast:
-        ar = m.createAlgebraicRule()
+        rr.setVariable(base[x])
+        rr.setMath(libsbml.parseL3Formula(' + '.join('(%s) * %s' % (ns(rx, x), rx.getId()) for rx in slow if ns(rx, x)) or '0'))
+        now[x] = ' + '.join([base[x]] + ['(%s) * %s' % (ns(rx, x), xi[rx.getId()]) for rx in fast if ns(rx, x)])
+
+    def kinetic(rx):  # kinetic law with local parameters inlined
         kl = rx.getKineticLaw()
         if kl is None or kl.getMath() is None:
             raise NotImplementedError("fast reaction %s without kinetic law" % rx.getId())
         math = kl.getMath().deepCopy()
         for q in list(kl.getListOfParameters()) + list(kl.getListOfLocalParameters()):
             math = _sub(math, q.getId(), repr(q.getValue()))
+        return math
+    for rx in fast:
+        math = kinetic(rx)
+        for x in fs:
+            math = _sub(math, x, conc_from(x, now[x]))
+        ar = m.createAlgebraicRule()
         ar.setMath(math)
     # starting guess where an equilibrium stays a DAE constraint (e.g. k*A*B = 0 has two roots): every
     # fast reaction run to completion in the direction of its initial rate
-    def conc_from(x, u):  # species value (SBML units) from an amount over the conversion factor
-        a = '(%s) * %s' % (u, cf(x)) if cf(x) else u
-        return a if sp[x].getHasOnlySubstanceUnits() else '(%s) / %s' % (a, sp[x].getCompartment())
     conc0 = {x: conc_from(x, amt0(x)) for x in fs}
     if pre is not None:  # delay() before the run sees the values before they equilibrate
         pre.update(conc0)
-    ext = {}
     for rx in fast:
-        v0 = rx.getKineticLaw().getMath().deepCopy()
-        for q in list(rx.getKineticLaw().getListOfParameters()) + list(rx.getKineticLaw().getListOfLocalParameters()):
-            v0 = _sub(v0, q.getId(), repr(q.getValue()))
+        v0 = kinetic(rx)
         for x in fs:
             v0 = _sub(v0, x, conc0[x])
         v0 = _l3(v0)
         lim = lambda sg: ['(%s) / %s' % (amt0(x), abs(n(rx, x))) for x in fs if sg * n(rx, x) < 0]
         fwd, bwd = lim(1), lim(-1)
-        ext[rx.getId()] = 'piecewise(%s, (%s) > 0, %s, (%s) < 0, 0)' % (
-            'min(%s)' % ', '.join(fwd) if fwd else '0', v0, '-min(%s)' % ', '.join(bwd) if bwd else '0', v0)
+        ia = m.createInitialAssignment()
+        ia.setSymbol(xi[rx.getId()])
+        ia.setMath(libsbml.parseL3Formula('piecewise(%s, (%s) > 0, %s, (%s) < 0, 0)' % (
+            'min(%s)' % ', '.join(fwd) if fwd else '0', v0, '-min(%s)' % ', '.join(bwd) if bwd else '0', v0)))
+    # an event that assigns a fast species or a stoichiometry: the amounts jump to their assigned values
+    # (base = amount - N_new * extent), then the fast reactions re-equilibrate from there
+    syms = set(fs) | {y for rx in fast for x in fs if ns(rx, x) for y in _names(libsbml.parseL3Formula(ns(rx, x)), set())}
+    for ev in m.getListOfEvents():
+        eas = {a.getVariable(): a.getMath() for a in ev.getListOfEventAssignments() if a.getVariable() in syms}
+        if not eas:
+            continue
+
+        def new(f):  # f at the assigned values (simultaneous substitution)
+            a = libsbml.parseL3Formula(f)
+            for y in eas:
+                a = _sub(a, y, '__new__' + y)
+            for y in eas:
+                a = _sub(a, '__new__' + y, _l3(eas[y]))
+            return _l3(a)
+        for x in fs:
+            ea = ev.createEventAssignment()
+            ea.setVariable(base[x])
+            ea.setMath(libsbml.parseL3Formula(new(amt[x]) + ''.join(
+                ' - (%s) * %s' % (new(ns(rx, x)), xi[rx.getId()]) for rx in fast if ns(rx, x))))
+        lst = ev.getListOfEventAssignments()
+        for i in reversed([i for i in range(lst.size()) if lst.get(i).getVariable() in fs]):
+            lst.remove(i)
     for x in fs:
         sp[x].setBoundaryCondition(True)
         if x in ias:  # now set by a rule
             m.getListOfInitialAssignments().remove(x)
-        guess = '%s + %s' % (amt0(x), ' + '.join('(%s) * (%s)' % (n(rx, x), ext[rx.getId()]) for rx in fast if n(rx, x)) or '0')
-        ia = m.createInitialAssignment()
-        ia.setSymbol(x)
-        ia.setMath(libsbml.parseL3Formula(conc_from(x, guess)))
+        r = m.createAssignmentRule()
+        r.setVariable(x)
+        r.setMath(libsbml.parseL3Formula(conc_from(x, now[x])))
     ids = {rx.getId() for rx in fast}
     named = [sr for rx in fast for l in (rx.getListOfReactants(), rx.getListOfProducts()) for sr in l if sr.isSetId()]
     lst = m.getListOfReactions()
     keep = [(sr.getId(), sr.getStoichiometry() if sr.isSetStoichiometry() else 1.0) for sr in named]
     for i in reversed([i for i in range(lst.size()) if lst.get(i).getId() in ids]):
         lst.remove(i)
-    for sid, v in keep:  # a named stoichiometry other math may use: kept as a constant parameter
+    for sid, v in keep:  # a named stoichiometry other math may use: kept as a parameter
         p = m.createParameter()
         p.setId(sid)
         p.setValue(v)
         p.setConstant(sid not in moving)
-    return set(fs)
+    return set(xi.values())
+
+
+def _held(m, z, f, d):
+    """Fast-reaction extent z = f solved from v = 0, where an event can switch the reaction off (dv/dz = d
+    becomes 0, e.g. v = k * A with k := 0): then v = 0 holds for any z and the extent stays where it was.
+    A state h tracks f while the reaction runs (rate rateOf(f), reset to f when it switches on) and holds
+    still while it is off; z = (d == 0 ? h : f)."""
+    s, h = _fresh_param(m, '__fast_solved_%s' % z), _fresh_param(m, '__fast_held_%s' % z)
+    r = m.createAssignmentRule()
+    r.setVariable(s)
+    r.setMath(libsbml.parseL3Formula(f))
+    ia = m.createInitialAssignment()  # off at the start: no extent yet
+    ia.setSymbol(h)
+    ia.setMath(libsbml.parseL3Formula('piecewise(0, (%s) == 0, %s)' % (d, s)))
+    r = m.createRateRule()
+    r.setVariable(h)
+    r.setMath(libsbml.parseL3Formula('piecewise(0, (%s) == 0, rateOf(%s))' % (d, s)))
+    ev = m.createEvent()
+    ev.setUseValuesFromTriggerTime(True)
+    t = ev.createTrigger()
+    t.setMath(libsbml.parseL3Formula('(%s) != 0' % d))
+    t.setInitialValue(True)
+    t.setPersistent(True)
+    ea = ev.createEventAssignment()
+    ea.setVariable(h)
+    ea.setMath(libsbml.parseL3Formula(s))
+    return 'piecewise(%s, (%s) == 0, %s)' % (h, d, s)
 
 
 def _algebraic_to_assignment(m, prefer=()):
@@ -787,6 +902,7 @@ def _algebraic_to_assignment(m, prefer=()):
         if not assign(i, set()):
             raise NotImplementedError("algebraic rule %s determines no free symbol" % _l3(alg[i].getMath()))
     var = {i: x for x, i in match.items()}
+    targets = {a.getVariable() for ev in m.getListOfEvents() for a in ev.getListOfEventAssignments()}
     rng = np.random.default_rng(1)
     vals = {}
 
@@ -808,6 +924,9 @@ def _algebraic_to_assignment(m, prefer=()):
         if not linear:  # a true constraint: z stays a state of the DAE
             dae.append((z, _l3(g[i])))
             continue
+        d = '(%s) - (%s)' % (g1, g0)
+        if z in prefer and _names(libsbml.parseL3Formula(d), set()) & targets:
+            f = _held(m, z, f, d)
         sol.append((z, f))
         for k in range(i + 1, len(alg)):  # eliminate z from the rules still to solve
             g[k] = _sub(g[k], z, f)
@@ -879,7 +998,7 @@ def from_sbml(sbml, info=None, base=None):
     if m is None or doc.getNumErrors(libsbml.LIBSBML_SEV_ERROR) or doc.getNumErrors(libsbml.LIBSBML_SEV_FATAL):
         raise ValueError("SBML errors")
     ns = doc.getNamespaces()
-    if any(p in ns.getURI(i) for i in range(ns.getNumNamespaces()) for p in ('/distrib/', '/arrays/')):
+    if any(p in ns.getURI(i) for i in range(ns.getNumNamespaces()) for p in ('/arrays/',)):
         raise NotImplementedError("SBML package")
     pre = {}
     dae = _algebraic_to_assignment(m, prefer=_fast_to_algebraic(m, pre))

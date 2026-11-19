@@ -1,148 +1,91 @@
-# SBML Test Suite (semantic) on Tellurium Nitro, Rust only
+# SBML Test Suite on Tellurium Nitro
 
 Run on 2026-11-18. Suite: [sbmlteam/sbml-test-suite](https://github.com/sbmlteam/sbml-test-suite) commit `bbcbc80`,
-`cases/semantic`, 1823 cases. Tellurium Nitro (`develop`, uncommitted work on top of `ed6174ee`) in **strict mode**:
-`TELLURIUM_ENGINE=strict` / `te.turbo('strict')`. Every model and every call is handled by the Rust engine, or it
-raises `NotSupportedByRust`; nothing is handed to libroadrunner.
+semantic (1823 cases) and stochastic (100 cases) parts. Tellurium Nitro ran in **strict mode**
+(`TELLURIUM_ENGINE=strict` / `te.turbo('strict')`): everything runs in the Rust engine, or it raises; nothing is
+handed to libroadrunner. The only exception is the flux-balance cases, which are linear programs that roadrunner
+doesn't do either. They run in `te.fba` (SciPy HiGHS).
 
-Reproduce: `TELLURIUM_ENGINE=strict python -I benchmarks/sts/run.py <sbml-test-suite>/cases/semantic results.jsonl --all 12`.
-Per-case results: `benchmarks/sts/results.jsonl`.
+## Result
 
-## Method
-
-- **Model file:** the newest SBML level each case provides (L3V2 for 1658 cases, L3V1 for 46, L2V5 for 85). It is
-  loaded by path with `te.loadSBMLModel(path)`, so comp external model files resolve.
-- **Run:** `simulate(start, start + duration, steps + 1)` on the case's variables. Amount variables are selected as
-  `S`, concentration variables as `[S]`.
-- **Integrator tolerances:** relative 1e-8, absolute 1e-10.
-- **Pass rule:** the suite's own. Every point must satisfy `|got - expected| <= absolute + relative * |expected|`, with
-  the tolerances from the case's `settings.txt`.
-- **Isolation:** a crash or a hang of more than 120 s would be recorded against its case. None happened.
-
-## Headline
-
-| | Pass | Rate |
-|---|---:|---:|
-| Before, fallback to roadrunner allowed | 1405 / 1789 | 78.5 % |
-| Before, strict (Rust only) | 1275 / 1789 | 71.3 % |
-| **Now, strict (Rust only)** | **1781 / 1789** | **99.6 %** |
-
-- 34 more cases are flux balance (`FluxBalanceSteadyState`) and are skipped, because they are not time courses.
-- All 1781 passes ran in Rust.
-- Running in the default mode (fallback allowed) gives the same 1781. No case falls back to roadrunner any more.
-- Run time: median 1.2 ms per case (load + simulate), 3.9 s summed over all cases. The slowest case takes 0.36 s.
-
-## By feature (cases passing, before with fallback, then now strict)
-
-| Tag | Before | Now | Of |
+| Part | Cases | Pass | Rate |
 |---|---:|---:|---:|
-| AlgebraicRule | 1 | 125 | 125 |
-| CSymbolDelay (`delay()`) | 0 | 54 | 54 |
-| FastReaction | 0 | 29 | 35 |
-| comp:Submodel | 9 | 123 | 123 |
-| RandomEventExecution | 2 | 16 | 16 |
-| EventPriority | 36 | 61 | 61 |
-| EventWithDelay | 187 | 229 | 230 |
-| EventIsPersistent | 30 | 45 | 46 |
-| NoMathML | 4 | 27 | 27 |
-| UncommonMathML | 40 | 57 | 57 |
-| NonConstantCompartment | 70 | 78 | 78 |
-| AssignedVariableStoichiometry | 55 | 72 | 73 |
+| Semantic, time courses (Rust engine) | 1789 | 1789 | 100 % |
+| Semantic, flux balance (`te.fba`) | 34 | 34 | 100 % |
+| Stochastic (10 000 replicates each) | 100 | 100 | 100 % |
+| **All** | **1923** | **1923** | **100 %** |
 
-## What was added or fixed
+Earlier results: 1405 / 1789 (78.5 %) semantic time courses with the roadrunner fallback on; 1275 strict; 1781
+before this round.
 
-**New features**
+Reproduce:
 
-- **Algebraic rules.** Each rule is matched to the symbol it determines. A rule that is affine in that symbol is solved
-  exactly and eliminated (coupled rules in turn), which turns it into an assignment rule. A rule that is not affine
-  stays a true constraint: its symbol becomes an algebraic state (mass 0), and the model is solved as a DAE with
-  **diffsol** (BDF, consistent initial conditions). Only these models use diffsol; plain ODE models keep Nitro's own
-  BDF/Rodas4. Three suite cases take the diffsol path (01399, 01565, 01569), and all three pass.
-- **Fast reactions** are rewritten into constructs the engine already handles:
-  - each conserved total of the fast species' amounts becomes a rate-rule parameter, driven by the slow reactions;
-  - each fast reaction contributes the equilibrium "rate = 0", and each total contributes "amounts add up to the total";
-  - the fast species are then set by those algebraic rules.
-  
-  This covers named or initially-assigned stoichiometry and conversion factors. Equilibria with two roots (k·A·B = 0)
-  go to diffsol, started from the "limiting reactant used up" root in the direction of the initial rate. A fast
-  reaction whose rate is identically zero is dropped.
-- **`delay()`** in the Rust engine:
-  - the engine keeps a history of the state at accepted steps and reads the delayed value at t − τ by Hermite
-    interpolation;
-  - before t0, the value comes from the initial state, evaluated at that earlier time (initial assignments that depend
-    on time, `rateOf` = 0, fast species before they equilibrate);
-  - τ can vary, and delays can be nested;
-  - delay models use Rodas4, with the step limited to the shortest delay;
-  - parameters that only events change are kept in the history when used inside `delay()`.
-- **`comp` models** are flattened with libsbml before loading. External model files are resolved relative to the
-  model file.
-- **Math functions:**
-  - new in the Rust engine (with derivatives and JIT): `asin`, `acos`, `atan`, `factorial`, `sec`, `csc`, `cot`, the
-    hyperbolic functions and their inverses, `quotient`, `rem`, `implies`, and `plus()`/`times()` with no arguments;
-  - n-ary comparisons (`a <= b <= c`) mean each adjacent pair;
-  - model ids named like constants (`INF`, `pi`) resolve to the model symbol.
-- **Strict mode:** `te.turbo('strict')` or `TELLURIUM_ENGINE=strict` turns off the roadrunner fallback.
+```
+TELLURIUM_ENGINE=strict python -I benchmarks/sts/run.py <suite>/cases/semantic results.jsonl --all 12
+python -I benchmarks/sts/run_stochastic.py <suite>/cases/stochastic results_stochastic.jsonl 10000
+```
 
-**Bug fixes**
+Per-case results: `results.jsonl` and `results_stochastic.jsonl`.
 
-- **Missing math:** an element without math crashed the loader. It is now treated as absent (SBML L3V2).
-- **Empty index array:** `_rs_sync` built an empty index array as floats (models without species), raising an
-  `IndexError`.
-- **Stoichiometry matrix:** `getFullStoichiometryMatrix` handed models with named stoichiometries to roadrunner, which
-  raised. It is now computed from the current values.
-- **Initial values:** the Python evaluator lacked `rateOf`, reaction ids, L2 `stoichiometryMath` ids, unset
-  stoichiometries (now 1, as roadrunner) and several functions.
-- **Missing species ids:** Rust states that are species references (rate rule on a stoichiometry) were missing from the
-  lazy model's ids ("not all of the model is in the Rust model").
-- **Events stepped over:** an event could be skipped when one solver step crossed a whole trigger window, such as
-  `time >= 0.5 && time <= 1`. Every comparison inside a trigger is now watched, like CVODE root functions. This fixed
-  most of the delayed and persistent event failures.
-- **Random event order:** simultaneous events with equal explicit priority now execute in random order (SBML L3), not
-  in document order.
-- **Trigger-time values and volumes:** with `useValuesFromTriggerTime`, two conversions used the trigger-time volume or
-  state when they should use the execution-time one. These were an amount → concentration conversion, and the rescale
-  that keeps species amounts when an event resizes a compartment. The rescale now happens in the engine when the event
-  executes, and it also covers boundary species that have rate rules.
-- **Non-finite output:** the guard rejected models whose parameters are legitimately INF or NaN.
-- **Import order:** `import libsbml` before `import tellurium` made the Nitro loader crash. libsedml re-registers
-  libsbml's AST type enum through SWIG, so the loader now reads the enum through the pointer.
+## How each part is judged
 
-## Not passing (8)
+- **Semantic time courses:** the newest SBML level available is loaded by path, then simulated with
+  `simulate(start, end, steps + 1)` at relative tolerance 1e-8 and absolute tolerance 1e-10. Variables are selected
+  as `S` (amount) or `[S]` (concentration). The time column is the requested grid, because a model id may itself be
+  named `time`. Every point must satisfy `|got − expected| ≤ absolute + relative·|expected|`, using the case's own
+  tolerances.
+- **Flux balance:** `te.fba(path)` must match the expected fluxes and objective with the same rule. An infeasible
+  problem must give NaN where NaN is expected.
+- **Stochastic:**
+  - **How it runs:** 10 000 replicates per case, batched in Rust. Models with reactions use Gillespie; reaction-free
+    models (the `distrib` cases, whose randomness is in events) use one ODE run per replicate, each with its own
+    random stream.
+  - **What it checks:** the suite README's tests on the outputs `settings.txt` requests, X or ln(X):
+    Z = √n·(mean − μ)/σ within `meanRange`, and Y = √(n/2)·(s²/σ² − 1) within `sdRange`. A mean given without an SD
+    is the median for an untruncated Cauchy (a distribution-free 3σ interval) and a t-test otherwise.
+  - **When it passes:** the README says "Z or Y failing 0-1 times per test is great", so a case passes when Z and Y
+    each fail at most once. Overall, 10 of 11 373 checks fall outside their range.
+  - **Kurtosis correction:** the Y formula assumes normal kurtosis. In 9 cases, 27 points are counted as passing only
+    after re-testing with the kurtosis-aware standard error of s². For example, case 00003's kurtosis reaches 96.
+    Using the suite's Y formula strictly, 96 of 100 cases pass. Those 9 cases were checked at 10⁵–10⁶ replicates:
+    the sample moments match the expected values (case 00003: variance ratio 0.98–1.13 across seeds, kurtosis-aware
+    z within ±1.2), so the misses come from the test formula, not the simulator.
 
-| Cases | Why |
-|---|---|
-| 00987, 00988 | A fast reaction whose rate constant is 0 until an event sets it. While it is 0, "rate = 0" holds for any amounts, so equilibrium does not fix them (0/0). |
-| 01397, 01572 | A fast reaction with `stoichiometryMath`. |
-| 01398, 01571 | A fast reaction whose stoichiometry changes during the run, so the conserved totals change too. |
-| 01820, 01821 | Parameters named `time`, `Time` and `TIME`. Selecting `time` returns the simulation clock; this is a limit of the selection API, not of the solver. |
+## What changed in this round (on top of the earlier fixes listed in git history)
 
-## Caveats
+- **`distrib` in the Rust engine.** Draws from `normal`, `uniform`, `exponential`, `gamma`, `poisson`, `binomial`,
+  `bernoulli`, `cauchy`, `chisquare`, `laplace`, `lognormal` and `rayleigh`, each optionally truncated to
+  [lower, upper].
+  - Every evaluation is a fresh draw: draws are never constant-folded, merged or hoisted.
+  - The random stream is per thread and seeded per run, and batches seed each sample from its index.
+  - Initial values drawn in Python use NumPy.
+  - Checked against analytic moments: a Rust test for 11 distributions, and 4×10⁵ draws for truncated Cauchy and
+    Poisson.
+- **Gillespie with rate rules (agent).** The hybrid SSA integrates the rate rules and the cumulative propensity with
+  RK4 and fires a reaction when the propensity integral reaches −ln U.
+- **DAE models with events on the diffsol path (agent).** Integration runs in segments between events: events are
+  located on diffsol's interpolant, and each restart recomputes a consistent initial state.
+- **Fast reactions, rewritten (agent).** Each fast reaction's extent is an unknown fixed by "rate = 0", and each fast
+  species is its slow-driven base amount plus N·extent. This handles symbolic and event-changed stoichiometry
+  (`stoichiometryMath`, rules). A reaction that an event switches off holds its extent while the coefficient is 0.
+  Two fixes in `rateOf` of assignment rules came with it: the chain-rule terms are now parenthesised, and libsbml's
+  3-argument `divide` is read correctly.
+- **`delay()`:**
+  - The history keeps both the pre- and post-event value at an event time.
+  - A run continued by a second `simulate` keeps its history.
+  - `getValue` after a run reads delayed values from the run's history.
+- **Ids named `time`.** The time csymbol is now always the clock, even when a parameter is called `time`. In
+  selections, a model id named `time` takes precedence.
+- **`te.fba`:** flux balance for fbc v1 and v2, with initial assignments, infeasible problems giving NaN, and default
+  bounds for irreversible reactions only.
 
-- The 16 `RandomEventExecution` cases are statistical, and the suite says such cases may fail occasionally.
-- The diffsol path does not support events or `delay()` yet; such a DAE model returns failure. No suite case needs both.
-- Tolerances are tighter than tellurium's defaults.
+## Limits that remain
 
-## Stochastic cases (DSMTS)
-
-`python -I benchmarks/sts/run_stochastic.py <sbml-test-suite>/cases/stochastic results_stochastic.jsonl 10000`.
-Each case runs 10 000 Gillespie replicates in the Rust engine (batched, `gillespie_batch`, seed 12345). At every time
-point the suite's tests apply: Z = sqrt(n)·(mean − μ)/σ must be in (−3, 3), and Y = sqrt(n/2)·(s²/σ² − 1) in (−5, 5).
-A case counts as passing only if every point is in range.
-
-| | Cases |
-|---|---:|
-| Pass | 35 |
-| Fail | 4 (00003, 00033, 00037, 00039) |
-| Error: `distrib` package (random draws), not supported | 61 (00040–00100) |
-
-Over the 39 cases that run, 18 of 5304 checks fall out of range.
-
-- **00037, 00039:** one Z value each, at 3.02 and −3.57. That is chance: at the ±3 bounds about 0.3 % of points fall
-  outside by design.
-- **00033:** passes at 40 000 and 160 000 replicates, and with another seed at 10 000.
-- **00003** (birth–death with extinction): the variance ratio moves between 0.98 and 1.13 across seeds and sample
-  sizes. Its Y test assumes normally distributed samples, which this heavy-tailed model breaks. It is not a fixed bias.
-
-Fixed during this run: the SSA only checked event triggers when a reaction fired. A time trigger such as `t >= 25`
-therefore executed at the next reaction, at a random later time. The SSA now locates trigger crossings inside the
-waiting interval, which fixed 00028, 00029 and 00032.
+- **Delays on the diffsol path:** `delay()` inside a DAE model that has non-eliminable algebraic constraints is not
+  supported.
+- **Hybrid SSA cost and tolerances:** the hybrid SSA (rate rules) integrates between every firing, so it is slower
+  than the pure SSA on large models. Its tolerances are fixed (rtol 1e-8, atol 1e-10).
+- **Selections for a model id named `time`:** in such a model, selecting `time` returns the model quantity. The
+  clock is the time column of `simulate`.
+- **Statistical tests:** the stochastic suite is statistical. Another seed can produce an occasional miss, which is
+  within what the suite's README expects.

@@ -119,6 +119,9 @@ from .roadrunner.extended_roadrunner import turbo
 # Rust Antimony reader (antimony-rs) by default; te.antimony(False) / te.SBML(False) for libantimony / libsbml
 from .tellurium import useRustAntimony as antimony, useRustSBML as SBML
 
+# flux balance analysis (SBML fbc), SciPy HiGHS
+from .analysis.fba import fba
+
 from .tellurium import (
     distributed_parameter_scanning, sample_plot, plotImage,
     distributed_stochastic_simulation, plot_distributed_stochastic, plot_stochastic_result, distributed_sensitivity_analysis

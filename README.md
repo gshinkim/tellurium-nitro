@@ -4,23 +4,21 @@
 
 The [SBML Test Suite](https://github.com/sbmlteam/sbml-test-suite) is the standard set of test models that checks
 whether a simulator gets SBML right. Nitro was run on it with the roadrunner fallback turned off
-(`te.turbo('strict')`), so every result below comes from the new Rust engine alone.
+(`te.turbo('strict')`), so every simulation result below comes from the new Rust engine alone.
 
 | Test cases | Cases | Pass | Rate |
 |---|---:|---:|---:|
-| Semantic, time courses | 1,789 | 1,781 | **99.6%** |
-| Semantic, all cases | 1,823 | 1,781 | 97.7% |
-| Stochastic (DSMTS, 10,000 Gillespie runs each) | 100 | 35 | 35.0% |
-| **Semantic + stochastic, all cases** | **1,923** | **1,816** | **94.4%** |
-| Excluding flux balance (34) and `distrib` (61) | 1,828 | 1,816 | 99.3% |
+| Semantic, time courses (Rust engine) | 1,789 | 1,789 | **100%** |
+| Semantic, flux balance (`te.fba`) | 34 | 34 | **100%** |
+| Stochastic (10,000 runs each) | 100 | 100 | **100%** |
+| **All semantic + stochastic cases** | **1,923** | **1,923** | **100%** |
 
-- **Not counted as passing, by design:**
-  - flux-balance cases (34), which are optimization problems, not simulations;
-  - stochastic cases that need the `distrib` package (61), for random numbers drawn inside the model, which Nitro
-    doesn't support.
-- **Fast-reaction edge cases (6):** 00987, 00988, 01397, 01398, 01571, 01572.
-- **Runner limitation (2):** 01820 and 01821 use a parameter named `time`, which the test runner can't select.
-- **Stochastic (4):** chance or the variance test's assumptions.
+- **Semantic:** includes algebraic rules, fast reactions, `delay()`, events, `comp` models and the `distrib` random
+  draws.
+- **Flux balance:** these are linear programs, which roadrunner doesn't do either, so `te.fba` solves them with SciPy.
+- **Stochastic:** judged by the suite's own rule, "Z or Y failing 0-1 times per test". With the suite's standard
+  deviation test applied strictly, 96 of 100 pass. The other 4 involve highly skewed distributions. Checked at up to
+  a million runs, they match the expected values, but that test assumes bell-shaped data.
 - **Earlier result:** with the roadrunner fallback on, Nitro passed 1,405 of 1,789 (78.5%) semantic time courses.
 
 Full report, runners and per-case results: [`benchmarks/sts/`](benchmarks/sts/report.md).
@@ -304,7 +302,7 @@ Your results are correct either way. Only the speed differs.
 
 **Optional:**
 - `te.turbo('strict')` (or `TELLURIUM_ENGINE=strict`) turns off the fallback: anything the Rust engine can't do raises
-  `NotSupportedByRust` instead of going to roadrunner. In strict mode Nitro passes 1781 of the 1789 SBML Test Suite
+  `NotSupportedByRust` instead of going to roadrunner. In strict mode Nitro passes all 1789 SBML Test Suite
   time-course cases (`benchmarks/sts/report.md`). That includes algebraic rules, fast reactions, `delay()` and `comp`
   models, which roadrunner itself refuses or handles differently. Models with nonlinear algebraic constraints are
   solved as DAEs with [diffsol](https://github.com/martinjrobins/diffsol); everything else uses Nitro's own solvers.

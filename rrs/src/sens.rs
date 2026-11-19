@@ -20,6 +20,7 @@ fn remap(op: Op, f: impl Fn(N) -> N) -> Op {
         Sqrt(a) => Sqrt(f(a)), Abs(a) => Abs(f(a)), Sign(a) => Sign(f(a)), Floor(a) => Floor(f(a)),
         Ceil(a) => Ceil(f(a)), Sin(a) => Sin(f(a)), Cos(a) => Cos(f(a)), Tan(a) => Tan(f(a)),
         Asin(a) => Asin(f(a)), Acos(a) => Acos(f(a)), Atan(a) => Atan(f(a)), Fact(a) => Fact(f(a)),
+        Rand(k, u, a, b, c, d) => Rand(k, u, f(a), f(b), f(c), f(d)),
         Lt(a, c) => Lt(f(a), f(c)), Le(a, c) => Le(f(a), f(c)), Eq(a, c) => Eq(f(a), f(c)),
         Ne(a, c) => Ne(f(a), f(c)), And(a, c) => And(f(a), f(c)), Or(a, c) => Or(f(a), f(c)),
         Xor(a, c) => Xor(f(a), f(c)), Not(a) => Not(f(a)), Sel(a, c, d) => Sel(f(a), f(c), f(d)),
@@ -104,7 +105,7 @@ fn show(d: &Dag, n: N, nm: &dyn Fn(u32) -> String, o: &mut String) {
         Const(b) => { let _ = write!(o, "({:?})", f64::from_bits(b)); }
         Var(r) => o.push_str(&nm(r)),
         Par(_) => unreachable!("lifted DAGs have no Par leaves"),
-        Time => o.push_str("time"),
+        Time => o.push_str("__time__"),
         Neg(a) => { o.push_str("(-"); show(d, a, nm, o); o.push(')'); }
         Add(a, c) => bin(o, a, "+", c), Sub(a, c) => bin(o, a, "-", c),
         Mul(a, c) => bin(o, a, "*", c), Div(a, c) => bin(o, a, "/", c),
@@ -115,6 +116,10 @@ fn show(d: &Dag, n: N, nm: &dyn Fn(u32) -> String, o: &mut String) {
         Ceil(a) => f(o, "ceil", &[a]), Sin(a) => f(o, "sin", &[a]), Cos(a) => f(o, "cos", &[a]),
         Tan(a) => f(o, "tan", &[a]), Asin(a) => f(o, "asin", &[a]), Acos(a) => f(o, "acos", &[a]),
         Atan(a) => f(o, "atan", &[a]), Fact(a) => f(o, "factorial", &[a]),
+        Rand(k, _, a, b, c, dd) => { // generic arity: (a, b) for two-parameter kinds, (a) otherwise, then the bounds
+            let two = crate::rand::NAMES[k as usize].1 == 2;
+            if two { f(o, crate::rand::NAMES[k as usize].0, &[a, b, c, dd]) } else { f(o, crate::rand::NAMES[k as usize].0, &[a, c, dd]) }
+        }
         Sign(a) => { o.push_str("piecewise(1,"); show(d, a, nm, o); o.push_str(">0,-1,"); show(d, a, nm, o); o.push_str("<0,0)"); }
         Lt(a, c) => f(o, "lt", &[a, c]), Le(a, c) => f(o, "leq", &[a, c]), Eq(a, c) => f(o, "eq", &[a, c]),
         Ne(a, c) => f(o, "neq", &[a, c]), And(a, c) => f(o, "and", &[a, c]), Or(a, c) => f(o, "or", &[a, c]),
@@ -285,7 +290,8 @@ mod py {
     /// gillespie_steps(model, keys, values, start, end, seed, outputs=None, max_rows=100000)
     ///   -> rows[n, 1 + len(outputs)] (time, outputs)
     /// Variable-step SSA: a row at start, after each reaction firing or event, and at end. Outputs
-    /// as Model.output_ids (default: floating species, concentrations). No rate rules.
+    /// as Model.output_ids (default: floating species, concentrations). Rate rules integrate
+    /// deterministically between firings (hybrid SSA); no algebraic rules.
     #[pyfunction]
     #[pyo3(signature = (model, keys, values, start, end, seed, outputs=None, max_rows=100000))]
     #[allow(clippy::too_many_arguments)]
@@ -293,7 +299,7 @@ mod py {
                             start: f64, end: f64, seed: u64, outputs: Option<Vec<String>>, max_rows: usize)
                             -> PyResult<Bound<'py, PyAny>> {
         let m = &model.get().m;
-        if m.nv != m.nr { return Err(PyValueError::new_err("gillespie: rate rules are not supported")); }
+        if m.has_algebraic() { return Err(PyValueError::new_err("gillespie: algebraic rules are not supported")); }
         let k = resolve(m, &keys, &values)?;
         let outs = match outputs {
             None => (0..m.ns as u32).collect(),
