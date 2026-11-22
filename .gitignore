@@ -79,3 +79,4 @@ graphify-out/
 benchmarks/run.log
 benchmarks/ref/
 .venv/
+benchmarks/sts/suite/
