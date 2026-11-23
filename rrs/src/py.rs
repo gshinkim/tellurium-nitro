@@ -478,10 +478,19 @@ fn antimony_to_sbml(source: &str) -> PyResult<String> {
     Ok(antimony::sbml::write_sbml(&loaded.document))
 }
 
+/// Flatten a hierarchical (comp) SBML document into SBML core text. ``base``: directory external
+/// model definitions are relative to. ValueError if it cannot be flattened.
+#[pyfunction]
+#[pyo3(signature = (sbml, base=None))]
+fn flatten_comp(sbml: &str, base: Option<String>) -> PyResult<String> {
+    sbml_io::comp::flatten(sbml, base.as_deref().map(std::path::Path::new)).map_err(verr)
+}
+
 #[pymodule]
 fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
+    m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;
     m.add_class::<Session>()?;
     m.add_class::<PyModel>()
 }

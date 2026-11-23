@@ -1377,6 +1377,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "rayon",
+ "sbml-io",
 ]
 
 [[package]]
