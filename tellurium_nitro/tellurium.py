@@ -147,14 +147,7 @@ getPlottingEngineFactory.__doc__ = __getPlottingEngineFactory.__doc__
 ##############################################
 # Remaining imports
 ##############################################
-import roadrunner
-
-try:
-    import rrplugins
-except ImportError as e:
-    rrplugins = None
-    roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
-    warnings.warn("'rrplugins' could not be imported", ImportWarning, stacklevel=2)
+from .roadrunner.extended_roadrunner import Logger, ExtendedRoadRunner
 
 try:
     import libsedml
@@ -163,38 +156,28 @@ except ImportError as e:
         import tesedml as libsedml
     except ImportError:
         libsedml = None
-        roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
+        Logger.log(Logger.LOG_WARNING, str(e))
         warnings.warn("'libsedml' could not be imported", ImportWarning, stacklevel=2)
-
-try:
-    try:
-        import libsbml
-    except ImportError:
-        import tesbml as libsbml
-except ImportError as e:
-    libsbml = None
-    roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
-    warnings.warn("'libsbml' could not be imported", ImportWarning, stacklevel=2)
 
 try:
     import phrasedml
 except ImportError as e:
     phrasedml = None
-    roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
+    Logger.log(Logger.LOG_WARNING, str(e))
     warnings.warn("'phrasedml' could not be imported", ImportWarning, stacklevel=2)
 
 try:
     import sbol
 except ImportError as e:
     sbol = None
-    roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
+    Logger.log(Logger.LOG_WARNING, str(e))
     warnings.warn("'pySBOL' could not be imported, cannot import/export SBOL files", ImportWarning, stacklevel=2)
 
 try:
     from sbml2matlab import sbml2matlab
 except ImportError as e:
     sbml2matlab = None
-    roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
+    Logger.log(Logger.LOG_WARNING, str(e))
     warnings.warn("'sbml2matlab' could not be imported", ImportWarning)
 
 from . import teconverters
@@ -211,11 +194,13 @@ def getVersionInfo():
     """
     versions = [
         ('tellurium', getTelluriumVersion()),
-        ('roadrunner', roadrunner.__version__),
+        ('roadrunner_nitro', _nitro_version()),
         ('antimony', antimony.__version__),
     ]
+    rrplugins = _optional('rrplugins')
     if rrplugins:
         versions.append(('rrplugins', rrplugins.__version__))
+    libsbml = _optional('libsbml')
     if libsbml:
         versions.append(('libsbml', libsbml.getLibSBMLDottedVersion()))
     if libsedml:
@@ -258,7 +243,7 @@ def noticesOff():
 
     See also :func:`noticesOn`
     """
-    roadrunner.Logger.setLevel(roadrunner.Logger.LOG_WARNING)
+    Logger.setLevel(Logger.LOG_WARNING)
 
 
 def noticesOn():
@@ -266,7 +251,7 @@ def noticesOn():
 
     See also :func:`noticesOff`
     """
-    roadrunner.Logger.setLevel(roadrunner.Logger.LOG_NOTICE)
+    Logger.setLevel(Logger.LOG_NOTICE)
 
 # ---------------------------------------------------------------------
 # Group: Loading Models
@@ -517,7 +502,7 @@ def loada(ant):
     :param ant: Antimony model
     :type ant: str | file
     :returns: RoadRunner instance with model loaded
-    :rtype: roadrunner.ExtendedRoadRunner
+    :rtype: ExtendedRoadRunner
     """
     return loadAntimonyModel(ant)
 
@@ -533,7 +518,7 @@ def loadAntimonyModel(ant):
     :param ant: Antimony model
     :type ant: str | file
     :returns: RoadRunner instance with model loaded
-    :rtype: roadrunner.ExtendedRoadRunner
+    :rtype: ExtendedRoadRunner
     """
     sbml = antimonyToSBML(ant)
     return ExtendedRoadRunner(sbml)
@@ -547,7 +532,7 @@ def loads(ant):
     :param ant: SBML model
     :type ant: str | file
     :returns: RoadRunner instance with model loaded
-    :rtype: roadrunner.ExtendedRoadRunner
+    :rtype: ExtendedRoadRunner
     """
     return loadSBMLModel(ant)
 
@@ -558,7 +543,7 @@ def loadSBMLModel(sbml):
     :param sbml: SBML model
     :type sbml: str | file
     :returns: RoadRunner instance with model loaded
-    :rtype: roadrunner.ExtendedRoadRunner
+    :rtype: ExtendedRoadRunner
     """
     return ExtendedRoadRunner(sbml)
 
@@ -569,7 +554,7 @@ def loadCellMLModel(cellml):
     :param cellml: CellML model
     :type cellml: str | file
     :returns: RoadRunner instance with model loaded
-    :rtype: roadrunner.ExtendedRoadRunner
+    :rtype: ExtendedRoadRunner
     """
     sbml = cellmlToSBML(cellml)
     return ExtendedRoadRunner(sbml)
@@ -622,7 +607,7 @@ try:
 except ImportError:
     _has_rust_antimony = False
 _rust_antimony = _has_rust_antimony
-_rust_sbml = False
+_rust_sbml = True
 
 
 # exported as te.antimony (here it would shadow the antimony module)
@@ -642,13 +627,13 @@ def useRustAntimony(enable=None):
 
 
 def useRustSBML(enable=None):
-    """Switch for a Rust SBML reader (sbml-io). Not wired in yet: SBML is always read with libsbml.
+    """Kept for compatibility: SBML is always read by the Rust engine's SBML reader (sbml-io).
 
-    :param enable: True/False to switch globally; None only queries.
-    :returns: False (until the Rust SBML loader exists).
+    :param enable: False warns and changes nothing; None only queries.
+    :returns: True
     """
-    if enable:
-        warnings.warn("te.SBML: the Rust SBML reader is not wired in yet; using libsbml.")
+    if enable is not None and not enable:
+        warnings.warn("te.SBML(False): SBML is always read by the Rust reader (there is no libsbml loader).")
     return _rust_sbml
 
 
@@ -1044,7 +1029,7 @@ def plotWithLegend (r, result=None, loc='upper right', show=True):
     plotWithLegend (r)
     """
 
-    if not isinstance (r, roadrunner.RoadRunner):
+    if not isinstance (r, ExtendedRoadRunner):
         raise Exception ('First argument must be a roadrunner variable')
 
     if result is None:
@@ -1071,6 +1056,9 @@ def plotWithLegend (r, result=None, loc='upper right', show=True):
 # ---------------------------------------------------------------------
 # Test Models
 # ---------------------------------------------------------------------
+_TEST_MODELS = os.path.join(os.path.dirname(__file__), 'roadrunner', 'test_models')
+
+
 def loadTestModel(string):
     """Loads particular test model into roadrunner.
     ::
@@ -1079,8 +1067,7 @@ def loadTestModel(string):
 
     :returns: RoadRunner instance with test model loaded
     """
-    import roadrunner.tests
-    return roadrunner.tests.getRoadRunner(string)
+    return ExtendedRoadRunner(getTestModel(string))
 
 
 def getTestModel(string):
@@ -1095,68 +1082,52 @@ def getTestModel(string):
 
     :returns: SBML string of test model
     """
-    import roadrunner.tests
-    return roadrunner.tests.getData(string)
+    with open(os.path.join(_TEST_MODELS, string), encoding='utf-8') as f:
+        return f.read()
 
 
 def listTestModels():
-    """ List roadrunner SBML test models.
+    """ List the SBML test models (libroadrunner's).
     ::
 
         print(te.listTestModels())
 
-    :returns: list of test model paths
+    :returns: list of test model file names
     """
-    import roadrunner.tests
-    modelList = []
-    fileList = roadrunner.tests.dir('*.xml')
-    for pathName in fileList:
-        modelList.append(os.path.basename(pathName))
-    return modelList
-
-# ---------------------------------------------------------------
-# Extended roadrunner
-# ---------------------------------------------------------------
-
-from .roadrunner import ExtendedRoadRunner
-
-def _model_function_factory(key):
-    """ Dynamic creation of model functions.
-
-    :param key: function key, i.e. the name of the function
-    :type key: str
-    :return: function object
-    :rtype: function
-    """
-    def f(self):
-        return getattr(self.model, key).__call__()
-    # set the name
-    f.__name__ = key
-    # copy the docstring
-    f.__doc__ = getattr(roadrunner.ExecutableModel, key).__doc__
-    return f
-
-# Add model functions to ExendedRoadRunner class
-for key in ExtendedRoadRunner._model_functions:
-    setattr(ExtendedRoadRunner, key, _model_function_factory(key))
+    return sorted(f for f in os.listdir(_TEST_MODELS) if f.endswith('.xml'))
 
 
-# Now we assign the ExtendedRoadRunner to RoadRunner
 def RoadRunner(*args):
-    # return roadrunner.RoadRunner(*args)
     return ExtendedRoadRunner(*args)
 
-# Not assigned to roadrunner.RoadRunner: that would change plain libroadrunner (and regular tellurium) in the same process.
+
+def _optional(name):
+    """An optional module, or None when it is not installed."""
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
+
+
+def _nitro_version():
+    try:
+        from importlib.metadata import version
+        return version('libroadrunner_nitro')
+    except Exception:
+        return 'unknown'
+
 
 def VersionDict():
     '''Return dict of version strings.'''
     versions = {
         'tellurium': getTelluriumVersion(),
-        'roadrunner': roadrunner.__version__,
+        'roadrunner_nitro': _nitro_version(),
         'antimony': antimony.__version__,
     }
+    rrplugins = _optional('rrplugins')
     if rrplugins:
         versions['rrplugins'] = rrplugins.__version__
+    libsbml = _optional('libsbml')
     if libsbml:
         versions['libsbml'] = libsbml.getLibSBMLDottedVersion()
     if libsedml:

@@ -5,10 +5,7 @@ Helpers to work with SBO terms in antimony.
 from __future__ import print_function, division, absolute_import
 
 import re
-try:
-    import libsbml
-except ImportError:
-    import tesbml as libsbml
+import xml.etree.ElementTree as ET
 
 from .antimony_regex import getModelStartRegex, getModelEndRegex, getFunctionStartRegex, getSBORegex, getFunctionSBORegex
 
@@ -26,12 +23,10 @@ class antimonySBOConverter(object):
     def __init__(self, doc):
         """ Create an SBO converter.
 
-        :param doc: SBMLDocument
+        :param doc: the SBML document's root element (xml.etree.ElementTree)
         """
         self.doc = doc
-        if self.doc.getNumErrors() > 0:
-            raise RuntimeError('Errors encountered loading SBML')
-        self.model = doc.getModel()
+        self.model = _child(doc, 'model')
         if self.model is None:
             raise RuntimeError('No SBML model')
 
@@ -106,61 +101,57 @@ class antimonySBOConverter(object):
         rxns = self.getReactionSBOTerms()
         return comps + species + params + rxns
 
+    def _terms(self, lst, item):
+        l = _child(self.model, lst)
+        return [self.createSBOTermStringForElt(e) for e in ([] if l is None else l)
+                if _local(e.tag) == item and self.hasSBOTerm(e)]
+
     def getCompartmentSBOTerms(self):
-        return filterIfEmpty(['// - Compartment SBO Terms:'] + \
-            [self.createSBOTermStringForElt(e)
-            for e in (self.model.getCompartment(k) for k in range(self.model.getNumCompartments())) \
-            if self.hasSBOTerm(e)])
+        return filterIfEmpty(['// - Compartment SBO Terms:'] + self._terms('listOfCompartments', 'compartment'))
 
     def getSpeciesSBOTerms(self):
-        return filterIfEmpty(['// - Species SBO Terms:'] + \
-            [self.createSBOTermStringForElt(e)
-            for e in (self.model.getSpecies(k) for k in range(self.model.getNumSpecies())) \
-            if self.hasSBOTerm(e)])
+        return filterIfEmpty(['// - Species SBO Terms:'] + self._terms('listOfSpecies', 'species'))
 
     def getParameterSBOTerms(self):
-        return filterIfEmpty(['// - Parameter SBO Terms:'] + \
-            [self.createSBOTermStringForElt(e)
-            for e in (self.model.getParameter(k) for k in range(self.model.getNumParameters())) \
-            if self.hasSBOTerm(e)])
+        return filterIfEmpty(['// - Parameter SBO Terms:'] + self._terms('listOfParameters', 'parameter'))
 
     def getReactionSBOTerms(self):
-        return filterIfEmpty(['// - Reaction SBO Terms:'] + \
-            [self.createSBOTermStringForElt(e)
-            for e in (self.model.getReaction(k) for k in range(self.model.getNumReactions())) \
-            if self.hasSBOTerm(e)])
+        return filterIfEmpty(['// - Reaction SBO Terms:'] + self._terms('listOfReactions', 'reaction'))
 
     def hasSBOTerm(self, elt):
-        if elt.isSetSBOTerm():
-            return True
-        else:
-            return False
+        return elt.get('sboTerm') is not None
 
     def createSBOTermStringForElt(self, elt):
-        if elt.isSetSBOTerm():
-            return elt.getId() + '.sboTerm = ' + 'SBO:{:07d};'.format(self.getSBOTermForElt(elt))
-        else:
-            return None
+        if self.hasSBOTerm(elt):
+            return elt.get('id') + '.sboTerm = ' + 'SBO:{:07d};'.format(self.getSBOTermForElt(elt))
+        return None
 
     def getSBOTermForElt(self, elt):
-        if elt.isSetSBOTerm():
-            return elt.getSBOTerm()
-        else:
+        if not self.hasSBOTerm(elt):
             raise RuntimeError('No SBO term set.')
+        return int(elt.get('sboTerm').split(':')[-1])
 
     @classmethod
     def fromSBMLFile(cls, sbml_file):
         """ Construct from SBML file. """
-        reader = libsbml.SBMLReader()
-        doc = reader.readSBMLFromFile(sbml_file)
-        return antimonySBOConverter(doc)
+        with open(sbml_file, encoding='utf-8') as f:
+            return cls.fromSBMLString(f.read())
 
     @classmethod
     def fromSBMLString(cls, sbml_str):
         """ Construct from SBML string. """
-        reader = libsbml.SBMLReader()
-        doc = reader.readSBMLFromString(sbml_str)
-        return antimonySBOConverter(doc)
+        try:
+            return antimonySBOConverter(ET.fromstring(sbml_str.encode('utf-8')))
+        except ET.ParseError as e:
+            raise RuntimeError('Errors encountered loading SBML: %s' % e)
+
+
+def _local(tag):
+    return tag.rsplit('}', 1)[-1]
+
+
+def _child(e, name):
+    return next((c for c in e if _local(c.tag) == name), None)
 
 
 class antimonySBOParser(object):
@@ -250,18 +241,11 @@ class antimonySBOParser(object):
         """Add SBO terms to an SBML string. Must have called
         elideSBOTerms first to populate self.sbo_map."""
 
-        reader = libsbml.SBMLReader()
-        doc = reader.readSBMLFromString(sbml_str)
-        if doc.getNumErrors() > 0:
-            raise RuntimeError('Errors reading SBML')
-
-        for elt_id,sbo in self.sbo_map.items():
-            elt = doc.getElementBySId(elt_id)
-            if elt is not None:
-                # print('set {} -> {}'.format(elt.getId(), sbo))
-                elt.setSBOTerm(sbo)
-
-        writer = libsbml.SBMLWriter()
-        out_sbml = writer.writeSBMLToString(doc)
-
+        out_sbml = sbml_str
+        for elt_id, sbo in self.sbo_map.items():  # the sboTerm attribute of the element with that id
+            pat = re.compile(r'<([\w:]+)\b([^>]*?\bid\s*=\s*"%s"[^>]*?)(/?)>' % re.escape(elt_id))
+            m = pat.search(out_sbml)
+            if m is not None:
+                body = re.sub(r'\ssboTerm\s*=\s*"[^"]*"', '', m.group(2)) + ' sboTerm="SBO:{:07d}"'.format(sbo)
+                out_sbml = out_sbml[:m.start()] + '<%s%s%s>' % (m.group(1), body, m.group(3)) + out_sbml[m.end():]
         return out_sbml

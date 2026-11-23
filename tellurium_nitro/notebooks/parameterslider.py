@@ -25,7 +25,7 @@ import sys
 
 import warnings
 import tellurium_nitro as te
-from roadrunner import SelectionRecord
+from ..roadrunner.extended_roadrunner import SelectionRecord
 
 try:
     import ipywidgets

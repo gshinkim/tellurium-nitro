@@ -1,868 +1,891 @@
 """
-Extending the RoadRunner object with additional fields.
+tellurium's RoadRunner: libroadrunner's Python API on the Rust engine (roadrunner_nitro.RoadRunner).
 """
 
 from __future__ import print_function, division, absolute_import
-import os
-import roadrunner
-import warnings
 import copy
-import inspect
+import os
+import re
+import tempfile
+import warnings
+from xml.sax.saxutils import quoteattr
+
 import numpy as np
+import roadrunner_nitro
 
-# ---------------------------------------------------------------------
-# Turbo: route roadrunner's expensive calls to the Rust engine roadrunner_nitro
-# ---------------------------------------------------------------------
-try:
-    import roadrunner_nitro  # noqa: F401
-    _has_rs = True
-    _turbo = os.environ.get('TELLURIUM_ENGINE', '').strip().lower() != 'roadrunner'
-except ImportError:
-    _has_rs = _turbo = False
-# strict: never hand a model or call to libroadrunner; raise NotSupportedByRust instead (te.turbo('strict'))
-_strict = _has_rs and os.environ.get('TELLURIUM_ENGINE', '').strip().lower() == 'strict'
-
-_NamedArray = roadrunner._roadrunner.NamedArray
-
-
-class _Opts:  # the SimulateOptions fields _rs_simulate reads, for the simulate fast path
-    times, output_file, reset_model = (), '', False
-
-    def __init__(self, start, end, steps):
-        self.start, self.end, self.steps = start, end, steps
-# integrator settings the Rust engine honours only at these values (others fall back to roadrunner).
-# cvode: tolerances are passed through; stiff/BDF/Adams orders/maximum_num_steps don't change the
-# solution within tolerance (Rodas4 is stiff-stable and has its own step cap).
-_RS_INTEGRATORS = {
-    'cvode': {'maximum_time_step': 0.0, 'minimum_time_step': 0.0, 'initial_time_step': 0.0,
-              'multiple_steps': False, 'variable_step_size': False},
-    'gillespie': {'minimum_time_step': 0.0, 'maximum_time_step': 0.0, 'nonnegative': False, 'maximum_num_steps': 0},
-}
-_RS_INTEGRATORS = {k: (tuple(v), tuple(v.values())) for k, v in _RS_INTEGRATORS.items()}  # (keys, values)
+INTEGRATORS = ['cvode', 'gillespie', 'rk4', 'rk45', 'euler']
+STEADY_STATE_SOLVERS = ['nleq1', 'nleq2', 'newton', 'newton_linesearch']
 
 
 def turbo(enable=None):
-    """Use the Rust engine (roadrunner_nitro) for simulate/steadyState/MCA when it supports the model.
+    """Kept for compatibility. The Rust engine is tellurium_nitro's only engine (libroadrunner is no longer
+    a fallback), so turbo is always on: True and 'strict' are accepted, False warns and changes nothing.
 
-    :param enable: True/False to switch globally, 'strict' for Rust only (anything the Rust engine
-        can't do raises NotSupportedByRust instead of going to roadrunner); None only queries.
-    :returns: whether turbo is on. On by default when roadrunner_nitro is installed;
-        env ``TELLURIUM_ENGINE=roadrunner`` starts it off, ``TELLURIUM_ENGINE=strict`` starts it strict.
-        Otherwise unsupported models, integrators or settings fall back to roadrunner.
+    :returns: True
     """
-    global _turbo, _strict
-    if enable is not None:
-        _strict = enable == 'strict' and _has_rs
-        if enable:
-            try:
-                import roadrunner_nitro  # noqa: F401
-            except ImportError:
-                warnings.warn("te.turbo: roadrunner_nitro is not installed; using roadrunner.")
-                enable = False
-        _turbo = bool(enable)
-    return _turbo
-
-
-def _named(a, rows=None, cols=None):
-    a = np.ascontiguousarray(a, dtype=float).view(_NamedArray)
-    if rows is not None:
-        a.rownames = list(rows)
-    if cols is not None:
-        a.colnames = list(cols)
-    return a
-
-
-class _Fallback(Exception):
-    """Raised inside a Rust-engine path: the call goes to roadrunner instead; the message is the reason."""
-
-
-class NotSupportedByRust(RuntimeError):
-    """te.turbo('strict'): the Rust engine can't do this and roadrunner fallback is off."""
-
-
-def _no_fallback(reason):
-    if _strict:
-        raise NotSupportedByRust(str(reason))
-
-
-class _Cols(object):
-    """Plan turning the Rust model's output columns into roadrunner's selections (one per selection list)."""
-
-    def __init__(self, sel, outs, ores, I, mul, div, lin, init):
-        self.sel, self.outs, self.ores = sel, outs, ores
-        self.I, self.mul, self.div, self.lin, self.init = I, mul, div, lin, init
-        self.ident = I == list(range(len(outs))) and not (mul or div or lin or init)
-
-    def init_values(self, r):
-        """init(...) selections: roadrunner's values now (taken before a run: they need roadrunner's model)."""
-        return [ExtendedRoadRunner.getValue(r, s) for _, s in self.init]
-
-    def apply(self, Y, pre=()):
-        """Rust output rows Y (columns = self.outs) -> rows in selection order."""
-        if self.ident:
-            return Y
-        out = Y[:, self.I]
-        for ops, f in ((self.mul, np.multiply), (self.div, np.divide)):
-            if ops:
-                k, j = zip(*ops)
-                out[:, list(k)] = f(out[:, list(k)], Y[:, list(j)])
-        for k, j, c in self.lin:
-            out[:, k] = Y[:, j] @ c
-        for (k, _), x in zip(self.init, pre):
-            out[:, k] = x
-        return out
-
-
-class _RsModel(object):
-    """The Rust model ``m`` of one roadrunner model (built by rrs_bridge from ``info``), the index maps
-    between roadrunner's ids and it, and the running simulation (event state, solver counters).
-    ``ids`` = (floating, boundary, parameter, compartment, reaction ids); ``vols``: compartment
-    volumes; ``nss``: no steady state (time-dependent rates or events)."""
-    rd = L = ind = tk = ick = None  # filled on first use
-
-    def __init__(self, m, info, ids, vols, nss, extra=False):
-        ids, bids, gids, cids, rids = ids
-        states, outs = list(m.state_ids), set(m.output_ids)
-        if not set(ids) <= outs or sorted(rids) != sorted(m.reactions):
-            raise _Fallback("roadrunner's species/reactions are not all in the Rust model")
-
-        def known(k):  # Rust parameter or state (not a rule output / moiety total)
-            try:
-                m.resolve_keys([k])
-                return True
-            except ValueError:
-                return False
-        pidx, cidx, bidx, sidx = ([i for i, k in enumerate(l) if known(k)] for l in (gids, cids, bids, ids))
-        keys = [gids[i] for i in pidx] + [cids[i] for i in cidx] + [bids[i] for i in bidx]
-        # extra (lazy models only): Rust states in none of roadrunner's groups, e.g. a species reference
-        # with a rate rule; they sit before the floating species and have no roadrunner array (xidx)
-        self.n_extra = len(keys)
-        keys += [k for k in states if extra and k not in keys and k not in ids]
-        self.n_extra = len(keys) - self.n_extra
-        keys += [ids[i] for i in sidx]
-        comp_of, general = info['comp_of'], info['general']
-        rx = [list(m.reactions).index(j) for j in rids]
-        NR, Lc, _ = m.conservation()
-        Ngen = np.asarray(Lc) @ np.asarray(NR)  # amount stoichiometry, states x (reactions + rate rules)
-        self.m, self.session = m, roadrunner_nitro.Session(m)
-        self.kres, self.ids, self.rids, self.gids, self.cids, self.bids = m.resolve_keys(keys), ids, rids, gids, cids, bids
-        self.pidx, self.cidx, self.bidx, self.sidx, self.keys = pidx, cidx, bidx, sidx, keys
-        self.kpos, self.off = {k: i for i, k in enumerate(keys)}, len(keys) - len(sidx)
-        self.bamt = np.array([bids[i] in info['amount_params'] for i in bidx], dtype=bool)
-        self.amount_params, self.comp_of, self.general, self.outs, self.states = info['amount_params'], comp_of, general, outs, states
-        self.rx, self.cols_cache, self.nss = rx, {}, nss
-        self.sp = [states.index(s) if s in states else None for s in ids]
-        self.asc = np.ones(len(states))
-        self.V = np.array([vols[cids.index(comp_of[s])] for s in ids])
-        # species volumes the Rust model bakes in (rebuild when they change)
-        self.cconst = sorted({cids.index(comp_of[s]) for s in m.species if s not in general})
-        self.spi = [i for i, j in enumerate(self.sp) if j is not None]
-        self.spj = [self.sp[i] for i in self.spi]
-        self.stats = None
-        oid = {n: i for i, n in enumerate(m.output_ids)}
-        nb = len(bids) if bidx else 0  # x() gathers [globals | volumes | boundary conc | boundary amounts | floating]
-        o1, o2 = len(gids), len(gids) + len(cids)
-        self.xidx = np.array(pidx + [o1 + i for i in cidx] + [o2 + i + nb * a for i, a in zip(bidx, self.bamt)] +
-                             [o2 + 2 * nb + i for i in sidx], dtype=int)
-
-        def plan(chg):  # what sync writes back: species, and parameters/compartments/boundary species in chg
-            return [(f, idx, [names[i] for i in idx], np.array([oid[names[i]] for i in idx], dtype=int)) for f, idx, names in (
-                ('setCompartmentVolumes', [i for i in cidx if cids[i] in chg], cids),  # volumes first: species keep conc
-                ('setGlobalParameterValues', [i for i in pidx if gids[i] in chg], gids),
-                ('amount', [i for i, a in zip(bidx, self.bamt) if bids[i] in chg and a], bids),
-                ('conc', [i for i, a in zip(bidx, self.bamt) if bids[i] in chg and not a], bids),  # via setValue
-                ('setFloatingSpeciesConcentrations', sidx, ids)) if idx]
-        self.sync, self.sync_all = plan(info['changing']), plan(set(keys))
-        # reaction-network views (MCA, Jacobian, elasticities) over the floating species; rate-rule
-        # states are not floating species in roadrunner and are held fixed, as roadrunner does
-        self.plain = all(s in m.species and s not in general for s in ids)
-        self.mca = self.plain and not nss
-        if self.plain:
-            self.N = Ngen[self.sp][:, rx]
-
-    def reset_events(self):
-        """The next run starts with fresh event triggers (as after roadrunner's reset())."""
-        self.session.reset_events()
-
-    def times(self, start, end, steps):
-        tk = (start, end, steps)
-        if self.tk != tk:
-            self.tk, self._times = tk, np.linspace(start, end, steps + 1)
-        return self._times
-
-    def atol_scale(self, ic):
-        """Per-state atol multipliers from the floating species' initial concentrations ``ic``:
-        roadrunner's CVODE multiplies a scalar atol by each species' initial amount (by its volume
-        if that is zero), i.e. atol * |initial concentration| (atol if zero). Rate-rule states keep atol."""
-        k = ic.tobytes()
-        if self.ick != k:
-            a = np.abs(ic[self.spi])
-            self.ick, self.asc[self.spj] = k, np.where(a < 1e-30, 1.0, a)
-        return self.asc
-
-    def advance(self, x, times, ores, rtol, atol, asc):
-        """Integrate from state x over times -> (outputs at times, final values of all outputs).
-        Keeps the event state for the next call; self.stats = the solver's counters."""
-        try:
-            y, final = self.session.advance(self.kres, x, times, outputs=ores, rtol=rtol, atol=atol, atol_scale=asc)
-        except RuntimeError:
-            self.stats = self.session.stats
-            raise _Fallback("Rust integration failed (atol %g and 1e-12)" % atol)
-        self.stats = self.session.stats
-        return np.asarray(y), final
-
-    def cols(self, sel, lazy=False):
-        """_Cols for the selection list, or None if Rust can't produce it (``lazy``: no roadrunner model,
-        so no init(...) selections)."""
-        key = tuple(sel)
-        c = self.cols_cache.get(key, False)
-        if c is False:
-            c = self.cols_cache[key] = self._cols(list(sel))
-        return None if c is None or (lazy and c.init) else c
-
-    def _cols(self, sel):
-        outs = []
-
-        def o(n):
-            if n not in outs:
-                outs.append(n)
-            return outs.index(n)
-        sp = set(self.ids) | set(self.bids)
-        I, mul, div, lin, init = [], [], [], [], []
-        for k, s in enumerate(sel):
-            if not isinstance(s, str):
-                return None
-            br = s[:1] == '[' and s[-1:] == ']'
-            v = s[1:-1] if br else s
-            if v in sp:
-                if v not in self.outs:
-                    return None
-                I.append(o(v))
-                amt = v in self.amount_params  # boundary species whose Rust value is an amount
-                if br and amt:
-                    div.append((k, o(self.comp_of[v])))
-                elif not br and not amt:
-                    mul.append((k, o(self.comp_of[v])))
-            elif s in self.outs:  # time, parameters, compartments, reaction rates, rule variables
-                I.append(o(s))
-            elif s.startswith('init(') and s.endswith(')'):
-                I.append(0)
-                init.append((k, s))
-            elif s.endswith("'") and self.plain and s[:-1].strip('[]') in self.ids:
-                i = self.ids.index(s[:-1].strip('[]'))
-                I.append(0)  # amount (or conc: constant compartment, plain) rate from the reaction rates
-                lin.append((k, [o(j) for j in self.rids], self.N[i] / (self.V[i] if s[0] == '[' else 1.0)))
-            else:
-                return None  # ponytail: eigen(), cc(), ee() ... selections -> roadrunner
-        return _Cols(sel, outs, self.m.resolve_outputs(outs), I, mul, div, lin, init)
+    if enable is not None and not enable:
+        warnings.warn("te.turbo(False): there is no other engine than the Rust engine; it stays on.", stacklevel=2)
+    return True
 
 
 # ---------------------------------------------------------------------
-# Extended RoadRunner class
+# NamedArray, Logger, Config, SelectionRecord (libroadrunner's helper types)
 # ---------------------------------------------------------------------
-class ExtendedRoadRunner(roadrunner.roadrunner.RoadRunner):
+class NamedArray(np.ndarray):
+    """numpy array with ``rownames`` / ``colnames``, printed as libroadrunner prints its NamedArray.
+    ``a['S1']``: the column (or row) of that name."""
 
-    def __new__(cls, *args, **kwargs):
-        # RoadRunner(sbml) with turbo: a lazily compiled RoadRunner (see _lazy); otherwise a plain one
-        r = cls._lazy(args[0]) if len(args) == 1 and not kwargs else None
-        return r if r is not None else super(ExtendedRoadRunner, cls).__new__(cls)
+    def __new__(cls, a, rownames=(), colnames=()):
+        obj = np.asarray(a).view(cls)
+        obj.rownames, obj.colnames = list(rownames), list(colnames)
+        return obj
 
-    def __init__(self, *args, **kwargs):
-        if '_lz' not in self.__dict__:  # lazy instances are already built by __new__
-            super(ExtendedRoadRunner, self).__init__(*args, **kwargs)
+    def __array_finalize__(self, obj):
+        self.rownames = list(getattr(obj, 'rownames', ()))
+        self.colnames = list(getattr(obj, 'colnames', ()))
 
-    # ---------------------------------------------------------------------
-    # Lazy roadrunner: with turbo, te.loada & co. build only the Rust model (~0.2 s at 1000 reactions)
-    # and keep the model state here (lz['x'], lz['t']). roadrunner compiles the model (~10 s at 1000
-    # reactions) on the first call the Rust engine can't answer (_load_rr), from the SBML + current state.
-    # ---------------------------------------------------------------------
-    @classmethod
-    def _lazy(cls, sbml):
-        """A lazily compiled RoadRunner when turbo is on and the Rust engine takes the model, else None."""
-        if _turbo and isinstance(sbml, str) and not roadrunner.Config.getValue(
-                roadrunner.Config.LOADSBMLOPTIONS_CONSERVED_MOIETIES):
-            text, base = sbml, None
-            if not text.lstrip().startswith('<') and os.path.isfile(text):
-                base = os.path.dirname(os.path.abspath(text))
-                with open(text, encoding='utf-8') as f:
-                    text = f.read()
-            r = object.__new__(cls)
-            roadrunner.roadrunner.RoadRunner._swig_init(r)  # empty roadrunner (no _makeProperties: no model)
-            try:
-                if text.lstrip().startswith('<'):
-                    r._lz_init(text, base)
-                    return r
-            except (NotImplementedError, ValueError, _Fallback) as e:
-                _no_fallback('model not supported by the Rust engine: %s' % e)
-        elif _turbo:
-            _no_fallback('model needs roadrunner (conserved moiety analysis or not SBML text)')
-        return None
+    def __reduce__(self):
+        f, args, state = super(NamedArray, self).__reduce__()
+        return f, args, (state, self.rownames, self.colnames)
 
-    def _lz_init(self, sbml, base=None):
-        from ..analysis.rrs_bridge import from_sbml, _names
-        info = {}
-        m = from_sbml(sbml, info, base)
-        fids, bids, gids, cids, rids = ids = info['ids']
-        st = _RsModel(m, info, ids, [info['values'][c] for c in cids], 'symbols/time' in sbml or info['n_events'] > 0,
-                      extra=True)
-        if not set(st.states) <= set(st.keys) or not set(sum(ids, [])) <= st.outs:
-            raise NotImplementedError("not all of the model is in the Rust model")
-        oid = {n: i for i, n in enumerate(m.output_ids)}
-        x0 = np.asarray(m.outputs_at([], [], 0.0, outputs=st.keys), dtype=float)
-        rr = info['rate_rule_ids']
-        # reset(): floating species and rate-rule targets back to their initial values, an initial
-        # assignment re-evaluated with the current parameters and initial species (as roadrunner)
-        tgt = [k for k in st.keys if k in fids or k in rr]
-        ok = not (set(cids) & (info['changing'] | set(info['ia'])))  # constant compartments
-        plain = set(gids) - set(info['rule_vars'])  # parameters without rules
-        for k in tgt:
-            if k in info['ia']:
-                ok = ok and _names(info['ia'][k], set()) <= set(fids) | set(cids) | set(info['fdefs']) | plain
-        attr = {}
-        for s in fids + bids:
-            attr.update({s: '[%s]' % s, s + '_conc': '[%s]' % s, s + '_amt': s})
-        attr.update({k: k for k in gids + cids + rids})
-        srefs = info['srefs']  # (species, reaction, sign, id, has stoichiometryMath)
-        self.__dict__['_lz'] = dict(
-            sbml=sbml, info=info, st=st, x=x0.copy(), x0=x0, t=0.0, oid=oid, xo=np.array([oid[k] for k in st.keys], dtype=int),
-            o=lambda l: np.array([oid[k] for k in l], dtype=int), attr=attr, reset_ok=ok,
-            srefs=any(sr[4] for sr in srefs),  # these SBML views: roadrunner
-            # named stoichiometries: (row, reaction column, sign, id); their current values update N
-            nref=[(info['rows'].index(s), rids.index(j), sg, sid) for s, j, sg, sid, _ in srefs
-                  if sid and s in info['rows']],
-            tgt=np.array([st.kpos[k] for k in tgt], dtype=int), tgt_ids=tgt, model=_LazyModel(self),
-            hosu=set(info['hosu']),
-            # roadrunner bakes these into the model: changing them needs roadrunner
-            fixed=cids + list(info['conversion_factors']),
-            sel=['time'] + ['[%s]' % s for s in fids] + [v for v in rr if v not in fids], ssel=['[%s]' % s for s in fids])
-
-    def _load_rr(self):
-        """Compile the model in roadrunner (once) and carry the lazy state over; returns self."""
-        lz = self.__dict__.get('_lz')
-        if lz is None:
-            return self
-        _no_fallback('this call needs roadrunner')
-        del self.__dict__['_lz']
-        st = lz['st']
-        roadrunner.roadrunner.RoadRunner.load(self, lz['sbml'])
-        mdl = self.model
-        now = self._rs_x(st, mdl)
-        self._rs_sync(st, {k: v for k, v, w in zip(st.keys, lz['x'], now) if v != w}, mdl, plan='sync_all')
-        mdl.setTime(lz['t'])
-        roadrunner.roadrunner.RoadRunner._setSelections(self, lz['sel'])
-        roadrunner.roadrunner.RoadRunner._setSteadyStateSelections(self, lz['ssel'])
-        ids = [list(f()) for f in (mdl.getFloatingSpeciesIds, mdl.getBoundarySpeciesIds, mdl.getGlobalParameterIds,
-                                   mdl.getCompartmentIds, mdl.getReactionIds)]
-        if not st.n_extra and ids == [getattr(st, k) for k in ('ids', 'bids', 'gids', 'cids', 'rids')]:  # keep the Rust model
-            cc = st.cconst
-            self.__dict__['_rs_cache'] = ((self.conservedMoietyAnalysis, mdl.getCompartmentVolumes()[cc].tobytes()), st, cc)
-        return self
-
-    def _super(self):
-        """roadrunner's own methods (compiling the model first if it is lazy)."""
-        return super(ExtendedRoadRunner, self._load_rr())
-
-    def _lz_out(self, lz, outputs=None):
-        """Rust outputs (all, or the resolved `outputs`) at the current state and time."""
-        st = lz['st']
-        live = lz.get('live')  # (state, time) the last run left: the session also has its delay() history
-        if live is not None and live[1] == lz['t'] and np.array_equal(live[0], lz['x']):
-            return np.asarray(st.session.outputs_now(lz['t'], outputs=outputs))
-        return np.asarray(st.m.outputs_at(st.kres, lz['x'], lz['t'], outputs=outputs))
-
-    def _lz_get(self, lz, sel):
-        cols = lz['st'].cols([sel], lazy=True) if isinstance(sel, str) else None
-        if cols is None:
-            return None
-        return float(cols.apply(self._lz_out(lz, cols.ores)[None])[0, 0])
-
-    def _lz_set(self, lz, sel, v):
-        st = lz['st']
-        br = isinstance(sel, str) and sel[:1] == '[' and sel[-1:] == ']'
-        k = sel[1:-1] if br else sel
-        if k == 'time' and not br:
-            lz['t'] = float(v)
-            return True
-        j = st.kpos.get(k)
-        sp = k in st.ids or k in st.bids
-        if j is None or k in lz['fixed'] or (br and not sp):
-            return False
-        if sp:
-            V = self._lz_out(lz)[lz['oid'][st.comp_of[k]]]
-            c = float(v) if br else float(v) / V
-            lz['x'][j] = c * V if k in st.amount_params else c
-        else:
-            lz['x'][j] = float(v)
-        return True
-
-    def _lz_init_values(self, lz):
-        """Values reset() gives the floating species and rate-rule targets (lz['tgt_ids'])."""
-        info, st, x0 = lz['info'], lz['st'], lz['x0']
-        vals = dict(zip(lz['tgt_ids'], x0[lz['tgt']]))
-        ia = {k: info['ia'][k] for k in lz['tgt_ids'] if k in info['ia']}
-        if ia:
-            from ..analysis.rrs_bridge import evaluate
-            cur = dict(zip(st.keys, lz['x']))
-            V = {c: cur[c] for c in st.cids if c in cur}
-
-            def get(n):  # SBML units: species amounts when hasOnlySubstanceUnits
-                if n in ia:
-                    if n not in done:
-                        done[n] = float(evaluate(ia[n], get, info['fdefs']))
-                    v = done[n]
-                    return v
-                if n in st.ids:
-                    return vals[n] * V[st.comp_of[n]] if n in lz['hosu'] else vals[n]
-                return cur[n]
-            done = {}
-            for k in ia:
-                v = get(k)
-                vals[k] = v / V[st.comp_of[k]] if k in lz['hosu'] and k in st.ids else v
-        return np.array([vals[k] for k in lz['tgt_ids']], dtype=float)
-
-    def _lz_reset(self, lz, everything=False):
-        lz['st'].reset_events()
-        lz['t'] = 0.0
-        if everything:
-            lz['x'][:] = lz['x0']
-        else:
-            lz['x'][lz['tgt']] = self._lz_init_values(lz)
-
-    def getModel(self):
-        lz = self.__dict__.get('_lz')
-        return roadrunner.roadrunner.RoadRunner.getModel(self) if lz is None else lz['model']
-    getModel.__doc__ = roadrunner.roadrunner.RoadRunner.getModel.__doc__
-
-    model = property(getModel)
-
-    def _selections(name, base):
-        def get(self):
-            lz = self.__dict__.get('_lz')
-            return list(lz[name]) if lz is not None else base.fget(self)
-
-        def put(self, sel):
-            lz = self.__dict__.get('_lz')
-            if lz is not None:  # selections Rust computes, in roadrunner's spelling
-                sel = list(sel)
-                if lz['st'].cols(sel, lazy=True) is not None:
-                    lz[name] = sel
-                    return
-                self._load_rr()
-            base.fset(self, sel)
-        return property(get, put)
-    timeCourseSelections = selections = _selections('sel', roadrunner.roadrunner.RoadRunner.timeCourseSelections)
-    steadyStateSelections = _selections('ssel', roadrunner.roadrunner.RoadRunner.steadyStateSelections)
-    del _selections
-
-    def _cma_set(self, v):
-        if v and '_lz' in self.__dict__:
-            self._load_rr()  # ponytail: libstruct's species order/moieties; Rust's own choice can differ
-        roadrunner.roadrunner.RoadRunner.conservedMoietyAnalysis.fset(self, v)
-    conservedMoietyAnalysis = property(roadrunner.roadrunner.RoadRunner.conservedMoietyAnalysis.fget, _cma_set)
-
-    def getValue(self, *args):
-        lz = self.__dict__.get('_lz')
-        if lz is not None and len(args) == 1:
-            v = self._lz_get(lz, args[0])
-            if v is not None:
-                return v
-        return self._super().getValue(*args)
-    getValue.__doc__ = roadrunner.roadrunner.RoadRunner.getValue.__doc__
-
-    def setValue(self, *args):
-        lz = self.__dict__.get('_lz')
-        if lz is not None and len(args) == 2 and self._lz_set(lz, *args):
-            return
-        return self._super().setValue(*args)
-    setValue.__doc__ = roadrunner.roadrunner.RoadRunner.setValue.__doc__
+    def __setstate__(self, state):
+        super(NamedArray, self).__setstate__(state[0])
+        self.rownames, self.colnames = state[1], state[2]
 
     def __getitem__(self, key):
+        if isinstance(key, str):
+            a = np.asarray(self)
+            if key in self.colnames:
+                return a[..., self.colnames.index(key)]
+            if key in self.rownames:
+                return a[self.rownames.index(key)]
+            raise KeyError(key)
+        return super(NamedArray, self).__getitem__(key)
+
+    def __str__(self):
+        a = np.asarray(self)
+        if a.ndim != 2 or not len(a) or len(self.colnames) != a.shape[1] or \
+                (self.rownames and len(self.rownames) != a.shape[0]):
+            return str(a)
+        cells = [[format(v, 'g') for v in row] for row in a]
+        w = [max([len(n)] + [len(r[j]) for r in cells]) + 1 for j, n in enumerate(self.colnames)]
+        rn = max([len(n) for n in self.rownames] or [0])
+        out = [' ' * rn + '   ' + ','.join(n.rjust(x) for n, x in zip(self.colnames, w))]
+        for i, r in enumerate(cells):
+            row = ','.join(c.rjust(x) for c, x in zip(r, w))
+            lead = self.rownames[i].ljust(rn) if rn else ''
+            out.append(lead + (' [[' if i == 0 else '  [') + row + (']]' if i == len(cells) - 1 else '],'))
+        return '\n'.join(out) + '\n'
+
+    __repr__ = __str__
+
+
+def _named(t):
+    """(array, row ids, column ids) from roadrunner_nitro -> NamedArray."""
+    return NamedArray(t[0], t[1], t[2])
+
+
+class Logger(object):
+    """libroadrunner's Logger API (levels as libroadrunner numbers them), on Python's logging."""
+    LOG_CURRENT, LOG_FATAL, LOG_CRITICAL, LOG_ERROR, LOG_WARNING, LOG_NOTICE, LOG_INFORMATION, LOG_DEBUG, LOG_TRACE = range(9)
+    _level = LOG_NOTICE
+
+    @classmethod
+    def setLevel(cls, level=LOG_CURRENT):
+        if level != cls.LOG_CURRENT:
+            cls._level = level
+
+    @classmethod
+    def getLevel(cls):
+        return cls._level
+
+    @classmethod
+    def log(cls, level, msg):
+        if level <= cls._level:
+            import logging
+            logging.getLogger('tellurium_nitro').log(max(10, 60 - 10 * level), msg)
+
+
+class Config(object):
+    """libroadrunner's Config: setValue/getValue on a key; the Rust engine reads none of them."""
+    _values = {}
+
+    @classmethod
+    def setValue(cls, key, value):
+        cls._values[key] = value
+
+    @classmethod
+    def getValue(cls, key):
+        return cls._values.get(key)
+
+
+class SelectionRecord(object):
+    """libroadrunner's selection type flags (the ones reset(options) takes)."""
+    TIME, CONCENTRATION, AMOUNT, RATE, BOUNDARY, FLOATING, _COMPARTMENT, _GLOBAL_PARAMETER = 1, 2, 4, 8, 16, 32, 64, 128
+    REACTION, INITIAL, CURRENT, UNSCALED, ELASTICITY, CONTROL = 256, 512, 1024, 2048, 4096, 8192
+    ALL = -1
+
+
+# ---------------------------------------------------------------------
+# Solver settings objects: r.integrator, r.steadyStateSolver
+# ---------------------------------------------------------------------
+class Solver(object):
+    """An integrator or steady-state solver: settings as attributes, getValue/setValue/getSettings.
+    Without ``name`` it is the current one; with ``name``, that solver (current or not)."""
+
+    def __init__(self, rr, ss, name=None):
+        object.__setattr__(self, '_rr', rr)
+        object.__setattr__(self, '_ss', ss)
+        object.__setattr__(self, '_name', name)
+
+    def _call(self, f, *args):
+        rr, ss = self._rr, self._ss
+        cur = rr.getSteadyStateSolverName() if ss else rr.getIntegratorName()
+        use = rr.setSteadyStateSolver if ss else rr.setIntegrator
+        if self._name is None or self._name == cur:
+            return f(*args)
+        use(self._name)  # settings of the other solvers are kept: switch, act, switch back
+        try:
+            return f(*args)
+        finally:
+            use(cur)
+
+    def getName(self):
+        if self._name is not None:
+            return self._name
+        return self._rr.getSteadyStateSolverName() if self._ss else self._rr.getIntegratorName()
+
+    def getSettings(self):
+        return list(self._call(self._rr.getSteadyStateSolverSettings if self._ss else self._rr.getIntegratorSettings))
+
+    def getValue(self, key):
+        return self._call(self._rr.getSteadyStateSolverSetting if self._ss else self._rr.getIntegratorSetting, key)
+
+    def setValue(self, key, value):
+        if isinstance(value, np.generic):
+            value = value.item()
+        self._call(self._rr.setSteadyStateSolverSetting if self._ss else self._rr.setIntegratorSetting, key, value)
+
+    def getSettingsMap(self):
+        return {k: self.getValue(k) for k in self.getSettings()}
+
+    def getSetting(self, key):
         return self.getValue(key)
 
-    def __setitem__(self, key, value):
+    def setSetting(self, key, value):
         self.setValue(key, value)
 
-    def __getattr__(self, name):  # lazy: model ids as attributes (roadrunner's dynamic properties)
-        lz = self.__dict__.get('_lz')
-        if lz is not None:
-            if name in lz['attr']:
-                return self.getValue(lz['attr'][name])
-            raise AttributeError(name)
-        return roadrunner.roadrunner.RoadRunner.__getattr__(self, name)
+    def __getattr__(self, key):
+        if key.startswith('_'):
+            raise AttributeError(key)
+        try:
+            return self.getValue(key)
+        except ValueError:
+            raise AttributeError("%s has no setting '%s'" % (self.getName(), key))
 
-    def __setattr__(self, name, value):
-        lz = self.__dict__.get('_lz')
-        if lz is not None and name in lz['attr']:
-            return self.setValue(lz['attr'][name], value)
-        object.__setattr__(self, name, value)
+    def __setattr__(self, key, value):
+        self.setValue(key, value)
 
-    def getCurrentTime(self):
-        lz = self.__dict__.get('_lz')
-        return self._super().getCurrentTime() if lz is None else lz['t']
-    getCurrentTime.__doc__ = roadrunner.roadrunner.RoadRunner.getCurrentTime.__doc__
+    def __dir__(self):
+        return sorted(set(dir(type(self))) | set(self.getSettings()))
 
-    def isModelLoaded(self):
-        return '_lz' in self.__dict__ or roadrunner.roadrunner.RoadRunner.isModelLoaded(self)
+    def __repr__(self):
+        s = self.getSettingsMap()
+        w = max([len(k) for k in s] or [0])
+        kind = 'SteadyStateSolver' if self._ss else 'Integrator'
+        return '< roadrunner.%s() >\n  name: %s\n  settings:\n%s' % (kind, self.getName(), ''.join(
+            '  %s: %s\n' % (k.rjust(w + 4), str(v).lower() if isinstance(v, bool) else '%g' % v if isinstance(v, float) else v) for k, v in s.items()))
 
-    @staticmethod
-    def _lz_doc(lz):  # the SBML document as roadrunner keeps it
-        import libsbml
-        doc = libsbml.readSBMLFromString(lz['sbml'])
-        for rx in doc.getModel().getListOfReactions():
-            for l in (rx.getListOfReactants(), rx.getListOfProducts()):
-                for sr in l:
-                    if not sr.isSetStoichiometry() and not sr.isSetStoichiometryMath():
-                        sr.setStoichiometry(sr.getStoichiometry())
-        return doc
+    __str__ = __repr__
 
-    def getSBML(self):
-        lz = self.__dict__.get('_lz')
-        if lz is None or lz['srefs']:
-            return self._super().getSBML()
-        import libsbml
-        return libsbml.writeSBMLToString(self._lz_doc(lz))
-    getSBML.__doc__ = roadrunner.roadrunner.RoadRunner.getSBML.__doc__
 
-    def getCurrentSBML(self):
-        lz = self.__dict__.get('_lz')
-        if lz is None or lz['srefs']:
-            return self._super().getCurrentSBML()
-        import libsbml  # the SBML with the current values, as roadrunner writes it
-        doc = self._lz_doc(lz)
-        m, md = doc.getModel(), lz['model']
-        v = dict(zip(md.getGlobalParameterIds(), md.getGlobalParameterValues()))
-        v.update(zip(md.getCompartmentIds(), md.getCompartmentVolumes()))
-        for p in m.getListOfParameters():
-            p.setValue(v[p.getId()])
-        for c in m.getListOfCompartments():
-            c.setSize(v[c.getId()])
-        for ids, conc, amt in ((md.getFloatingSpeciesIds(), md.getFloatingSpeciesConcentrations(), md.getFloatingSpeciesAmounts()),
-                               (md.getBoundarySpeciesIds(), md.getBoundarySpeciesConcentrations(), md.getBoundarySpeciesAmounts())):
-            for s, c, a in zip(ids, conc, amt):
-                x = m.getSpecies(s)
-                x.setInitialConcentration(c) if x.isSetInitialConcentration() else x.setInitialAmount(a)
-        while m.getNumInitialAssignments():
-            m.removeInitialAssignment(0)
-        return libsbml.writeSBMLToString(doc)
-    getCurrentSBML.__doc__ = roadrunner.roadrunner.RoadRunner.getCurrentSBML.__doc__
+class SensitivitySolver(Solver):
+    """r.getSensitivitySolver(): the tolerances timeSeriesSensitivities integrates with ('forward': exact
+    symbolic derivatives, one stiff integration per parameter)."""
 
-    def getFullStoichiometryMatrix(self):
-        lz = self.__dict__.get('_lz')
-        if lz is None or lz['srefs']:
-            return self._super().getFullStoichiometryMatrix()
-        N = np.array(lz['info']['N'], dtype=float)
-        for i, j, sg, sid in lz['nref']:
-            N[i, j] += sg * (self.getValue(sid) - lz['info']['values'][sid])
-        return _named(N, lz['info']['rows'], lz['st'].rids)
-    getFullStoichiometryMatrix.__doc__ = roadrunner.roadrunner.RoadRunner.getFullStoichiometryMatrix.__doc__
+    def __init__(self):
+        object.__setattr__(self, '_s', {'relative_tolerance': 1e-6, 'absolute_tolerance': 1e-12})
 
-    def setIntegrator(self, name):
-        if name not in ('cvode', 'gillespie'):  # other integrators need roadrunner's model
-            self._load_rr()
-        roadrunner.roadrunner.RoadRunner.setIntegrator(self, name)
-    setIntegrator.__doc__ = roadrunner.roadrunner.RoadRunner.setIntegrator.__doc__
+    def getName(self):
+        return 'forward'
 
-    integrator = property(roadrunner.roadrunner.RoadRunner.getIntegrator, setIntegrator)
+    def getSettings(self):
+        return list(self._s)
 
-    def getRatesOfChange(self):
-        lz = self.__dict__.get('_lz')
-        if lz is None or not lz['st'].plain:
-            return self._super().getRatesOfChange()
-        return np.array([self._lz_get(lz, s + "'") for s in lz['st'].ids])
-    getRatesOfChange.__doc__ = roadrunner.roadrunner.RoadRunner.getRatesOfChange.__doc__
+    def getValue(self, key):
+        if key not in self._s:
+            raise ValueError("forward: no setting '%s'" % key)
+        return self._s[key]
+
+    def setValue(self, key, value):
+        self.getValue(key)
+        self._s[key] = float(value)
+
+
+# ---------------------------------------------------------------------
+# r.model: libroadrunner's ExecutableModel API
+# ---------------------------------------------------------------------
+def _sbml_ids(sbml, tag, attr):
+    """Ids from the SBML text: <tag ... attr="x"> (rule variables, initial assignment symbols, event ids)."""
+    return re.findall(r'<(?:\w+:)?%s\b[^>]*?\b%s\s*=\s*"([^"]*)"' % (tag, attr), sbml)
+
+
+class ExecutableModel(object):
+    """``r.model``: ids and values of the loaded model, as libroadrunner's ExecutableModel."""
+
+    def __init__(self, r):
+        self._r = r
+
+    def _get(self, ids, fmt, idx=None):
+        ids = ids if idx is None else [ids[i] for i in np.atleast_1d(idx)]
+        return np.array(self._r._rr.getValues([fmt % i for i in ids]), dtype=float)
+
+    def _set(self, ids, fmt, args):
+        idx, vals = (range(len(ids)), args[0]) if len(args) == 1 else args
+        for i, v in zip(np.atleast_1d(idx), np.atleast_1d(vals)):
+            self._r._rr.setValue(fmt % ids[i], float(v))
+
+    def __getitem__(self, key):
+        return self._r.getValue(key)
+
+    def __setitem__(self, key, value):
+        self._r.setValue(key, value)
+
+    def keys(self):
+        return [s for _, l in self._r._rr.getAvailableTimeCourseSymbols() for s in l]
+
+    def values(self):
+        return [self[k] for k in self.keys()]
+
+    def items(self):
+        return list(zip(self.keys(), self.values()))
+
+    def getTime(self):
+        return self._r._rr.getCurrentTime()
+
+    def setTime(self, t):
+        self._r._rr.setValue('time', float(t))
+
+    def reset(self):
+        self._r.reset()
+
+    def getModelName(self):
+        return self._r.getModelName()
+
+    def getInfo(self):
+        return self._r.getInfo()
+
+    def getNumEvents(self):
+        return len(self.getEventIds())
+
+    def getEventIds(self):
+        return _sbml_ids(self._r._rr.getSBML(), 'event', 'id')
+
+    def getAssignmentRuleIds(self):
+        return _sbml_ids(self._r._rr.getSBML(), 'assignmentRule', 'variable')
+
+    def getInitialAssignmentIds(self):
+        return _sbml_ids(self._r._rr.getSBML(), 'initialAssignment', 'symbol')
 
     def getRateRuleIds(self):
-        lz = self.__dict__.get('_lz')
-        return self._super().getRateRuleIds() if lz is None else list(lz['info']['rate_rule_ids'])
-    getRateRuleIds.__doc__ = roadrunner.roadrunner.RoadRunner.getRateRuleIds.__doc__
+        return list(self._r._rr.getRateRuleIds())
 
-    # ---------------------------------------------------------------------
-    # Turbo (Rust engine) overrides. Each public method runs its Rust path through _run, which
-    # records the outcome in lastRun and falls back to roadrunner when the path raises _Fallback.
-    # ---------------------------------------------------------------------
+    def getNumRateRules(self):
+        return len(self.getRateRuleIds())
+
+    def getRateRuleRates(self):
+        return self._get(self.getRateRuleIds(), "%s'")
+
+    def getConservedMoietyIds(self):
+        return list(self._r._rr.getConservedMoietyIds())
+
+    def getNumConservedMoieties(self):
+        return len(self.getConservedMoietyIds())
+
+    def getConservedMoietyValues(self, idx=None):
+        return self._get(self.getConservedMoietyIds(), '%s', idx)
+
+    def setConservedMoietyValues(self, *args):
+        self._set(self.getConservedMoietyIds(), '%s', args)
+
+    def getFloatingSpeciesConcentrationIds(self):
+        return ['[%s]' % s for s in self._r._rr.getFloatingSpeciesIds()]
+
+    def getBoundarySpeciesConcentrationIds(self):
+        return ['[%s]' % s for s in self._r._rr.getBoundarySpeciesIds()]
+
+    def getFloatingSpeciesInitConcentrationIds(self):
+        return ['init([%s])' % s for s in self._r._rr.getFloatingSpeciesIds()]
+
+    def getFloatingSpeciesInitAmountIds(self):
+        return ['init(%s)' % s for s in self._r._rr.getFloatingSpeciesIds()]
+
+    def getConservedMoietyId(self, i):
+        return self.getConservedMoietyIds()[i]
+
+    def getEventId(self, i):
+        return self.getEventIds()[i]
+
+    def getFloatingSpeciesAmountRate(self, i, reactionRates=None):
+        """Amount rate of floating species i from the reactions: N[i] . reactionRates (default: the current rates)."""
+        n, rows, cols = self._r._rr.getFullStoichiometryMatrix()
+        v = self.getReactionRates() if reactionRates is None else np.asarray(reactionRates)
+        ids = self._r._rr.getReactionIds()
+        return float(np.asarray(n)[rows.index(self._r._rr.getFloatingSpeciesIds()[i]), [cols.index(r) for r in ids]] @ v)
+
+    def _compartment_index(self, sid):
+        m = re.search(r'<(?:\w+:)?species\b[^>]*?\bid\s*=\s*"%s"[^>]*' % re.escape(sid), self._r._rr.getSBML())
+        c = re.search(r'\bcompartment\s*=\s*"([^"]*)"', m.group(0)).group(1)
+        return self._r._rr.getCompartmentIds().index(c)
+
+    def getCompartmentIndexForFloatingSpecies(self, i):
+        return self._compartment_index(self._r._rr.getFloatingSpeciesIds()[i])
+
+    def getCompartmentIndexForBoundarySpecies(self, i):
+        return self._compartment_index(self._r._rr.getBoundarySpeciesIds()[i])
+
+    def getStoichiometry(self, speciesIndex, reactionIndex):
+        n, rows, cols = self._r._rr.getFullStoichiometryMatrix()
+        rr = self._r._rr
+        return float(np.asarray(n)[rows.index(rr.getFloatingSpeciesIds()[speciesIndex]), cols.index(rr.getReactionIds()[reactionIndex])])
+
+    def getStateVectorId(self, i):
+        return list(self._r._rr.getRateRuleIds() + self._r._rr.getFloatingSpeciesIds())[i]
+
+
+def _model_group(ids, getters, setters):
+    """ExecutableModel ids / count / value getters (name -> selection format) / setters for one id list."""
+    def ids_(self):
+        return list(getattr(self._r._rr, ids)())
+
+    def num(self):
+        return len(getattr(self._r._rr, ids)())
+
+    def getter(fmt):
+        return lambda self, idx=None: self._get(getattr(self._r._rr, ids)(), fmt, idx)
+
+    def setter(fmt):
+        return lambda self, *args: self._set(getattr(self._r._rr, ids)(), fmt, args)
+    group = ids[3:-3]  # FloatingSpecies, GlobalParameter, ...
+    out = {ids: ids_, 'getNum' + group + ('' if group.endswith('Species') else 's'): num,
+           'get%sId' % group: lambda self, i: getattr(self._r._rr, ids)()[i]}
+    out.update({n: getter(f) for n, f in getters.items()})
+    out.update({n: setter(f) for n, f in setters.items()})
+    return out
+
+
+for _ids, _get, _put in (
+        ('getFloatingSpeciesIds', {'getFloatingSpeciesConcentrations': '[%s]', 'getFloatingSpeciesAmounts': '%s',
+                                   'getFloatingSpeciesInitConcentrations': 'init([%s])',
+                                   'getFloatingSpeciesInitAmounts': 'init(%s)',
+                                   'getFloatingSpeciesConcentrationRates': "[%s]'",
+                                   'getFloatingSpeciesAmountRates': "%s'"},
+         {'setFloatingSpeciesConcentrations': '[%s]', 'setFloatingSpeciesAmounts': '%s',
+          'setFloatingSpeciesInitConcentrations': 'init([%s])', 'setFloatingSpeciesInitAmounts': 'init(%s)'}),
+        ('getBoundarySpeciesIds', {'getBoundarySpeciesConcentrations': '[%s]', 'getBoundarySpeciesAmounts': '%s',
+                                   'getBoundarySpeciesInitConcentrations': 'init([%s])',
+                                   'getBoundarySpeciesInitAmounts': 'init(%s)'},
+         {'setBoundarySpeciesConcentrations': '[%s]', 'setBoundarySpeciesAmounts': '%s',
+          'setBoundarySpeciesInitConcentrations': 'init([%s])', 'setBoundarySpeciesInitAmounts': 'init(%s)'}),
+        ('getGlobalParameterIds', {'getGlobalParameterValues': '%s', 'getGlobalParameterInitValues': 'init(%s)'},
+         {'setGlobalParameterValues': '%s', 'setGlobalParameterInitValues': 'init(%s)'}),
+        ('getCompartmentIds', {'getCompartmentVolumes': '%s', 'getCompartmentInitVolumes': 'init(%s)'},
+         {'setCompartmentVolumes': '%s', 'setCompartmentInitVolumes': 'init(%s)'}),
+        ('getReactionIds', {'getReactionRates': '%s'}, {})):
+    for _n, _f in _model_group(_ids, _get, _put).items():
+        _f.__name__ = _n
+        setattr(ExecutableModel, _n, _f)
+ExecutableModel.getStateVectorRate = ExecutableModel.getFloatingSpeciesAmountRates
+ExecutableModel.getRateRuleSymbols = ExecutableModel.getRateRuleIds
+ExecutableModel.getAllTimeCourseComponentIds = ExecutableModel.keys
+ExecutableModel.getValue = ExecutableModel.__getitem__
+ExecutableModel.setValue = ExecutableModel.__setitem__
+ExecutableModel.iterkeys, ExecutableModel.itervalues, ExecutableModel.iteritems = \
+    ExecutableModel.keys, ExecutableModel.values, ExecutableModel.items
+
+
+# ---------------------------------------------------------------------
+# Model editing: libroadrunner's method -> (roadrunner_nitro.sbml_edit op, argument defaults after the ids)
+# ---------------------------------------------------------------------
+_EDITS = {
+    'addSpeciesAmount': ('add_species_amount', 2, (0.0, False, False, '')),
+    'addSpeciesConcentration': ('add_species_concentration', 2, (0.0, False, False, '')),
+    'removeSpecies': ('remove_species', 1, ()),
+    'setBoundary': ('set_boundary', 2, ()),
+    'setHasOnlySubstanceUnits': ('set_has_only_substance_units', 2, ()),
+    'setConstant': ('set_constant', 2, ()),
+    'removeReaction': ('remove_reaction', 1, (False,)),
+    'setReversible': ('set_reversible', 2, ()),
+    'setKineticLaw': ('set_kinetic_law', 2, ()),
+    'addParameter': ('add_parameter', 2, ()),
+    'removeParameter': ('remove_parameter', 1, ()),
+    'addCompartment': ('add_compartment', 2, ()),
+    'removeCompartment': ('remove_compartment', 1, ()),
+    'addInitialAssignment': ('add_initial_assignment', 2, ()),
+    'addAssignmentRule': ('add_assignment_rule', 2, ()),
+    'addRateRule': ('add_rate_rule', 2, ()),
+    'addEvent': ('add_event', 3, ()),
+    'addTrigger': ('add_trigger', 2, ()),
+    'setPersistent': ('set_persistent', 2, ()),
+    'setTriggerInitialValue': ('set_trigger_initial_value', 2, ()),
+    'addPriority': ('add_priority', 2, ()),
+    'addDelay': ('add_delay', 2, ()),
+    'addEventAssignment': ('add_event_assignment', 3, ()),
+    'removeEventAssignments': ('remove_event_assignments', 2, ()),
+    'removeEvent': ('remove_event', 1, ()),
+}
+
+
+def _edit_method(name, op, n, defaults):
+    def f(self, *args, **kwargs):
+        regen = kwargs.pop('forceRegenerate', True)
+        args = list(args) + [None] * (n + len(defaults) - len(args))
+        if len(args) > n + len(defaults):  # forceRegenerate given positionally
+            regen = args.pop()
+        for i, d in enumerate(defaults):
+            if args[n + i] is None:
+                args[n + i] = d
+        names = f._kw
+        for k, v in kwargs.items():
+            args[names.index(k)] = v
+        self._edit(op, args, regen)
+    f.__name__ = name
+    f._kw = {'addSpeciesAmount': ['sid', 'compartment', 'initAmount', 'hasOnlySubstanceUnits', 'boundaryCondition', 'substanceUnits'],
+             'addSpeciesConcentration': ['sid', 'compartment', 'initConcentration', 'hasOnlySubstanceUnits',
+                                         'boundaryCondition', 'substanceUnits'],
+             'removeReaction': ['rid', 'deleteUnusedParameters']}.get(name, [])
+    f.__doc__ = "libroadrunner's %s (SBML edited in Rust; forceRegenerate=True recompiles keeping the current values)." % name
+    return f
+
+
+def _set_attr(sbml, tag, id_, attr, value, id_attr='id'):
+    """SBML text with attribute ``attr`` of the <tag id_attr="id_"> start tag (id_ None: the first <tag>) set to ``value``."""
+    sel = r'[^>]*?' if id_ is None else r'[^>]*?\b%s\s*=\s*"%s"[^>]*?' % (id_attr, re.escape(id_))
+    pat = re.compile(r'<((?:\w+:)?%s)\b(%s)(/?)>' % (tag, sel))
+    m = pat.search(sbml)
+    if m is None:
+        raise ValueError("no %s '%s' in the model" % (tag, id_))
+    body = re.sub(r'\s%s\s*=\s*"[^"]*"' % attr, '', m.group(2)) + ' %s=%s' % (attr, quoteattr(str(value)))
+    return sbml[:m.start()] + '<%s%s%s>' % (m.group(1), body, m.group(3)) + sbml[m.end():]
+
+
+# ---------------------------------------------------------------------
+# RoadRunner
+# ---------------------------------------------------------------------
+class ExtendedRoadRunner(object):
+    """libroadrunner's RoadRunner API on the Rust engine, plus tellurium's helpers (plot, export, ...).
+
+    RoadRunner(sbml=None): SBML text or a file path."""
+
+    def __init__(self, sbml=None, options=None):
+        # options (libroadrunner's LoadSBMLOptions): the Rust engine has no load options
+        object.__setattr__(self, '_rr', roadrunner_nitro.RoadRunner())
+        object.__setattr__(self, '_data', None)
+        object.__setattr__(self, '_last_run', None)
+        object.__setattr__(self, '_attrs', None)
+        object.__setattr__(self, 'model', ExecutableModel(self))
+        object.__setattr__(self, '_sens', SensitivitySolver())
+        if sbml is not None:
+            self.load(sbml)
+
+    # ------------------------------------------------------------ loading, SBML
+    def load(self, sbml):
+        """Load an SBML model from text or a file path."""
+        if isinstance(sbml, bytes):
+            sbml = sbml.decode('utf-8')
+        if sbml.startswith('file://'):
+            sbml = sbml[len('file://'):]
+        self._rr.load(sbml)
+        self._changed()
+
+    def _changed(self):  # the model's ids may have changed
+        object.__setattr__(self, '_attrs', None)
+
+    def clearModel(self):
+        self._rr.clearModel()
+        self._changed()
+
+    def isModelLoaded(self):
+        return self._rr.isModelLoaded()
+
+    def getModel(self):
+        return self.model
+
+    def getSBML(self, level=0, version=0):
+        """The SBML as loaded (with model edits)."""
+        if level or version:
+            raise ValueError("getSBML: converting to another SBML level/version is not supported")
+        return self._rr.getSBML()
+
+    def getCurrentSBML(self, level=0, version=0):
+        """The SBML with the current values as initial values."""
+        if level or version:
+            raise ValueError("getCurrentSBML: converting to another SBML level/version is not supported")
+        return self._rr.getCurrentSBML()
+
+    def getParamPromotedSBML(self, sbml=None):
+        """SBML with local parameters promoted to global ones (of ``sbml``, default the current model)."""
+        return roadrunner_nitro.sbml_edit('get_param_promoted_sbml', self.getSBML() if sbml is None else sbml)
+
+    def validateCurrentSBML(self):
+        return roadrunner_nitro.sbml_edit('validate_current_sbml', self.getSBML())
+
+    def getModelName(self):
+        m = re.search(r'<(?:\w+:)?model\b[^>]*?\bname\s*=\s*"([^"]*)"', self._rr.getSBML())
+        return m.group(1) if m else self.getModelId()
+
+    def getModelId(self):
+        m = re.search(r'<(?:\w+:)?model\b[^>]*?\bid\s*=\s*"([^"]*)"', self._rr.getSBML())
+        return m.group(1) if m else ''
+
+    def getInfo(self):
+        rr = self._rr
+        return '\n'.join(['<roadrunner.RoadRunner() >', 'engine: Rust (roadrunner_nitro)',
+                          'model loaded: %s' % rr.isModelLoaded(), 'modelName: %s' % self.getModelName(),
+                          'integrator: %s' % rr.getIntegratorName(), 'conservedMoietyAnalysis: %s' % rr.conservedMoietyAnalysis,
+                          'floating species: %d' % len(rr.getFloatingSpeciesIds()),
+                          'reactions: %d' % len(rr.getReactionIds())])
+
+    def getExtendedVersionInfo(self):
+        return 'roadrunner_nitro (Rust engine)'
+
+    # ------------------------------------------------------------ values
+    def getValue(self, sel):
+        return self._rr.getValue(sel)
+
+    def setValue(self, sel, value):
+        self._rr.setValue(sel, float(value))
+
+    def setValues(self, keysOrDict, values=None):
+        items = keysOrDict.items() if values is None else zip(keysOrDict, values)
+        for k, v in items:
+            self.setValue(k, v)
+
+    def __getitem__(self, sel):
+        if isinstance(sel, (list, tuple)):
+            return np.array(self._rr.getValues(list(sel)))
+        return self._rr.getValue(sel)
+
+    def __setitem__(self, sel, value):
+        self.setValue(sel, value)
+
+    def keys(self):
+        return self.model.keys()
+
+    def values(self):
+        return self.model.values()
+
+    def items(self):
+        return self.model.items()
+
+    iterkeys, itervalues, iteritems = keys, values, items
+
+    def resetSelectionLists(self):
+        """Selections back to the defaults: time, floating species concentrations, rate-rule values."""
+        fs = self._rr.getFloatingSpeciesIds()
+        self.timeCourseSelections = ['time'] + ['[%s]' % s for s in fs] + [v for v in self._rr.getRateRuleIds() if v not in fs]
+        self.steadyStateSelections = ['[%s]' % s for s in fs]
+
+    def getHasOnlySubstanceUnits(self, sid):
+        m = re.search(r'<(?:\w+:)?species\b[^>]*?\bid\s*=\s*"%s"[^>]*' % re.escape(sid), self._rr.getSBML())
+        if m is None:
+            raise ValueError("no species '%s'" % sid)
+        return re.search(r'\bhasOnlySubstanceUnits\s*=\s*"(true|1)"', m.group(0)) is not None
+
+    def getSelectedValues(self):
+        return np.array(self._rr.getValues(self.timeCourseSelections))
+
+    def _attr_map(self):
+        """Model ids as attributes: r.S1 (concentration), r.S1_amt, r.S1_conc, parameters, compartments, rates."""
+        a = self._attrs
+        if a is None:
+            rr, a = self._rr, {}
+            for s in rr.getFloatingSpeciesIds():
+                a.update({s: '[%s]' % s, s + '_conc': '[%s]' % s, s + '_amt': s})
+            a.update({s: '[%s]' % s for s in rr.getBoundarySpeciesIds()})
+            a.update({k: k for k in rr.getGlobalParameterIds() + rr.getCompartmentIds() + rr.getReactionIds()})
+            object.__setattr__(self, '_attrs', a)
+        return a
+
+    def __getattr__(self, name):
+        if not name.startswith('_'):
+            sel = self._attr_map().get(name)
+            if sel is not None:
+                return self._rr.getValue(sel)
+        raise AttributeError("'RoadRunner' object has no attribute '%s'" % name)
+
+    def __setattr__(self, name, value):
+        if not name.startswith('_') and not hasattr(type(self), name):
+            sel = self._attr_map().get(name)
+            if sel is not None:
+                return self.setValue(sel, value)
+        object.__setattr__(self, name, value)
+
+    def __dir__(self):
+        return sorted(set(dir(type(self))) | set(self._attr_map()))
+
+    def getCurrentTime(self):
+        return self._rr.getCurrentTime()
+
+    def _ran(self, method):
+        object.__setattr__(self, '_last_run', dict(method=method, engine='rust', reason=None))
+
     @property
     def lastRun(self):
-        """What answered the last turbo-capable call: dict(method, engine='rust'|'roadrunner',
-        reason=None or why roadrunner ran; for Rust time courses also solver, bdf_steps,
-        rodas_steps, rejected, switched, atol). None before any such call."""
-        r = self.__dict__.get('_last_run')
+        """The last simulate/steadyState/MCA-type call: dict(method, engine='rust', reason=None);
+        None before any such call. (Kept from the two-engine era: the engine is always Rust.)"""
+        r = self._last_run
         return None if r is None else dict(r)
 
-    def _run(self, method, rust, fallback):
-        """rust() unless it raises _Fallback, then fallback(); records lastRun either way."""
-        try:
-            res = rust()
-        except _Fallback as e:
-            _no_fallback('%s: %s' % (method, e))
-            self.__dict__['_last_run'] = dict(method=method, engine='roadrunner', reason=str(e))
-            return fallback()
-        info = self.__dict__.pop('_run_info', None) or {}
-        self.__dict__['_last_run'] = dict(method=method, engine='rust', reason=None, **info)
-        return res
+    # ------------------------------------------------------------ selections
+    timeCourseSelections = selections = property(
+        lambda self: list(self._rr.timeCourseSelections),
+        lambda self, s: setattr(self._rr, 'timeCourseSelections', list(s)))
+    steadyStateSelections = property(
+        lambda self: list(self._rr.steadyStateSelections),
+        lambda self, s: setattr(self._rr, 'steadyStateSelections', list(s)))
 
-    def _rs(self):
-        """The _RsModel for the current model; raises _Fallback (turbo off/unsupported) with the reason."""
-        lz = self.__dict__.get('_lz')
-        if lz is not None:
-            if _turbo:
-                return lz['st']
-            self._load_rr()
-        if not _turbo:
-            raise _Fallback('turbo is off' if _has_rs else 'roadrunner_nitro is not installed')
-        mdl = self.model
-        if mdl is None:
-            raise _Fallback('no model loaded')
-        c = self.__dict__.get('_rs_cache')
-        # rebuild on a CMA switch or when a compartment volume baked into the Rust model changes
-        cma = self.conservedMoietyAnalysis
-        if c is None or c[0] != (cma, mdl.getCompartmentVolumes()[c[2]].tobytes()):
-            try:
-                st = self._rs_build()
-            except _Fallback as e:
-                st = e
-            cc = st.cconst if isinstance(st, _RsModel) else list(range(self.model.getNumCompartments()))
-            c = self.__dict__['_rs_cache'] = ((cma, mdl.getCompartmentVolumes()[cc].tobytes()), st, cc)
-        if isinstance(c[1], _Fallback):
-            raise c[1]
-        return c[1]
+    def getSteadyStateSelectionStrings(self):
+        return self.steadyStateSelections
 
-    def _rs_or_none(self):
-        try:
-            return self._rs()
-        except _Fallback:
-            return None
+    @property
+    def conservedMoietyAnalysis(self):
+        return self._rr.conservedMoietyAnalysis
 
-    def _rs_build(self):
-        from ..analysis.rrs_bridge import from_roadrunner
-        info = {}
-        try:
-            m = from_roadrunner(self, info)
-        except (NotImplementedError, ValueError) as e:
-            raise _Fallback('model not supported by the Rust engine: %s' % e)
-        mdl = self.model
-        ids = [list(f()) for f in (mdl.getFloatingSpeciesIds, mdl.getBoundarySpeciesIds, mdl.getGlobalParameterIds,
-                                   mdl.getCompartmentIds, mdl.getReactionIds)]
-        # steady state: roadrunner refuses events, and time-dependent rates have none
-        nss = 'symbols/time' in self.getCurrentSBML() or mdl.getNumEvents() > 0
-        return _RsModel(m, info, ids, mdl.getCompartmentVolumes(), nss)
+    @conservedMoietyAnalysis.setter
+    def conservedMoietyAnalysis(self, on):
+        self._rr.conservedMoietyAnalysis = bool(on)
+        self._changed()
 
-    def _rs_x(self, st, mdl=None):
-        """Current values of st.keys: parameters, compartments, boundary species (SBML units), species conc."""
-        lz = self.__dict__.get('_lz')
-        if lz is not None:
-            return lz['x'].copy()
-        mdl = self.model if mdl is None else mdl
-        b = [mdl.getBoundarySpeciesConcentrations(), mdl.getBoundarySpeciesAmounts()] if st.bidx else []
-        return np.concatenate([mdl.getGlobalParameterValues(), mdl.getCompartmentVolumes(), *b,
-                               mdl.getFloatingSpeciesConcentrations()])[st.xidx]
+    # ------------------------------------------------------------ solvers
+    def getIntegrator(self):
+        return Solver(self._rr, False)
 
-    def _rs_sync(self, st, d, mdl=None, plan='sync'):
-        """Write Rust values (dict id -> value; species as concentrations) back into the roadrunner model."""
-        arr = isinstance(d, np.ndarray)  # all outputs, in output_ids order (else a dict id -> value)
-        lz = self.__dict__.get('_lz')
-        if lz is not None:  # no roadrunner model yet: the state is lz['x']
-            if arr:
-                lz['x'][:] = d[lz['xo']]
-            else:
-                for k, v in d.items():
-                    if k in st.kpos:
-                        lz['x'][st.kpos[k]] = v
-            return
-        mdl = self.model if mdl is None else mdl
-        for f, idx, names, oidx in getattr(st, plan):
-            if arr and f not in ('amount', 'conc'):
-                getattr(mdl, f)(idx, d[oidx])
-                continue
-            if arr:
-                have = list(zip(idx, names, d[oidx]))
-            else:
-                have = [(i, n, d[n]) for i, n in zip(idx, names) if n in d]
-            if not have:
-                continue
-            if f in ('amount', 'conc'):
-                for _, n, x in have:
-                    ExtendedRoadRunner.setValue(self, n if f == 'amount' else '[%s]' % n, float(x))
-            else:
-                i, _, x = zip(*have)
-                getattr(mdl, f)(list(i), np.array(x, dtype=float))
+    def setIntegrator(self, name):
+        self._rr.setIntegrator(name if isinstance(name, str) else name.getName())
 
-    def _rs_tol(self, solver):
-        """(rtol, atol) of a solver, or _Fallback for settings Rust doesn't take."""
-        try:
-            return float(solver.getValue('relative_tolerance')), float(solver.getValue('absolute_tolerance'))
-        except TypeError:
-            raise _Fallback('per-species tolerance vectors')
+    integrator = property(getIntegrator, setIntegrator)
 
-    def _rs_integrator(self, integ):
-        """The integrator's name if Rust honours it with its current settings, else _Fallback."""
-        name = integ.getName()
-        if name not in _RS_INTEGRATORS:
-            raise _Fallback('integrator %s' % name)
-        keys, vals = _RS_INTEGRATORS[name]
-        cfg = integ.getSettingsMap()
-        bad = [k for k, v in zip(keys, vals) if cfg.get(k) != v]
-        if bad:
-            raise _Fallback('%s settings %s' % (name, ', '.join(bad)))
-        return name
+    def getIntegratorByName(self, name):
+        if name not in INTEGRATORS:
+            raise ValueError("no integrator '%s' (one of %s)" % (name, INTEGRATORS))
+        return Solver(self._rr, False, name)
 
-    def _rs_advance(self, st, times, ores, integ):
-        """Run the Rust model from the current state over times and write the final state back
-        (species, event-changed values, time). Returns the outputs at times."""
-        rtol, atol = self._rs_tol(integ)
-        mdl = self.model
-        Y, final = st.advance(self._rs_x(st, mdl).tolist(), times, ores, rtol, atol,
-                              st.atol_scale(mdl.getFloatingSpeciesInitConcentrations()))
-        if not np.isfinite(Y).all() and (~np.isfinite(Y) & np.isfinite(Y[:1])).any():  # went non-finite during the run
-            raise _Fallback('non-finite Rust output')
-        self._rs_sync(st, final, mdl)
-        mdl.setTime(times[-1])
-        lz = self.__dict__.get('_lz')
-        if lz is not None:
-            lz['live'] = (lz['x'].copy(), lz['t'])
-        self.__dict__['_run_info'] = st.stats
-        return Y
+    makeIntegrator = getIntegratorByName
 
-    def _rs_mcast(self):
-        st = self._rs()
-        if not st.mca:
-            raise _Fallback('rate rules, events or time-dependent rates (no steady state in roadrunner either)'
-                            if st.plain else 'rate-rule or non-plain species')
-        return st
+    def setIntegratorSetting(self, integratorName, settingName, value):
+        self.getIntegratorByName(integratorName).setValue(settingName, value)
 
-    def simulate(self, start=None, end=None, points=None, selections=None, output_file=None, steps=None, times=None):
-        # Turbo fast path for simulate(start, end, points or steps[, selections]) with CVODE: what
-        # roadrunner's wrapper does (its simulate options are private and reset by every call) without
-        # its per-call overhead. Anything else, or a model/setting Rust can't run, takes the wrapper
-        # (which also turns gillespie's variable_step_size off for such calls, and calls _simulate).
-        def wrapper():
-            return super(ExtendedRoadRunner, self).simulate(start, end, points, selections, output_file, steps, times)
-        if not (_turbo and output_file is None and times is None and start is not None and end is not None
-                and (points is None) != (steps is None) and type(points) is not list):
-            return wrapper()
-        n = points - 1 if steps is None else steps
-        integ = self.integrator
-        sel = None
-        try:
-            if n < 1 or integ.getName() != 'cvode':
-                raise _Fallback('wrapper')
-            st = self._rs()
-            sel = list(self.timeCourseSelections)
-        except _Fallback:
-            return wrapper()
-        # new selections go through roadrunner's wrapper once (it validates and sets them)
-        if not (selections is None or (isinstance(selections, (list, tuple)) and sel == list(selections))):
-            return wrapper()
+    def integratorExists(self, name):
+        return name in INTEGRATORS
 
-        def rust():
-            res = self.__dict__['_rs_data'] = self._rs_simulate(st, _Opts(start=start, end=end, steps=n), sel, integ)
-            return res
-        return self._run('simulate', rust, wrapper)
-    simulate.__doc__ = roadrunner.roadrunner.RoadRunner.simulate.__doc__
+    def getExistingIntegratorNames(self):
+        return list(INTEGRATORS)
 
-    def _simulate(self, o):
-        def rust():
-            return self._rs_simulate(self._rs(), o)
+    getAvailableIntegrators = getRegisteredIntegratorNames = getExistingIntegratorNames
 
-        def fallback():
-            self.__dict__['_rs_data'] = None
-            st = self._rs_or_none()
-            if st is not None:
-                st.reset_events()  # roadrunner moves the event triggers itself; Rust restarts them next time
-            return self._super()._simulate(o)
-        res = self._run('simulate', rust, fallback)
-        if self.__dict__.get('_last_run', {}).get('engine') == 'rust':
-            self.__dict__['_rs_data'] = res
-        return res
+    def getSteadyStateSolver(self):
+        return Solver(self._rr, True)
 
-    def _rs_simulate(self, st, o, sel=None, integ=None):
-        integ = self.integrator if integ is None else integ
-        if o.output_file:
-            raise _Fallback('output_file')
-        name = self._rs_integrator(integ)
-        times = np.asarray(o.times, dtype=float) if len(o.times) else st.times(o.start, o.end, o.steps)
-        sel = list(self.timeCourseSelections) if sel is None else sel
-        cols = st.cols(sel)
-        if cols is None:
-            raise _Fallback('selections %s' % sel)
-        if o.reset_model:
+    def setSteadyStateSolver(self, name):
+        self._rr.setSteadyStateSolver(name if isinstance(name, str) else name.getName())
+
+    steadyStateSolver = property(getSteadyStateSolver, setSteadyStateSolver)
+
+    def getSteadyStateSolverByName(self, name):
+        if name not in STEADY_STATE_SOLVERS:
+            raise ValueError("no steady-state solver '%s' (one of %s)" % (name, STEADY_STATE_SOLVERS))
+        return Solver(self._rr, True, name)
+
+    makeSteadyStateSolver = getSteadyStateSolverByName
+
+    def steadyStateSolverExists(self, name):
+        return name in STEADY_STATE_SOLVERS
+
+    def getExistingSteadyStateSolverNames(self):
+        return list(STEADY_STATE_SOLVERS)
+
+    getRegisteredSteadyStateSolverNames = getExistingSteadyStateSolverNames
+
+    def getSensitivitySolver(self):
+        return self._sens
+
+    def setSensitivitySolver(self, name):
+        self.getSensitivitySolverByName(name if isinstance(name, str) else name.getName())
+
+    def getSensitivitySolverByName(self, name):
+        if name != 'forward':
+            raise ValueError("no sensitivity solver '%s' (one of ['forward'])" % name)
+        return self._sens
+
+    makeSensitivitySolver = getSensitivitySolverByName
+
+    def sensitivitySolverExists(self, name):
+        return name == 'forward'
+
+    def getExistingSensitivitySolverNames(self):
+        return ['forward']
+
+    getRegisteredSensitivitySolverNames = getExistingSensitivitySolverNames
+
+    def getDiffStepSize(self):
+        return self._rr.diffStepSize
+
+    def setDiffStepSize(self, value):
+        self._rr.diffStepSize = float(value)
+
+    diffstep = property(getDiffStepSize, setDiffStepSize)
+
+    def getFluxThreshold(self):
+        return self._rr.getFluxThreshold()
+
+    def setFluxThreshold(self, value):
+        self._rr.setFluxThreshold(float(value))
+
+    def getSeed(self):
+        return self._rr.getSeed()
+
+    def setSeed(self, seed, resetModel=True):
+        self._rr.setSeed(int(seed))
+        if resetModel:
             self.reset()
-        pre = cols.init_values(self)  # init(...) values before the run
-        if name == 'gillespie':
-            Y = self._rs_ssa(st, o, times, cols.outs)
-        else:
-            Y = self._rs_advance(st, times, cols.ores, integ)
-        return _named(cols.apply(Y, pre), cols=sel)
 
-    def _rs_ssa(self, st, o, times, outs):
-        """Gillespie in Rust: fixed output points, or every reaction firing when variable_step_size.
-        Writes the final state back; returns the output rows."""
-        integ = self.integrator
-        # roadrunner draws successive runs from one seeded stream: same seed -> same sequence of runs
-        seed = int(integ.getValue('seed')) % 2 ** 64
-        if seed == 2 ** 64 - 1 and '_lz' in self.__dict__:  # unset: roadrunner seeds from the clock at load
-            seed = self.__dict__.setdefault('_rs_auto_seed', np.random.SeedSequence().entropy % (2 ** 64 - 1))
-        c = self.__dict__.get('_rs_seed')
-        if c is None or c[0] != seed:
-            c = self.__dict__['_rs_seed'] = [seed, 0]
-        c[1] += 1
-        run_seed = (seed + c[1] * 0x9E3779B97F4A7C15) % 2 ** 64
-        m, x, k = st.m, self._rs_x(st), st.keys
+    # ------------------------------------------------------------ time courses
+    def simulate(self, start=None, end=None, points=None, selections=None, output_file=None, steps=None, times=None):
+        """Time course from ``start`` to ``end`` at ``points`` points (or ``steps`` + 1, or at ``times``)
+        with the current integrator; returns a NamedArray (columns: the selections, which become
+        timeCourseSelections). The model is left at the end. ``output_file``: also written as CSV."""
+        if isinstance(points, (list, tuple)):  # simulate(start, end, selections)
+            points, selections = None, points
+        if steps is not None:
+            points = int(steps) + 1
+        rr = self._rr
+        sel = None if selections is None else list(selections)
+        # gillespie / rk45 on a grid when points/times are given, else their variable steps
+        vss = rr.getIntegratorName() in ('gillespie', 'rk45') and (points is not None or times is not None) and \
+            rr.getIntegratorSetting('variable_step_size')
+        if vss:
+            rr.setIntegratorSetting('variable_step_size', False)
         try:
-            if integ.getValue('variable_step_size'):
-                R = roadrunner_nitro.gillespie_steps(m, k, x.tolist(), o.start, o.end, run_seed, outputs=outs + k,
-                                                  max_rows=int(integ.getValue('max_output_rows')))
-                Y, tend = R[:, 1:], R[-1, 0]
+            if times is not None:
+                y = rr.simulateTimes([float(t) for t in times], sel)
             else:
-                Y, tend = m.gillespie_batch(k, x[None], times, seed=run_seed, threads=1, outputs=outs + k)[0], times[-1]
-        except ValueError:
-            raise _Fallback('rate rules in a stochastic simulation')
-        if not np.isfinite(Y).all() and (~np.isfinite(Y) & np.isfinite(Y[:1])).any():  # went non-finite during the run
-            raise _Fallback('non-finite Rust output')
-        st.reset_events()  # the next ODE run starts its events fresh
-        self._rs_sync(st, dict(zip(k, Y[-1, len(outs):])))
-        self.model.setTime(tend)
-        self.__dict__['_run_info'] = dict(solver='gillespie')
-        return Y[:, :len(outs)]
+                # as libroadrunner: start 0, end 5, 51 points unless given (each call)
+                y = rr.simulate(0.0 if start is None else float(start), 5.0 if end is None else float(end),
+                                51 if points is None else int(points), sel)
+        finally:
+            if vss:
+                rr.setIntegratorSetting('variable_step_size', True)
+        out = NamedArray(y, colnames=rr.timeCourseSelections)
+        object.__setattr__(self, '_data', out)
+        self._ran('simulate')
+        if output_file:
+            np.savetxt(output_file, out, delimiter=',', header=','.join(out.colnames), comments='')
+        return out
+
+    def getSimulationData(self):
+        return self._data
+
+    def oneStep(self, currentTime, stepSize, reset=True):
+        self._ran('oneStep')
+        return self._rr.oneStep(float(currentTime), float(stepSize))
+
+    def simulateBatch(self, params, start, end, points, selections=None, threads=None):
+        """Many time courses at once on all CPU cores, one per parameter set.
+
+        :param params: dict ``{'k1': [...], 'k2': [...]}`` of equal-length sequences (zipped, not a
+            grid), or a pandas DataFrame. Ids can be parameters, compartments, boundary or floating
+            species (concentrations), as in ``r[id] = value``.
+        :param start, end, points: as in ``simulate``.
+        :param selections: output columns (default: timeCourseSelections).
+        :param threads: CPU threads (default: all cores).
+        :returns: array (n sets, points, len(selections)). Every run starts from the current state;
+            the model itself is not changed.
+        """
+        from ..analysis.rrs_bridge import from_sbml
+        if hasattr(params, 'to_dict'):
+            params = params.to_dict('list')
+        names = list(params)
+        vals = np.array([np.atleast_1d(np.asarray(params[k], dtype=float)) for k in names]).T.reshape(-1, len(names))
+        sel = list(self.timeCourseSelections if selections is None else selections)
+        times = np.linspace(start, end, points)
+        sbml = self.getCurrentSBML()
+        info = {}
+        m = from_sbml(sbml, info)
+        comp_of, amt = info['comp_of'], set(info['amount_params'])
+        outs, cols = [], []
+        for s in sel:  # selection -> (output column, column of the volume to multiply / divide by)
+            br = s[:1] == '[' and s[-1:] == ']'
+            v = s[1:-1] if br else s
+            if v in comp_of:
+                f = 0 if br != (v in amt) else (1 if not br else -1)  # amount wanted from conc: x V
+                cols.append((v, comp_of[v] if f else None, f))
+                outs += [v] + ([comp_of[v]] if f else [])
+            else:
+                cols.append((s, None, 0))
+                outs.append(s)
+        outs = list(dict.fromkeys(outs))
+        ok = set(outs) <= set(m.output_ids) and all(k.strip('[]') in set(m.state_ids) | set(m.output_ids) for k in names)
+        out = np.full((len(vals), points, len(sel)), np.nan)
+        if ok and len(vals):
+            ig = self.integrator
+            ic = dict(zip(self.getFloatingSpeciesIds(), self.model.getFloatingSpeciesInitConcentrations()))
+            asc = [abs(ic[s]) if abs(ic.get(s, 0.0)) > 1e-30 else 1.0 for s in m.state_ids]
+            Y = np.asarray(m.simulate_batch([k.strip('[]') for k in names], vals, times, threads=threads,
+                                            rtol=float(ig.relative_tolerance), atol=float(ig.absolute_tolerance),
+                                            outputs=outs, atol_scale=asc))
+            o = {n: i for i, n in enumerate(outs)}
+            for j, (c, vol, f) in enumerate(cols):
+                y = Y[:, :, o[c]]
+                out[:, :, j] = y * Y[:, :, o[vol]] if f == 1 else y / Y[:, :, o[vol]] if f == -1 else y
+        # selections the batch engine has no column for, and failed runs: one simulate per set
+        for i in (range(len(vals)) if not ok else np.flatnonzero(~np.isfinite(out).all(axis=(1, 2)))):
+            out[i] = self._one_run(sbml, names, vals[i], start, end, points, sel)
+        self._ran('simulateBatch')
+        return out
+
+    def _one_run(self, sbml, names, v, start, end, points, sel):
+        """One simulateBatch run on a copy of the current model (this one unchanged)."""
+        r = ExtendedRoadRunner(sbml)
+        r.setIntegrator(self.integrator.getName())
+        for k, x in self.integrator.getSettingsMap().items():
+            r.integrator.setValue(k, x)
+        sp = set(r.getFloatingSpeciesIds()) | set(r.getBoundarySpeciesIds())
+        for k, x in zip(names, v):
+            r.setValue('[%s]' % k if k in sp else k, float(x))  # species ids are concentrations
+        return np.asarray(r.simulate(start, end, points, sel))
 
     def timeSeriesSensitivities(self, start, stop, num, params=(), species=(), k=0):
-        return self._run('timeSeriesSensitivities',
-                         lambda: self._rs_tss(self._rs(), start, stop, num, list(params), list(species), k),
-                         lambda: self._super().timeSeriesSensitivities(start, stop, num, list(params), list(species), k))
-    timeSeriesSensitivities.__doc__ = roadrunner.roadrunner.RoadRunner.timeSeriesSensitivities.__doc__
+        """Forward sensitivities d species / d parameter along a time course (exact symbolic derivatives).
 
-    def _rs_tss(self, st, start, stop, num, params, species, k):
-        """Forward sensitivities in Rust: exact symbolic derivatives, parameters integrated in parallel."""
+        :returns: (times, sensitivities[time, parameter, species] in amounts, parameter ids, species ids);
+            params default: the global parameters; species: rate-rule states, then the (independent)
+            floating species. The model is left at ``stop``."""
+        from ..analysis.rrs_bridge import from_sbml
         if k not in (0, 1):
-            raise _Fallback('sensitivity order k=%s' % k)
+            raise ValueError('timeSeriesSensitivities: k must be 0 or 1')
+        info = {}
+        m = from_sbml(self.getCurrentSBML(), info)
+        states, fids = list(m.state_ids), self.getFloatingSpeciesIds()
         cma = self.conservedMoietyAnalysis
-        cs = list(self.getConservedMoietyIds()) if cma else []
-        # roadrunner: rows = global parameters (+ moiety totals, + rate-rule targets as zero rows);
-        # columns = rate-rule states, then (independent) floating species, in model order
-        rr_ids = [v for v in self.getRateRuleIds() if v in st.states]
-        base = rr_ids + (list(self.getIndependentFloatingSpeciesIds()) if cma else st.ids)
-        pkeys = set(st.keys[:st.off]) - set(st.bids)
-        if any(p not in pkeys and p not in cs for p in params) or \
-                any(s in st.general or s not in st.states for s in base):
-            raise _Fallback('sensitivity parameters/species the Rust model does not hold')
-        params, species = params or st.gids, [s for s in base if s in species or not species]
-        if '_lz' in self.__dict__:  # roadrunner makes its sensitivity solver with the model: still the defaults
-            rtol, atol = 1e-6, 1e-12
-        else:
-            rtol, atol = self._rs_tol(self.getSensitivitySolver())
+        cs = self.getConservedMoietyIds() if cma else []
+        rr_ids = [v for v in self.getRateRuleIds() if v in states and v not in fids]
+        base = rr_ids + (self.getIndependentFloatingSpeciesIds() if cma else fids)
+        params = list(params) or self.getGlobalParameterIds()
+        species = [s for s in base if not species or s in species]
         zero = set(rr_ids)
         rp = [p for p in params if p not in cs and p not in zero]
-        dep = list(self.getDependentFloatingSpeciesIds()) if any(p in cs for p in params) else []
+        dep = self.getDependentFloatingSpeciesIds() if any(p in cs for p in params) else []
         times = np.linspace(start, stop, int(num))
-        try:
-            X, S = roadrunner_nitro.time_sensitivities(st.m, st.keys, self._rs_x(st).tolist(), times, rp + dep,
-                                                    rtol=rtol, atol=atol, order=k)
-        except ValueError:
-            raise _Fallback('Rust sensitivity integration failed')
+        X, S = roadrunner_nitro.time_sensitivities(m, [], [], times, rp + dep, order=k, rtol=self._sens.relative_tolerance,
+                                                   atol=self._sens.absolute_tolerance)
+        vol = {c: self.getValue(c) for c in self.getCompartmentIds()}
+        V = np.array([vol.get(info['comp_of'].get(s), 1.0) for s in fids])
         rows = []
-        if dep:  # moiety total T_k moves the dependent species: d conc_dep / d T = inv(Gamma[:, dep]) / V_dep
+        if dep:  # moiety total T moves the dependent species: d conc_dep / d T = inv(Gamma[:, dep]) / V_dep
             G = self.getConservationMatrix()
             gcols = list(G.colnames)
-            C = np.linalg.inv(np.asarray(G)[:, [gcols.index(d) for d in dep]]) / st.V[[st.ids.index(d) for d in dep]][:, None]
+            C = np.linalg.inv(np.asarray(G)[:, [gcols.index(d) for d in dep]]) / V[[fids.index(d) for d in dep]][:, None]
         for p in params:
             if p in zero:
                 rows.append(np.zeros((len(times), S.shape[2])))
@@ -872,365 +895,396 @@ class ExtendedRoadRunner(roadrunner.roadrunner.RoadRunner):
                 rows.append(S[:, rp.index(p)])
         S = np.stack(rows, axis=1) if rows else S[:, :0]
         if k:
-            S[0] = 0.0  # roadrunner reports a zero first row for k = 1 too
-        self._rs_sync(st, dict(zip(st.states, X[-1])))
-        self.model.setTime(times[-1])
-        idx = [st.states.index(s) for s in species]
-        V = np.array([st.V[st.ids.index(s)] if s in st.ids else 1.0 for s in species])
-        return times, S[:, :, idx] * V, params, species  # roadrunner reports amount sensitivities
+            S[0] = 0.0  # as libroadrunner: a zero first row for k = 1 too
+        for s, x in zip(states, X[-1]):  # the model is left at the end
+            if s in fids or s in rr_ids:
+                self.setValue('[%s]' % s if s in fids else s, x)
+        self.setValue('time', times[-1])
+        idx = [states.index(s) for s in species]
+        Vs = np.array([V[fids.index(s)] if s in fids else 1.0 for s in species])
+        self._ran('timeSeriesSensitivities')
+        return times, S[:, :, idx] * Vs, params, species  # amount sensitivities, as libroadrunner
 
-    def oneStep(self, currentTime, stepSize, reset=True):
-        def rust():
-            st, integ = self._rs(), self.integrator
-            if self._rs_integrator(integ) != 'cvode':
-                raise _Fallback('integrator %s' % integ.getName())
-            t = np.array([currentTime, currentTime + stepSize])
-            self._rs_advance(st, t, None, integ)
-            return currentTime + stepSize
-        return self._run('oneStep', rust, lambda: self._super().oneStep(currentTime, stepSize, reset))
+    # ------------------------------------------------------------ reset, state
+    def reset(self, options=None):
+        """reset(): floating species, rate-rule values and time to their initial values;
+        reset(SelectionRecord flags): also parameters (_GLOBAL_PARAMETER) or everything (ALL)."""
+        if options is None:
+            return self._rr.reset()
+        if options == SelectionRecord.ALL:
+            return self._rr.resetAll()
+        if options & SelectionRecord._GLOBAL_PARAMETER:
+            self._rr.resetParameter()
+        if options & (SelectionRecord.TIME | SelectionRecord.RATE | SelectionRecord.FLOATING):
+            self._rr.reset()
 
-    def simulateBatch(self, params, start, end, points, selections=None, threads=None):
-        """Many time courses at once on all CPU cores (Rust engine), one per parameter set.
+    def resetAll(self):
+        self._rr.resetAll()
 
-        :param params: dict ``{'k1': [...], 'k2': [...]}`` of equal-length sequences (zipped, not a
-            grid), or a pandas DataFrame. Ids can be parameters, compartments, boundary or floating
-            species (concentrations), as in ``r[id] = value``.
-        :param start, end, points: as in ``simulate``.
-        :param selections: output columns (default: timeCourseSelections).
-        :param threads: CPU threads (default: all cores).
-        :returns: array (n sets, points, len(selections)). Every run starts from the current state;
-            the model itself is not changed. Runs Rust cannot do (or that fail) run in roadrunner.
-        """
-        if hasattr(params, 'to_dict'):
-            params = params.to_dict('list')
-        names = list(params)
-        vals = np.array([np.atleast_1d(np.asarray(params[k], dtype=float)) for k in names]).T.reshape(-1, len(names))
-        sel = list(self.timeCourseSelections if selections is None else selections)
-        times = np.linspace(start, end, points)
+    def resetToOrigin(self):
+        self._rr.resetToOrigin()
+        self._changed()
 
-        def rust():
-            st, integ = self._rs(), self.integrator
-            if self._rs_integrator(integ) != 'cvode':
-                raise _Fallback('integrator %s' % integ.getName())
-            cols = st.cols(sel)
-            if cols is None or cols.init:
-                raise _Fallback('selections %s' % sel)
-            bad = [k for k in names if k.strip('[]') not in st.kpos]
-            if bad:
-                raise _Fallback('not a Rust parameter or state: %s' % ', '.join(bad))
-            rtol, atol = self._rs_tol(integ)
-            mdl = self.model
-            X = np.repeat(self._rs_x(st, mdl)[None], len(vals), axis=0)
-            for j, k in enumerate(names):  # species ids are concentrations, as r['[S]'] / r.S for conc
-                X[:, st.kpos[k.strip('[]')]] = vals[:, j]
-            Y = st.m.simulate_batch(st.keys, X, times, threads=threads, rtol=rtol, atol=atol, outputs=cols.outs,
-                                    atol_scale=st.atol_scale(mdl.getFloatingSpeciesInitConcentrations()))
-            out = np.stack([cols.apply(y) for y in Y]) if len(Y) else np.zeros((0, points, len(sel)))
-            for i in np.flatnonzero(~np.isfinite(out).all(axis=(1, 2))):  # failed runs: roadrunner
-                out[i] = self._rr_one(names, vals[i], start, end, points, sel)
-            return out
+    def resetParameter(self):
+        self._rr.resetParameter()
 
-        def fallback():
-            return np.stack([self._rr_one(names, v, start, end, points, sel) for v in vals]) if len(vals) \
-                else np.zeros((0, points, len(sel)))
-        return self._run('simulateBatch', rust, fallback)
+    def saveState(self, filename, opt='b'):
+        """Save the model, its values, time and event state to a file (``opt`` is ignored: one format)."""
+        self._rr.saveState(filename)
 
-    def _rr_one(self, names, v, start, end, points, sel):
-        """One simulateBatch run in plain roadrunner, on a copy of the current model (this one unchanged)."""
-        r = roadrunner.roadrunner.RoadRunner(self.getCurrentSBML())
-        r.setIntegrator(self.integrator.getName())
-        for k, x in self.integrator.getSettingsMap().items():
-            try:
-                r.integrator.setValue(k, x)
-            except Exception:  # read-only or engine-specific setting
-                pass
-        sp = set(r.model.getFloatingSpeciesIds()) | set(r.model.getBoundarySpeciesIds())
-        for k, x in zip(names, v):
-            r.setValue('[%s]' % k if k in sp else k, float(x))  # species ids are concentrations, as in Rust
-        return np.asarray(r.simulate(start, end, points, sel))
+    def loadState(self, filename):
+        self._rr.loadState(filename)
+        self._changed()
 
-    def getSimulationData(self):
-        d = self.__dict__.get('_rs_data')
-        return self._super().getSimulationData() if d is None else d
+    def saveStateS(self, opt='b'):
+        """saveState to a string."""
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            self._rr.saveState(path)
+            with open(path, encoding='utf-8') as f:
+                return f.read()
+        finally:
+            os.remove(path)
 
+    def loadStateS(self, state):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(state)
+        try:
+            self.loadState(path)
+        finally:
+            os.remove(path)
+
+    def __getstate__(self):  # pickle / copy.deepcopy: model state and settings
+        ig, ss = self.integrator, self.steadyStateSolver
+        return dict(state=self.saveStateS() if self.isModelLoaded() else None,
+                    integrators={n: Solver(self._rr, False, n).getSettingsMap() for n in INTEGRATORS},
+                    integrator=ig.getName(), ss=ss.getName(), ss_settings=ss.getSettingsMap(),
+                    sel=self.timeCourseSelections if self.isModelLoaded() else None,
+                    ssel=self.steadyStateSelections if self.isModelLoaded() else None,
+                    diff=self.getDiffStepSize(), flux=self.getFluxThreshold(), sens=dict(self._sens._s))
+
+    def __setstate__(self, d):
+        self.__init__()
+        if d['state'] is not None:
+            self.loadStateS(d['state'])
+            self.timeCourseSelections, self.steadyStateSelections = d['sel'], d['ssel']
+        for n, s in d['integrators'].items():
+            for k, v in s.items():
+                Solver(self._rr, False, n).setValue(k, v)
+        self.setIntegrator(d['integrator'])
+        self.setSteadyStateSolver(d['ss'])
+        for k, v in d['ss_settings'].items():
+            self.steadyStateSolver.setValue(k, v)
+        self.setDiffStepSize(d['diff'])
+        self.setFluxThreshold(d['flux'])
+        self._sens._s.update(d['sens'])
+
+    # ------------------------------------------------------------ steady state, MCA
     def steadyState(self, dict=None):
-        def rust():
-            st = self._rs()
-            if dict is not None:
-                raise _Fallback('steady-state options dict')
-            if st.nss:
-                raise _Fallback('events or time-dependent rates')
-            if self.steadyStateSolver.getName() != 'nleq2':
-                raise _Fallback('steady-state solver %s' % self.steadyStateSolver.getName())
-            S, v, _, ok = st.m.steady_state_batch(st.keys, self._rs_x(st)[None])
-            if not ok[0]:
-                raise _Fallback('Rust Newton found no steady state')
-            self._rs_sync(st, {k: val for k, val in zip(st.states, S[0])})
-            dx = (st.N @ v[0][st.rx] / st.V) if st.plain else 0.0
-            return float(np.linalg.norm(dx))
-        return self._run('steadyState', rust, lambda: self._super().steadyState(dict))
-
-    def _rs_mca(self):
-        """(st, unscaled CCC, unscaled FCC, v, S) at steady state, model left there (as roadrunner does)."""
-        st = self._rs_mcast()
-        res = st.m.mca_batch(st.keys, self._rs_x(st)[None])
-        if not res['ok'][0]:
-            raise _Fallback('Rust found no steady state for MCA')
-        sp, rx = st.sp, st.rx
-        self._rs_sync(st, dict(zip(st.states, res['S'][0])))
-        return st, res['uccc'][0][sp][:, rx], res['ufcc'][0][rx][:, rx], res['v'][0][rx], res['S'][0][sp]
-
-    def getUnscaledConcentrationControlCoefficientMatrix(self):
-        def rust():
-            st, C, _, _, _ = self._rs_mca()
-            return _named(C, st.ids, st.rids)
-        return self._run('getUnscaledConcentrationControlCoefficientMatrix', rust,
-                         lambda: self._super().getUnscaledConcentrationControlCoefficientMatrix())
-
-    def getScaledConcentrationControlCoefficientMatrix(self):
-        def rust():
-            st, C, _, v, S = self._rs_mca()
-            return _named(C * v[None, :] / S[:, None], st.ids, st.rids)
-        return self._run('getScaledConcentrationControlCoefficientMatrix', rust,
-                         lambda: self._super().getScaledConcentrationControlCoefficientMatrix())
-
-    def getUnscaledFluxControlCoefficientMatrix(self):
-        def rust():
-            st, _, F, _, _ = self._rs_mca()
-            return _named(F, st.rids, st.rids)
-        return self._run('getUnscaledFluxControlCoefficientMatrix', rust,
-                         lambda: self._super().getUnscaledFluxControlCoefficientMatrix())
-
-    def getScaledFluxControlCoefficientMatrix(self):
-        def rust():
-            st, _, F, v, _ = self._rs_mca()
-            vi = np.where(np.abs(v) < self.getFluxThreshold(), 0.0, v)  # roadrunner zeroes near-zero flux rows
-            with np.errstate(divide='ignore', invalid='ignore'):
-                out = np.where(vi[:, None] != 0, F * v[None, :] / vi[:, None], 0.0)
-            return _named(out, st.rids, st.rids)
-        return self._run('getScaledFluxControlCoefficientMatrix', rust,
-                         lambda: self._super().getScaledFluxControlCoefficientMatrix())
-
-    def _rs_rd(self):
-        """(st, v, dv/dS, S) for the reactions at the current state (exact derivatives)."""
-        st = self._rs()
-        if not st.plain:
-            raise _Fallback('rate-rule or non-plain species')
-        x = self._rs_x(st)
-        if st.rd is None:  # compiled once per Rust model
-            st.rd = roadrunner_nitro.RateDerivatives(st.m)
-        v, dx, _, _ = st.rd(st.keys, x.tolist(), self.model.getTime())
-        return st, v[st.rx], dx[st.rx][:, st.sp], x[st.off:]
-
-    def getUnscaledElasticityMatrix(self):
-        def rust():
-            st, _, E, _ = self._rs_rd()
-            return _named(E, st.rids, st.ids)
-        return self._run('getUnscaledElasticityMatrix', rust, lambda: self._super().getUnscaledElasticityMatrix())
-
-    def getScaledElasticityMatrix(self):
-        def rust():
-            st, v, E, S = self._rs_rd()
-            with np.errstate(divide='ignore', invalid='ignore'):
-                return _named(E * S[None, :] / v[:, None], st.rids, st.ids)
-        return self._run('getScaledElasticityMatrix', rust, lambda: self._super().getScaledElasticityMatrix())
-
-    def getSteadyStateValues(self):
-        if self._rs_or_none() is None:
-            return self._super().getSteadyStateValues()
-        self.steadyState()  # Rust when it can, roadrunner otherwise
-        return np.array([self.getValue(s) for s in self.steadyStateSelections], dtype=float)
-
-    def getSteadyStateValuesNamedArray(self):
-        if self._rs_or_none() is None:
-            return self._super().getSteadyStateValuesNamedArray()
-        return _named(self.getSteadyStateValues()[None], cols=self.steadyStateSelections)
-
-    def steadyStateNamedArray(self, dict=None):
-        if self._rs_or_none() is None or dict is not None:
-            return self._super().steadyStateNamedArray(dict)
-        return self.getSteadyStateValuesNamedArray()
+        """Solve for the steady state (``dict``: steady-state solver settings for this call);
+        returns the norm of the rates of change there."""
+        ss = self.steadyStateSolver
+        old = {k: ss.getValue(k) for k in (dict or {})}
+        for k, v in (dict or {}).items():
+            ss.setValue(k, v)
+        try:
+            v = self._rr.steadyState()
+        finally:
+            for k, x in old.items():
+                ss.setValue(k, x)
+        self._ran('steadyState')
+        return v
 
     def mcaSteadyState(self, *args):
-        return self._run('mcaSteadyState', lambda: (self._rs_mcast(), self.steadyState())[1],
-                         lambda: self._super().mcaSteadyState(*args))
+        return self.steadyState()
 
-    def _rs_jac(self):
-        """(st, Jacobian of the floating species in concentrations) at the current state and time."""
-        st = self._rs_mcast()
-        sp = st.sp
-        J = np.asarray(st.m.jacobian(st.keys, self._rs_x(st).tolist(), self.model.getTime()))
-        return st, J[sp][:, sp]
+    def getSteadyStateValues(self):
+        v = np.array(self._rr.getSteadyStateValues())
+        self._ran('steadyState')
+        return v
+
+    def getSteadyStateValuesNamedArray(self):
+        return NamedArray(self.getSteadyStateValues()[None], colnames=self.steadyStateSelections)
+
+    def steadyStateNamedArray(self, dict=None):
+        self.steadyState(dict)
+        return NamedArray(np.array(self._rr.getValues(self.steadyStateSelections))[None], colnames=self.steadyStateSelections)
+
+    def _mat(self, method, *args):
+        out = _named(getattr(self._rr, method)(*args))
+        self._ran(method)
+        return out
+
+    def getFullStoichiometryMatrix(self):
+        return self._mat('getFullStoichiometryMatrix')
+
+    def getReducedStoichiometryMatrix(self):
+        return self._mat('getNrMatrix')
+
+    getNrMatrix = getReducedStoichiometryMatrix
+
+    def getLinkMatrix(self):
+        return self._mat('getLinkMatrix')
+
+    def getL0Matrix(self):
+        return self._mat('getL0Matrix')
+
+    def getConservationMatrix(self):
+        return self._mat('getConservationMatrix')
 
     def getFullJacobian(self):
-        def rust():
-            st, J = self._rs_jac()
-            return _named(J, st.ids, st.ids)
-        return self._run('getFullJacobian', rust, lambda: self._super().getFullJacobian())
+        return self._mat('getFullJacobian')
 
-    def _rs_rjac(self):
-        st, J = self._rs_jac()
-        if not self.conservedMoietyAnalysis:
-            return st.ids, J
-        if st.ind is None:  # roadrunner's (libstruct's) choice of independent species
-            Lm = self.getLinkMatrix()
-            ok = set(st.ids) <= set(Lm.rownames)
-            st.L = np.array(Lm)[[list(Lm.rownames).index(s) for s in st.ids]] if ok else None
-            st.ind = list(Lm.colnames)
-        if st.L is None:
-            raise _Fallback("link matrix rows don't cover the floating species")
-        # d(dependent conc)/d(independent conc): the link matrix is in amounts
-        V, ind = st.V, [st.ids.index(s) for s in st.ind]
-        Lc = st.L / V[:, None] * V[ind][None, :]
-        return st.ind, (J @ Lc)[ind]
-
-    def getReducedJacobian(self, h=-1.0):
-        def rust():
-            ids, J = self._rs_rjac()
-            return _named(J, ids, ids)
-        return self._run('getReducedJacobian', rust, lambda: self._super().getReducedJacobian(h))
+    def getReducedJacobian(self, h=None):
+        return self._mat('getReducedJacobian')
 
     def getFullEigenValues(self):
-        return self._run('getFullEigenValues', lambda: np.linalg.eigvals(self._rs_jac()[1]).astype(complex),
-                         lambda: self._super().getFullEigenValues())
+        self._ran('getFullEigenValues')
+        return np.asarray(self._rr.getFullEigenValues())
 
     def getReducedEigenValues(self):
-        return self._run('getReducedEigenValues', lambda: np.linalg.eigvals(self._rs_rjac()[1]).astype(complex),
-                         lambda: self._super().getReducedEigenValues())
+        self._ran('getReducedEigenValues')
+        return np.asarray(self._rr.getReducedEigenValues())
 
     def getFullEigenValuesNamedArray(self):
-        def rust():
-            st, J = self._rs_jac()
-            e = np.linalg.eigvals(J)
-            return _named(np.column_stack([e.real, e.imag]), st.ids, ['real', 'imaginary'])
-        return self._run('getFullEigenValuesNamedArray', rust, lambda: self._super().getFullEigenValuesNamedArray())
+        e = self.getFullEigenValues()
+        return NamedArray(np.column_stack([e.real, e.imag]), self._rr.getFullJacobian()[1], ['real', 'imaginary'])
 
     def getReducedEigenValuesNamedArray(self):
-        def rust():
-            ids, J = self._rs_rjac()
-            e = np.linalg.eigvals(J)
-            return _named(np.column_stack([e.real, e.imag]), ids, ['real', 'imaginary'])
-        return self._run('getReducedEigenValuesNamedArray', rust, lambda: self._super().getReducedEigenValuesNamedArray())
+        e = self.getReducedEigenValues()
+        return NamedArray(np.column_stack([e.real, e.imag]), self._rr.getReducedJacobian()[1], ['real', 'imaginary'])
 
-    def _rs_ucc(self, variableName, parameterName):
-        """(unscaled CC, parameter value, variable value now, is flux) with roadrunner's 5-point stencil."""
-        st = self._rs_mcast()
-        var = variableName.replace('[', '').replace(']', '')
-        if st.kpos.get(parameterName, st.off) >= st.off or (var not in st.ids and var not in st.rids):
-            raise _Fallback('species / moiety totals as parameters')
-        x = self._rs_x(st)
-        j = st.kpos[parameterName]
-        p0 = x[j]
-        h = self.getDiffStepSize() * p0
-        if abs(h) < 1e-12:
-            h = self.getDiffStepSize()
-        X = np.repeat(x[None], 4, axis=0)
-        X[:, j] += [h, 2 * h, -h, -2 * h]
-        S, v, _, ok = st.m.steady_state_batch(st.keys, X)
-        if not ok.all():
-            raise _Fallback('Rust found no steady state for a stencil point')
-        if var in st.ids:
-            i = st.ids.index(var)
-            f, now = S[:, st.sp[i]], self.model.getFloatingSpeciesConcentrations()[i]
+    def getUnscaledElasticityMatrix(self):
+        return self._mat('getElasticityMatrix', False)
+
+    def getScaledElasticityMatrix(self):
+        return self._mat('getElasticityMatrix', True)
+
+    def getUnscaledConcentrationControlCoefficientMatrix(self):
+        return self._mat('getConcentrationControlCoefficientMatrix', False)
+
+    def getScaledConcentrationControlCoefficientMatrix(self):
+        return self._mat('getConcentrationControlCoefficientMatrix', True)
+
+    def getUnscaledFluxControlCoefficientMatrix(self):
+        return self._mat('getFluxControlCoefficientMatrix', False)
+
+    def getScaledFluxControlCoefficientMatrix(self):
+        return self._mat('getFluxControlCoefficientMatrix', True)
+
+    def getCC(self, variable, parameter):
+        self._ran('getCC')
+        return self._rr.getCC(variable, parameter)
+
+    def getuCC(self, variable, parameter):
+        self._ran('getuCC')
+        return self._rr.getuCC(variable, parameter)
+
+    def getEE(self, reactionName, parameterName, computeSteadyState=True):
+        return self._rr.getEE(reactionName, parameterName, bool(computeSteadyState))
+
+    def getuEE(self, reactionName, parameterName, computeSteadyState=True):
+        return self._rr.getuEE(reactionName, parameterName, bool(computeSteadyState))
+
+    def getScaledFloatingSpeciesElasticity(self, reactionId, speciesId):
+        return self._rr.getEE(reactionId, speciesId, False)
+
+    def getUnscaledSpeciesElasticity(self, reactionIndex, speciesIndex):
+        return self._rr.getuEE(self._rr.getReactionIds()[reactionIndex], self._rr.getFloatingSpeciesIds()[speciesIndex], False)
+
+    def getUnscaledParameterElasticity(self, reactionName, parameterName):
+        return self._rr.getuEE(reactionName, parameterName, False)
+
+    # ------------------------------------------------------------ ids and value vectors
+    def getIndependentFloatingSpeciesIds(self):
+        return list(self._rr.getIndependentFloatingSpeciesIds())
+
+    def getDependentFloatingSpeciesIds(self):
+        return list(self._rr.getDependentFloatingSpeciesIds())
+
+    def getNumIndFloatingSpecies(self):
+        return len(self._rr.getIndependentFloatingSpeciesIds())
+
+    def getNumDepFloatingSpecies(self):
+        return len(self._rr.getDependentFloatingSpeciesIds())
+
+    getNumberOfIndependentSpecies, getNumberOfDependentSpecies = getNumIndFloatingSpecies, getNumDepFloatingSpecies
+
+    def getConservedMoietyIds(self):
+        return list(self._rr.getConservedMoietyIds())
+
+    def getConservedMoietyValues(self):
+        return self.model.getConservedMoietyValues()
+
+    def getEigenValueIds(self):
+        return list(self._rr.getEigenValueIds())
+
+    def getRatesOfChangeIds(self):
+        return list(self._rr.getRatesOfChangeIds())
+
+    def getRateRuleIds(self):
+        return list(self._rr.getRateRuleIds())
+
+    def getAssignmentRuleIds(self):
+        return self.model.getAssignmentRuleIds()
+
+    def getInitialAssignmentIds(self):
+        return self.model.getInitialAssignmentIds()
+
+    def getFloatingSpeciesInitialConcentrationIds(self):
+        return self.model.getFloatingSpeciesInitConcentrationIds()
+
+    def getAvailableTimeCourseSymbols(self):
+        return self._rr.getAvailableTimeCourseSymbols()
+
+    def getRatesOfChange(self):
+        return np.array(self._rr.getRatesOfChange())
+
+    def getRatesOfChangeNamedArray(self):
+        return NamedArray(self.getRatesOfChange()[None], colnames=self.getRatesOfChangeIds())
+
+    def getKineticLaw(self, rid):
+        return roadrunner_nitro.sbml_edit('get_kinetic_law', self.getSBML(), rid)
+
+    # ------------------------------------------------------------ model editing
+    def _edit(self, op, args, regen=True):
+        self._set_sbml(roadrunner_nitro.sbml_edit(op, self._rr.getSBML(), *args), regen)
+
+    def _set_sbml(self, sbml, regen=True):
+        self._rr.setSBML(sbml, bool(regen))
+        self._changed()
+
+    def regenerateModel(self, forceRegenerate=True, reset=False):
+        """Recompile the (edited) model, keeping the current values (``reset``: then resetAll)."""
+        self._rr.regenerate()
+        self._changed()
+        if reset:
+            self.resetAll()
+
+    def addSpecies(self, sid, compartment, initAmount=0.0, initConcentration=0.0, hasOnlySubstanceUnits=False,
+                   boundaryCondition=False, substanceUnits='', forceRegenerate=True):
+        if initConcentration and not initAmount:
+            self.addSpeciesConcentration(sid, compartment, initConcentration, hasOnlySubstanceUnits, boundaryCondition,
+                                         substanceUnits, forceRegenerate)
         else:
-            i = st.rids.index(var)
-            f, now = v[:, st.rx[i]], self.model.getReactionRates()[i]
-        return (f[3] + 8 * f[0] - 8 * f[2] - f[1]) / (12 * h), p0, now, var in st.rids
+            self.addSpeciesAmount(sid, compartment, initAmount, hasOnlySubstanceUnits, boundaryCondition,
+                                  substanceUnits, forceRegenerate)
 
-    def getuCC(self, variableName, parameterName):
-        return self._run('getuCC', lambda: self._rs_ucc(variableName, parameterName)[0],
-                         lambda: self._super().getuCC(variableName, parameterName))
+    def addReaction(self, *args, **kwargs):
+        """addReaction(sbmlRep[, forceRegenerate]) or addReaction(rid, reactants, products, kineticLaw[, forceRegenerate])."""
+        regen = kwargs.pop('forceRegenerate', True)
+        if len(args) in (1, 2) and not kwargs:
+            if len(args) == 2:
+                regen = args[1]
+            return self._edit('add_reaction_from_sbml', [args[0]], regen)
+        a = dict(zip(['rid', 'reactants', 'products', 'kineticLaw', 'forceRegenerate'], args))
+        a.update(kwargs)
+        self._edit('add_reaction', [a['rid'], list(a['reactants']), list(a['products']), a['kineticLaw']],
+                   a.get('forceRegenerate', regen))
 
-    def getCC(self, variableName, parameterName):
-        def rust():
-            u, p, now, flux = self._rs_ucc(variableName, parameterName)
-            if flux and abs(now) < self.getFluxThreshold():
-                return 0.0
-            with np.errstate(divide='ignore', invalid='ignore'):
-                return float(np.float64(u) * p / now)
-        return self._run('getCC', rust, lambda: self._super().getCC(variableName, parameterName))
+    def removeRules(self, vid, useInitialValue=False, forceRegenerate=True):
+        """Remove the rules of ``vid`` (``useInitialValue``: its value becomes the rule's value at time 0)."""
+        v = self.getValue('init(%s)' % vid) if useInitialValue else None
+        self._edit('remove_rules', [vid], forceRegenerate and v is None)
+        if v is not None:
+            self.setInitValue(vid, v, forceRegenerate)
 
-    # ---------------------------------------------------------------------
-    # Model access
-    # ---------------------------------------------------------------------
-    # def getBoundarySpeciesConcentrations(self):
-    #     return self.model.getBoundarySpeciesConcentrations()
-    # getBoundarySpeciesConcentrations.__doc__ = roadrunner.ExecutableModel.getBoundarySpeciesConcentrations.__doc__
+    def setInitAmount(self, sid, initAmount, forceRegenerate=True):
+        self._edit('set_init_amount', [sid, float(initAmount)], forceRegenerate)
 
-    # These model functions are attached after class creation
+    def setInitConcentration(self, sid, initConcentration, forceRegenerate=True):
+        self._edit('set_init_concentration', [sid, float(initConcentration)], forceRegenerate)
+
+    def setInitValue(self, sid, initValue, forceRegenerate=True):
+        """Initial value of any species (amount), compartment or parameter."""
+        sbml = self._rr.getSBML()
+        if sid in self.getFloatingSpeciesIds() + self.getBoundarySpeciesIds():
+            return self.setInitAmount(sid, initValue, forceRegenerate)
+        tag, attr = ('compartment', 'size') if sid in self.getCompartmentIds() else ('parameter', 'value')
+        self._set_sbml(_set_attr(sbml, tag, sid, attr, repr(float(initValue))), forceRegenerate)
+
+    def removeInitialAssignment(self, vid, forceRegenerate=True, errIfNotExist=True, replaceInitVal=True):
+        """Remove the initial assignment of ``vid`` (``replaceInitVal``: its value becomes the initial value).
+        Returns whether the model was regenerated."""
+        sbml = self._rr.getSBML()
+        pat = re.compile(r'<(?:\w+:)?initialAssignment\b[^>]*?\bsymbol\s*=\s*"%s".*?</(?:\w+:)?initialAssignment>\s*'
+                         % re.escape(vid), re.S)
+        if not pat.search(sbml):
+            if errIfNotExist:
+                raise ValueError("no initial assignment for '%s'" % vid)
+            return False
+        v = self.getValue('init(%s)' % vid) if replaceInitVal else None
+        self._set_sbml(pat.sub('', sbml, count=1), forceRegenerate and v is None)
+        if v is not None:
+            self.setInitValue(vid, v, forceRegenerate)
+        return bool(forceRegenerate)
+
+    def setInitStoichiometryValue(self, speciesId, reactionId, initValue):
+        """Stoichiometry of the (unnamed) species reference of ``speciesId`` in reaction ``reactionId``."""
+        sbml = self._rr.getSBML()
+        m = re.search(r'<(?:\w+:)?reaction\b[^>]*?\bid\s*=\s*"%s".*?</(?:\w+:)?reaction>' % re.escape(reactionId), sbml, re.S)
+        if m is None:
+            raise ValueError("no reaction '%s'" % reactionId)
+        block = _set_attr(m.group(0), 'speciesReference', speciesId, 'stoichiometry', repr(float(initValue)), 'species')
+        self._set_sbml(sbml[:m.start()] + block + sbml[m.end():])
+
+    def setModelId(self, id):
+        self._set_sbml(_set_attr(self._rr.getSBML(), 'model', None, 'id', id), False)
+
+    def setModelName(self, name):
+        self._set_sbml(_set_attr(self._rr.getSBML(), 'model', None, 'name', name), False)
+
+    def setGlobalParameterByName(self, param, value):
+        self.setValue(param, value)
+
+    def getGlobalParameterByName(self, param):
+        return self.getValue(param)
+
+    # The model getters libroadrunner's tellurium attaches to RoadRunner (r.getFloatingSpeciesIds() ...)
     _model_functions = [
-        'getBoundarySpeciesIds',
-        'getBoundarySpeciesConcentrationIds',
-        'getBoundarySpeciesConcentrations',
-        'getBoundarySpeciesAmounts',
-        'getNumBoundarySpecies',
-
-        'getFloatingSpeciesIds',
-        'getFloatingSpeciesConcentrationIds',
-        'getFloatingSpeciesConcentrations',
-        'getFloatingSpeciesAmounts',
-        'getNumFloatingSpecies',
-
-        'getGlobalParameterIds',
-        'getGlobalParameterValues',
-        'getNumGlobalParameters',
-
-        'getCompartmentIds',
-        'getCompartmentVolumes',
-        'getNumCompartments',
-
-        'getConservedMoietyValues',
-        'getNumConservedMoieties',
-
-        'getReactionIds',
-        'getReactionRates',
-        'getNumReactions',
-        'getNumEvents',
-        'getNumRateRules'
-     ]
+        'getBoundarySpeciesIds', 'getBoundarySpeciesConcentrationIds', 'getBoundarySpeciesConcentrations',
+        'getBoundarySpeciesAmounts', 'getNumBoundarySpecies',
+        'getFloatingSpeciesIds', 'getFloatingSpeciesConcentrationIds', 'getFloatingSpeciesConcentrations',
+        'getFloatingSpeciesAmounts', 'getNumFloatingSpecies',
+        'getGlobalParameterIds', 'getGlobalParameterValues', 'getNumGlobalParameters',
+        'getCompartmentIds', 'getCompartmentVolumes', 'getNumCompartments',
+        'getNumConservedMoieties', 'getReactionIds', 'getReactionRates', 'getNumReactions', 'getNumEvents',
+        'getNumRateRules']
 
     # ---------------------------------------------------------------------
     # Jarnac compatibility layer
     # ---------------------------------------------------------------------
     def fjac(self):
         return self.getFullJacobian()
-    fjac.__doc__ = roadrunner.roadrunner.RoadRunner.getFullJacobian.__doc__
 
     def sm(self):
         return self.getFullStoichiometryMatrix()
-    sm.__doc__ = roadrunner.roadrunner.RoadRunner.getFullStoichiometryMatrix.__doc__
 
     def rs(self):
         return self.model.getReactionIds()
-    rs.__doc__ = roadrunner.ExecutableModel.getReactionIds.__doc__
 
     def fs(self):
         return self.model.getFloatingSpeciesIds()
-    fs.__doc__ = roadrunner.ExecutableModel.getFloatingSpeciesIds.__doc__
 
     def bs(self):
         return self.model.getBoundarySpeciesIds()
-    bs.__doc__ = roadrunner.ExecutableModel.getBoundarySpeciesIds.__doc__
 
     def ps(self):
         return self.model.getGlobalParameterIds()
-    ps.__doc__ = roadrunner.ExecutableModel.getGlobalParameterIds.__doc__
 
     def vs(self):
         return self.model.getCompartmentIds()
-    vs.__doc__ = roadrunner.ExecutableModel.getCompartmentIds.__doc__
 
     def dv(self):
         return self.getRatesOfChange()
-    dv.__doc__ = roadrunner.roadrunner.RoadRunner.getRatesOfChange.__doc__
 
     def rv(self):
         return self.model.getReactionRates()
-    rv.__doc__ = roadrunner.ExecutableModel.getReactionRates.__doc__
 
     def sv(self):
         return self.model.getFloatingSpeciesConcentrations()
-    sv.__doc__ = roadrunner.ExecutableModel.getFloatingSpeciesConcentrations.__doc__
 
     # ---------------------------------------------------------------------
     # Export Utilities
@@ -1567,187 +1621,45 @@ class ExtendedRoadRunner(roadrunner.roadrunner.RoadRunner):
         return s
 
 
-def _resets(f, everything):  # reset() / resetAll() / resetToOrigin() restart event triggers, as Rust does
-    def g(self, *args, **kwargs):
-        lz = self.__dict__.get('_lz')
-        if lz is not None and not args and not kwargs and (everything or lz['reset_ok']):
-            return self._lz_reset(lz, everything)  # lazily nothing can change the SBML: origin = all
-        self._load_rr()
-        if f.__name__ == 'resetToOrigin':
-            self.__dict__.pop('_rs_cache', None)
-        c = self.__dict__.get('_rs_cache')
-        if c is not None and isinstance(c[1], _RsModel):
-            c[1].reset_events()
-        return f(self, *args, **kwargs)
-    g.__name__, g.__doc__, g._route = f.__name__, f.__doc__, 'resets'
-    return g
+for _n, (_op, _k, _d) in _EDITS.items():
+    setattr(ExtendedRoadRunner, _n, _edit_method(_n, _op, _k, _d))
 
 
-for _n, _all in (('reset', False), ('resetAll', True), ('resetToOrigin', True)):
-    setattr(ExtendedRoadRunner, _n, _resets(getattr(roadrunner.roadrunner.RoadRunner, _n), _all))
+def _model_function(key):
+    def f(self):
+        return getattr(self.model, key)()
+    f.__name__ = key
+    return f
 
 
-# Structure-changing roadrunner methods drop the cached Rust model (rebuilt on next use)
-def _invalidates(f):
-    def g(self, *args, **kwargs):
-        if f.__name__.startswith('load'):
-            self.__dict__.pop('_lz', None)  # a new model replaces the lazy one
-        self._load_rr().__dict__.pop('_rs_cache', None)
-        return f(self, *args, **kwargs)
-    g.__name__, g.__doc__, g._route = f.__name__, f.__doc__, 'invalidates'
-    return g
+for _n in ExtendedRoadRunner._model_functions:
+    setattr(ExtendedRoadRunner, _n, _model_function(_n))
 
 
-for _n in dir(roadrunner.roadrunner.RoadRunner):
-    if _n.startswith(('add', 'remove', 'load', 'clear', 'regenerate', 'setBoundary', 'setConstant',
-                      'setHasOnlySubstanceUnits', 'setInitStoichiometryValue', 'setKineticLaw', 'setReversible')):
-        setattr(ExtendedRoadRunner, _n, _invalidates(getattr(roadrunner.roadrunner.RoadRunner, _n)))
+def _vector(ids, fmt, named):  # r.get<Independent|Dependent|>FloatingSpecies<Amounts|Concentrations><V|NamedArray>()
+    def f(self):
+        names = getattr(self._rr, ids)()
+        v = np.array(self._rr.getValues([fmt % s for s in names]))
+        return NamedArray(v[None], colnames=names) if named else v
+    return f
 
 
-# Every other roadrunner method needs roadrunner's model: compile it first when the model is lazy.
-# These don't (solver settings live in the RoadRunner object and survive the load).
-_NO_MODEL = {'getAvailableIntegrators', 'getDiffStepSize', 'setDiffStepSize', 'getExistingIntegratorNames',
-             'getExistingSteadyStateSolverNames', 'getFluxThreshold',
-             'setFluxThreshold', 'getInstanceCount', 'getInstanceID', 'getIntegrator',
-             'getSteadyStateSolver', 'getSteadyStateSolverByName', 'getSteadyStateThreshold',
-             'setSteadyStateThreshold', 'integratorExists', 'makeSteadyStateSolver', 'setSteadyStateSolver',
-             'steadyStateSolverExists',
-             'getCompiler', 'showPlot', 'plotLegend'}
+for _g, _ids in (('', 'getFloatingSpeciesIds'), ('Independent', 'getIndependentFloatingSpeciesIds'),
+                 ('Dependent', 'getDependentFloatingSpeciesIds'), ('Boundary', 'getBoundarySpeciesIds')):
+    _sp = 'BoundarySpecies' if _g == 'Boundary' else _g + 'FloatingSpecies'
+    for _q, _fmt in (('Amounts', '%s'), ('Concentrations', '[%s]')):
+        for _sfx, _named_ in (('V', False), ('NamedArray', True)):
+            if _g in ('', 'Boundary') and _sfx == 'V':
+                continue
+            _f = _vector(_ids, _fmt, _named_)
+            _f.__name__ = 'get%s%s%s' % (_sp, _q, _sfx)
+            setattr(ExtendedRoadRunner, _f.__name__, _f)
+    if _g in ('Independent', 'Dependent'):
+        _f = _vector(_ids, "%s'", False)
+        _f.__name__ = 'get%sRatesOfChange' % _g
+        setattr(ExtendedRoadRunner, _f.__name__, _f)
+        _f = _vector(_ids, "%s'", True)
+        _f.__name__ = 'get%sRatesOfChangeNamedArray' % _g
+        setattr(ExtendedRoadRunner, _f.__name__, _f)
 
-
-def _loads(name):
-    def g(self, *args, **kwargs):
-        return getattr(self._super(), name)(*args, **kwargs)
-    g.__name__, g.__doc__, g._route = name, getattr(roadrunner.roadrunner.RoadRunner, name).__doc__, 'loads'
-    return g
-
-
-def _public(n, f):
-    return inspect.isfunction(f) and (not n.startswith('_') or n == '__getstate__')
-
-
-for _n, _f in list(vars(roadrunner.roadrunner.RoadRunner).items()):
-    if _public(_n, _f) and _n not in vars(ExtendedRoadRunner) and _n not in _NO_MODEL:
-        setattr(ExtendedRoadRunner, _n, _loads(_n))
-
-
-def _routing():
-    """How each public roadrunner method is routed: name -> 'override' (defined here: Rust when it can),
-    'loads' (compiles a lazy model, then roadrunner), 'invalidates' (drops the Rust model), 'resets'
-    (restarts events), 'no-model' (needs no compiled model) or 'unrouted' (roadrunner's own, which
-    would run on an uncompiled lazy model: a bug)."""
-    out = {}
-    for n, f in vars(roadrunner.roadrunner.RoadRunner).items():
-        if _public(n, f):
-            g = getattr(ExtendedRoadRunner, n)
-            out[n] = 'no-model' if n in _NO_MODEL else getattr(g, '_route', 'unrouted' if g is f else 'override')
-    return out
-
-
-def _lzm(f):  # _LazyModel method: lazily from the Rust state, else roadrunner's model
-    def g(self, *args):
-        lz = self._r.__dict__.get('_lz')
-        if lz is None:
-            return getattr(self._r.model, f.__name__)(*args)
-        return f(self, lz, *args)
-    g.__name__ = f.__name__
-    return g
-
-
-class _LazyModel(object):
-    """``r.model`` before roadrunner compiled the model: values from the Rust model's state. Anything
-    else compiles the model in roadrunner and is answered by roadrunner's model."""
-
-    def __init__(self, r):
-        self._r = r
-
-    def __getattr__(self, name):
-        return getattr(self._r._load_rr().model, name)
-
-    def __getitem__(self, key):
-        return self._r.getValue(key)
-
-    def __setitem__(self, key, value):
-        self._r.setValue(key, value)
-
-    def _vals(self, lz, ids, kind, idx):
-        ids = ids if idx is None else [ids[i] for i in idx]
-        st, out = lz['st'], self._r._lz_out(lz)
-        v = out[lz['o'](ids)]
-        if kind is None:
-            return v
-        V = out[lz['o']([st.comp_of[s] for s in ids])]
-        a = np.array([s in st.amount_params for s in ids], dtype=bool)  # value is an amount
-        return np.where(a, v / V, v) if kind == 'conc' else np.where(a, v, v * V)
-
-    def _set(self, ids, fmt, args):
-        idx, vals = (range(len(ids)), args[0]) if len(args) == 1 else args
-        for i, v in zip(idx, vals):
-            self._r.setValue(fmt % ids[i], v)
-
-    @_lzm
-    def getTime(self, lz):
-        return lz['t']
-
-    @_lzm
-    def setTime(self, lz, t):
-        lz['t'] = float(t)
-
-    @_lzm
-    def getNumEvents(self, lz):
-        return lz['info']['n_events']
-
-    @_lzm
-    def getNumRateRules(self, lz):
-        return len(lz['info']['rate_rule_ids'])
-
-    @_lzm
-    def getNumConservedMoieties(self, lz):  # conservedMoietyAnalysis is off while lazy
-        return 0
-
-    @_lzm
-    def getConservedMoietyIds(self, lz):
-        return []
-
-    @_lzm
-    def getConservedMoietyValues(self, lz):
-        return np.zeros(0)
-
-    @_lzm
-    def getFloatingSpeciesInitConcentrations(self, lz):
-        v = self._r._lz_init_values(lz) if lz['reset_ok'] else lz['x0'][lz['tgt']]
-        d = dict(zip(lz['tgt_ids'], v))
-        c = self.getFloatingSpeciesConcentrations()
-        return np.array([d.get(s, x) for s, x in zip(lz['st'].ids, c)])
-
-
-def _lazy_ids(key, kind=None, fmt=None):  # _LazyModel getters/setters over one id list
-    def ids(self, lz):
-        return list(getattr(lz['st'], key))
-
-    def num(self, lz):
-        return len(getattr(lz['st'], key))
-
-    def get(self, lz, idx=None):
-        return self._vals(lz, getattr(lz['st'], key), kind, idx)
-
-    def put(self, lz, *args):
-        self._set(getattr(lz['st'], key), fmt, args)
-    return ids, num, get, put
-
-
-for _k, _i, _n, _g, _s, _kind, _fmt in (
-        ('ids', 'getFloatingSpeciesIds', 'getNumFloatingSpecies', 'getFloatingSpeciesConcentrations',
-         'setFloatingSpeciesConcentrations', 'conc', '[%s]'),
-        ('ids', None, None, 'getFloatingSpeciesAmounts', 'setFloatingSpeciesAmounts', 'amt', '%s'),
-        ('bids', 'getBoundarySpeciesIds', 'getNumBoundarySpecies', 'getBoundarySpeciesConcentrations',
-         'setBoundarySpeciesConcentrations', 'conc', '[%s]'),
-        ('bids', None, None, 'getBoundarySpeciesAmounts', 'setBoundarySpeciesAmounts', 'amt', '%s'),
-        ('gids', 'getGlobalParameterIds', 'getNumGlobalParameters', 'getGlobalParameterValues',
-         'setGlobalParameterValues', None, '%s'),
-        ('cids', 'getCompartmentIds', 'getNumCompartments', 'getCompartmentVolumes', 'setCompartmentVolumes', None, '%s'),
-        ('rids', 'getReactionIds', 'getNumReactions', 'getReactionRates', None, None, '%s')):
-    for _name, _fn in zip((_i, _n, _g, _s), _lazy_ids(_k, _kind, _fmt)):
-        if _name:
-            _fn.__name__ = _name
-            setattr(_LazyModel, _name, _lzm(_fn))
+RoadRunner = ExtendedRoadRunner

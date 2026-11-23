@@ -405,7 +405,6 @@ class TelluriumTestCase(unittest.TestCase):
         models = te.listTestModels()
         self.assertTrue('feedback.xml' in models)
 
-    @pytest.mark.skip(reason="bug in roadrunner loading test models, https://github.com/sys-bio/roadrunner/issues/400")
     def test_loadTestModel(self):
         r = te.loadTestModel('feedback.xml')
         self.assertIsNotNone(r)
@@ -431,13 +430,6 @@ class TelluriumTestCase(unittest.TestCase):
         self.assertEqual(s.shape[0], 200)
         self.assertEqual(s["time"][0], 0)
         self.assertAlmostEqual(s["time"][-1], 100.0)
-
-    #The roadrunner tests seem to have changed; 'runTester' doesn't work any more.
-    # def test_roadrunner_tests(self):
-    #     """ Run the roadrunner tests. """
-    #     import roadrunner.tests
-    #     Nfailed = roadrunner.tests.runTester()
-    #     self.assertEqual(Nfailed, 0)
 
     def test_loada(self):
         rr = te.loada('''

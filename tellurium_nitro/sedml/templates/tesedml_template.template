@@ -26,7 +26,7 @@ python {{ factory.python }}
 ####################################################################################################
 """
 import tellurium_nitro as te
-from roadrunner import Config
+from tellurium_nitro.nitro import Config
 from tellurium_nitro.sedml.mathml import *
 from tellurium_nitro.sedml.tesedml import process_trace, terminate_trace, fix_endpoints
 
