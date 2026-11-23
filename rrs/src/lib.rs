@@ -1,4 +1,5 @@
 pub mod expr;
+pub mod fixed;
 mod jit;
 pub mod model;
 pub mod sens;

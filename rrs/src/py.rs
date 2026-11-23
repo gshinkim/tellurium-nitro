@@ -518,8 +518,27 @@ fn from_sbml<'py>(py: Python<'py>, sbml: &str) -> PyResult<(PyModel, Bound<'py, 
     Ok((PyModel { m, pool: Default::default(), names: Default::default() }, d))
 }
 
+/// libroadrunner's "euler" / "rk4" / "rk45" integrators (see crate::fixed) from the model's initial
+/// state -> array (len(times), len(outputs)). outputs default: floating species.
+#[pyfunction]
+#[pyo3(signature = (model, method, times, step=0.0, rtol=1e-6, atol=1e-12, outputs=None))]
+#[allow(clippy::too_many_arguments)]
+fn simulate_fixed<'py>(py: Python<'py>, model: &PyModel, method: &str, times: PyReadonlyArray1<f64>, step: f64, rtol: f64,
+                       atol: f64, outputs: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
+    use crate::fixed::{integrate_fixed, Method};
+    let method = match method { "euler" => Method::Euler, "rk4" => Method::Rk4, "rk45" => Method::Rk45,
+                                _ => return Err(verr(format!("unknown method '{method}' (euler, rk4, rk45)"))) };
+    let (m, times, outs) = (&model.m, check_times(times)?, model.outs(outputs)?);
+    let mut out = vec![0.0; times.len() * outs.len()];
+    let mut w = m.work();
+    m.load(&mut w, &[], &[]);
+    integrate_fixed(m, &mut w, method, &times, step, rtol, atol, &outs, &mut out).map_err(verr)?;
+    arr(py, out, &[times.len(), outs.len()])
+}
+
 #[pymodule]
 fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(simulate_fixed, m)?)?;
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;

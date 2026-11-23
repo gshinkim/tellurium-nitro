@@ -1298,6 +1298,27 @@ impl Model {
         None
     }
 
+    /// dy/dt at (t, y) into out (full state, same units as `simulate`), via the rates-only tape.
+    pub fn deriv(&self, w: &mut Work, t: f64, y: &[f64], out: &mut [f64]) {
+        let Work { rr, v, hist, .. } = w;
+        self.rates_at(hist, rr, v, y, t);
+        self.rhs(v, out);
+    }
+
+    /// Any delay() in the model.
+    pub fn has_delays(&self) -> bool { !self.dly.is_empty() }
+
+    /// Is any event trigger true at (w.s, t)?
+    pub fn any_trigger(&self, w: &mut Work, t: f64) -> bool {
+        let Work { ra, s, hist, .. } = w;
+        self.aux_at(hist, ra, s, t);
+        self.events.iter().any(|e| ra[e.trig as usize] != 0.0)
+    }
+
+    /// Process trigger transitions and execute due events at t (as `simulate` does between steps).
+    /// None if a cascade does not terminate, else whether any event executed.
+    pub fn apply_events(&self, w: &mut Work, t: f64) -> Option<bool> { self.events_at(w, t) }
+
     /// Write the requested output registers at (w.s, t) into row.
     pub fn record(&self, w: &mut Work, t: f64, outs: &[u32], row: &mut [f64]) {
         self.record_y(&w.hist, &mut w.ra, &w.s, t, outs, row);
