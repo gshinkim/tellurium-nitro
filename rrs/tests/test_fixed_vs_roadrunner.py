@@ -108,6 +108,47 @@ def test_fixed_vs_roadrunner(verbose=False):
     return max(worst)
 
 
+def _tight(sbml, sel, times):
+    """libroadrunner CVODE at rtol 1e-12 on `times`: the reference solution."""
+    r = roadrunner.RoadRunner(sbml)
+    r.integrator.relative_tolerance, r.integrator.absolute_tolerance = 1e-12, 1e-14
+    r.timeCourseSelections = sel
+    return np.asarray(r.simulate(times=list(times)))[:, 1:]
+
+
+def test_rk45_variable_step(verbose=False):
+    """rk45 with variable_step_size (libroadrunner's default): libroadrunner's step sequence and row
+    count (equal up to rounding: the step size control amplifies 1-ulp differences in the rates), and
+    on its own time grid at least as accurate as libroadrunner on its grid (vs CVODE at rtol 1e-12)."""
+    worst = 0.0
+    for name, src in ANT.items():
+        sbml = sbml_of(src)
+        for eps, hmax, rows in [(1e-12, 1.0, 100000), (1e-8, 0.25, 100000), (1e-10, 1.0, 7)]:
+            a = roadrunner.RoadRunner(sbml)
+            a.setIntegrator('rk45')
+            a.integrator.epsilon, a.integrator.maximum_time_step, a.integrator.max_output_rows = eps, hmax, rows
+            sel = ['time'] + [f'[{i}]' for i in a.model.getFloatingSpeciesIds()]
+            a.timeCourseSelections = sel
+            ya = np.asarray(a.simulate(0, 10))
+            b = rn.RoadRunner(sbml)
+            b.setIntegrator('rk45')
+            for k, v in dict(epsilon=eps, maximum_time_step=hmax, max_output_rows=rows).items():
+                b.setIntegratorSetting(k, v)
+            b.timeCourseSelections = sel
+            yb = np.asarray(b.simulate(0, 10)).reshape(-1, len(sel))
+            assert yb.shape == ya.shape, (name, eps, yb.shape, ya.shape)
+            assert abs(yb[1, 0] - ya[1, 0]) <= 1e-9 * ya[1, 0], (name, eps, yb[1, 0], ya[1, 0])  # same first step (to rounding)
+            scale = np.abs(ya[:, 1:]).max(0) + 1e-300
+            ea = (np.abs(ya[:, 1:] - _tight(sbml, sel, ya[:, 0])) / scale).max()
+            eb = (np.abs(yb[:, 1:] - _tight(sbml, sel, yb[:, 0])) / scale).max()
+            if verbose:
+                print(f'{name:20s} eps {eps:.0e} hmax {hmax:<4} rows {len(yb):5d}  error/colmax nitro {eb:.1e} libroadrunner {ea:.1e}')
+            assert eb <= max(2 * ea, 1e-9), (name, eps, eb, ea)
+            worst = max(worst, eb - ea)
+    return worst
+
+
 if __name__ == '__main__':
     print('roadrunner_nitro:', rn.__file__, ' roadrunner:', roadrunner.__version__)
     print('worst (abs diff / max |y|):', test_fixed_vs_roadrunner(verbose=True))
+    print('rk45 variable step, worst (nitro error - libroadrunner error):', test_rk45_variable_step(verbose=True))

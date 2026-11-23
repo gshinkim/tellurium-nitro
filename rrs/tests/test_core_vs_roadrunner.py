@@ -212,6 +212,8 @@ def sc_reset(r, rec, sbml):
     r.sim(0, 4, 9); r.reset(); snap()
     r.setValue('init(%s)' % ps[0], 0.77); snap()
     r.resetToOrigin(); snap()
+    # init(...) set after a parameter change: libroadrunner reloads at the initial values (parameters too)
+    r.sim(0, 4, 9); r.setValue(ps[0], 0.555); r.setValue('init([%s])' % fs[0], 2.5); snap()
     rec('sim', lambda: r.sim(0, 2, 5), atol=1e-10, scaled=True)
 
 
@@ -334,8 +336,8 @@ def test_integrator_registry():
         b.setIntegrator(name)
         assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('rk45')
-    with pytest.raises(ValueError):  # variable_step_size=True (default): adaptive output grid not built yet
-        b.simulate(0, 1, 5)
+    y = np.asarray(b.simulate(0, 1, 5))  # variable_step_size=True (default): a row per accepted step
+    assert y.shape[0] > 5 and y[-1, 0] == 1
     b.setIntegratorSetting('variable_step_size', False)
     assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('cvode')

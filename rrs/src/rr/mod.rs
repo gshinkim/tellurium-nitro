@@ -208,7 +208,17 @@ impl Core {
     }
 
     /// Initial concentrations reset() gives the floating species (fids order).
-    fn init_concs(&mut self) -> Result<Vec<f64>, String> {
+    fn init_concs(&mut self) -> Result<Vec<f64>, String> { self.init_concs_v(true) }
+
+    /// Initial volume of compartment `c`: its initial value, else (set by an assignment rule) the
+    /// model's initial value of it.
+    fn init_volume(&self, c: &str) -> Option<f64> {
+        self.kpos.get(c).map(|&q| self.xi[q]).or_else(|| self.info.values.get(c).copied())
+    }
+
+    /// `keep_amounts`: as reset() (species of a compartment changed since its initial value keep their
+    /// initial amount in the current volume); false: the initial concentrations themselves (init([S])).
+    fn init_concs_v(&mut self, keep_amounts: bool) -> Result<Vec<f64>, String> {
         let mut vals: HashMap<String, f64> = self.tgt.iter().map(|&j| (self.keys[j].clone(), self.xi[j])).collect();
         if let Some(ia) = self.ia.clone().filter(|v| !v.is_empty()) {
             let cur: HashMap<&String, f64> = self.keys.iter().zip(&self.x).map(|(k, &v)| (k, v)).collect();
@@ -240,7 +250,7 @@ impl Core {
         for s in &fids {
             let v = match vals.get(s) {
                 // amounts are kept when a compartment changed since its initial value (as roadrunner)
-                Some(&v) => match self.kpos.get(self.comp_of(s)) { Some(&c) if self.x[c] != 0.0 => v * self.xi[c] / self.x[c], _ => v },
+                Some(&v) => match self.kpos.get(self.comp_of(s)) { Some(&c) if keep_amounts && self.x[c] != 0.0 => v * self.xi[c] / self.x[c], _ => v },
                 None => match self.rule_init.get(s) { Some(&v) => v, None => self.species(s, true)? },
             };
             out.push(v);
@@ -260,13 +270,15 @@ impl Core {
         Ok(())
     }
 
-    /// Per-state atol multipliers: |initial concentration| of each floating species (1 if ~0), as
-    /// roadrunner's CVODE scales a scalar atol by initial amounts.
+    /// Per-state atol multipliers: |initial concentration| of each floating species (1 if ~0), and
+    /// |initial value| of other states (rate-rule variables; 1 if ~0), as roadrunner's CVODE scales a
+    /// scalar atol by initial amounts (CVODEIntegrator::getAbsoluteToleranceVector).
     fn atol_scale(&mut self) -> Result<Vec<f64>, String> {
         let ic = self.init_concs()?;
-        let mut a = vec![1.0; self.m.nx];
+        let sc = |v: f64| if v.abs() < 1e-30 || !v.is_finite() { 1.0 } else { v.abs() };
+        let mut a: Vec<f64> = self.m.state_ids.iter().map(|id| self.kpos.get(id).map_or(1.0, |&k| sc(self.xi[k]))).collect();
         for (i, s) in self.sp.iter().enumerate() {
-            if let Some(j) = *s { let v = ic[i].abs(); a[j] = if v < 1e-30 { 1.0 } else { v }; }
+            if let Some(j) = *s { a[j] = sc(ic[i]); }
         }
         Ok(a)
     }
@@ -287,17 +299,35 @@ impl Core {
         Ok(out)
     }
 
-    fn advance(&mut self, times: &[f64], outs: &[u32], rtol: f64, atol: f64) -> Result<Vec<f64>, String> {
+    /// rk45 with variable_step_size (crate::fixed::integrate_rk45_variable) from t0 to t1: rows of
+    /// `outs`, one per accepted step; the model is left at the last row's time.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_rk45_variable(&mut self, t0: f64, t1: f64, outs: &[u32], hmin: f64, hmax: f64, eps: f64, max_rows: usize)
+                             -> Result<Vec<f64>, String> {
+        let Core { m, w, kres, x, .. } = self;
+        m.load(w, kres, x);
+        let (ts, out) = crate::fixed::integrate_rk45_variable(m, w, t0, t1, hmin, hmax, eps, outs, max_rows)?;
+        let (tend, xo) = (ts[ts.len() - 1], self.xo.clone());
+        self.m.record(&mut self.w, tend, &xo, &mut self.x);
+        (self.t, self.fresh, self.qok, self.live) = (tend, false, false, true);
+        Ok(out)
+    }
+
+    /// `tol`: absolute tolerance per state (RoadRunner::cvode_tolerances).
+    fn advance(&mut self, times: &[f64], outs: &[u32], rtol: f64, tol: &[f64]) -> Result<Vec<f64>, String> {
         let asc = self.atol_scale()?;
+        // the retry: every state at most 1e-12 times its scale
+        let retry = tol.iter().zip(&asc).map(|(&t, &a)| (1e-12 * a / t).min(1.0)).fold(1.0, f64::min);
         let (no, nt) = (outs.len(), times.len());
         let mut out = vec![0.0; nt * no];
         let Core { m, w, kres, x, fresh, .. } = self;
-        w.atol_scale.copy_from_slice(&asc);
+        w.atol_scale.copy_from_slice(tol);
         if *fresh { m.events_reset(w); }
         let saved = m.event_state(w);
         let mut tried = f64::NAN;
         let mut ok = false;
-        for a in [atol, atol.min(1e-12)] {
+        let atol = tol.iter().zip(&asc).map(|(&t, &a)| t / a).fold(0.0, f64::max);
+        for a in [1.0, retry] {
             if a == tried { break; }
             tried = a;
             let hist = w.hist.save(); // a continued run keeps its delay() history
@@ -727,11 +757,11 @@ impl RoadRunner {
     fn init_value(&mut self, k: &str, conc: bool) -> Result<f64, String> {
         let c = self.core_mut()?;
         if let Some(i) = c.fids().iter().position(|x| x == k) {
-            let ic = c.init_concs()?[i];
+            let ic = c.init_concs_v(false)?[i];
             if conc { return Ok(ic); }
             let comp = c.comp_of(k).to_string();
-            let vol = match c.kpos.get(&comp) { Some(&j) => c.xi[j], None => c.species_raw(k)?.1 };
-            return Ok(ic * vol);
+            let vol = match c.init_volume(&comp) { Some(v) => v, None => c.species_raw(k)?.1 };
+            return Ok(ic * vol); // the initial amount: in the initial volume (as roadrunner)
         }
         let Some(&j) = c.kpos.get(k) else { // rule-set symbols: their current value (as roadrunner)
             let r = c.reg(k)?;
@@ -739,7 +769,7 @@ impl RoadRunner {
         };
         if c.is_species(k) { // boundary species
             let comp = c.comp_of(k).to_string();
-            let vol = c.kpos.get(&comp).map_or(1.0, |&v| c.xi[v]);
+            let vol = c.init_volume(&comp).unwrap_or(1.0);
             return Ok(match (conc, c.info.amount_params.contains(k)) { (true, true) => c.xi[j] / vol, (false, false) => c.xi[j] * vol, _ => c.xi[j] });
         }
         if conc { return Err(format!("'{k}' is not a species")); }
@@ -785,19 +815,27 @@ impl RoadRunner {
                 Ok(())
             }
             Sel::Init(k, conc) => {
-                let c = self.core_mut()?;
-                let j = *c.kpos.get(&k).ok_or_else(|| format!("no initial value for '{k}'"))?;
-                let x = if c.is_species(&k) {
-                    let comp = c.comp_of(&k).to_string();
-                    let vol = c.kpos.get(&comp).map_or(1.0, |&q| c.xi[q]);
-                    match (conc, c.info.amount_params.contains(&k)) { (true, true) => v * vol, (false, false) => v / vol, _ => v }
-                } else if conc { return Err(format!("'{k}' is not a species")) } else { v };
-                c.xi[j] = x;
-                if let Some(ia) = c.ia.as_mut() { ia.retain(|(n, _)| *n != k); }
+                self.set_init(&k, conc, v)?;
                 self.reset_all() // roadrunner reloads its model at the initial values
             }
             _ => Err(format!("cannot set '{s}'")),
         }
+    }
+
+    /// Write the initial value of `k` (`conc`: a species' initial concentration) and nothing else, as
+    /// ExecutableModel::setFloatingSpeciesInitConcentrations; its initial assignment is dropped.
+    /// setValue("init(...)") follows it with reset_all(); the C API's initial-condition calls do not.
+    pub fn set_init(&mut self, k: &str, conc: bool, v: f64) -> Result<(), String> {
+        let c = self.core_mut()?;
+        let j = *c.kpos.get(k).ok_or_else(|| format!("no initial value for '{k}'"))?;
+        let x = if c.is_species(k) {
+            let comp = c.comp_of(k).to_string();
+            let vol = c.init_volume(&comp).unwrap_or(1.0); // an initial amount: in the initial volume
+            match (conc, c.info.amount_params.contains(k)) { (true, true) => v * vol, (false, false) => v / vol, _ => v }
+        } else if conc { return Err(format!("'{k}' is not a species")) } else { v };
+        c.xi[j] = x;
+        if let Some(ia) = c.ia.as_mut() { ia.retain(|(n, _)| n != k); }
+        Ok(())
     }
 
     /// Set the engine value of key k (species: amount, or concentration with `conc`).
@@ -972,6 +1010,61 @@ impl RoadRunner {
         Ok(())
     }
 
+    /// libroadrunner's CVODE state order for tolerances: rate-rule variables, then the independent
+    /// floating species (all floating species with moiety analysis off).
+    fn tolerance_ids(&self) -> Vec<String> {
+        let fs = self.floating_ids();
+        let ni = if self.cma { self.independent_ids().len() } else { fs.len() };
+        self.rate_rule_ids().into_iter().filter(|r| !fs.contains(r)).chain(fs[..ni].iter().cloned()).collect()
+    }
+
+    /// CVODEIntegrator::getAbsoluteToleranceVector: absolute tolerances on amounts, one per
+    /// tolerance_ids(). A scalar absolute_tolerance is scaled by each initial amount (initial value of
+    /// a rate-rule variable; the compartment volume if ~0); a vector set on the cvode integrator is
+    /// used as is (one of the wrong length: 1e-12, scaled, as roadrunner's CVODE_MIN_ABSOLUTE).
+    pub fn absolute_tolerance_vector(&mut self) -> Result<Vec<f64>, String> {
+        let ids = self.tolerance_ids();
+        let a = match self.integrator_named("cvode").unwrap().get("absolute_tolerance")? {
+            Value::Doubles(v) if v.len() == ids.len() => return Ok(v.clone()),
+            Value::Doubles(_) => 1e-12,
+            v => v.f64(),
+        };
+        let c = self.core_mut()?;
+        let asc = c.atol_scale()?;
+        Ok(ids.iter().map(|id| c.m.state_ids.iter().position(|s| s == id).map_or(a, |j| a * asc[j] * c.m.vol[j])).collect())
+    }
+
+    /// CVODEIntegrator::setIndividualTolerance: absolute tolerance `value` (on the amount) for a
+    /// floating species (independent, with moiety analysis on) or rate-rule variable; the cvode
+    /// absolute_tolerance becomes the vector of absolute_tolerance_vector().
+    pub fn set_individual_tolerance(&mut self, sid: &str, value: f64) -> Result<(), String> {
+        if self.integ.name != "cvode" { return Err(format!("{}: individual tolerances are a cvode setting", self.integ.name)); }
+        let i = self.tolerance_ids().iter().position(|s| s == sid).ok_or_else(|| format!(
+            "CVODEIntegrator::setIndividualTolerance failed, given sid {sid} is neither a floating species nor has a rate rule."))?;
+        let mut v = self.absolute_tolerance_vector()?;
+        v[i] = value;
+        self.integ.set("absolute_tolerance", Value::Doubles(v))
+    }
+
+    /// Absolute tolerance per engine state for cvode: absolute_tolerance (scalar) times atol_scale, or
+    /// the vector's amount tolerances in state units (states it does not list: 1e-12 scaled).
+    fn cvode_tolerances(&mut self) -> Result<Vec<f64>, String> {
+        let at = self.integrator_named("cvode").unwrap().get("absolute_tolerance")?.clone();
+        let (ids, v) = match at {
+            Value::Doubles(_) => (self.tolerance_ids(), self.absolute_tolerance_vector()?),
+            _ => (vec![], vec![]),
+        };
+        let c = self.core_mut()?;
+        let asc = c.atol_scale()?;
+        let a = if let Value::Doubles(_) = at { 1e-12 } else { at.f64() };
+        let mut tol: Vec<f64> = asc.iter().map(|s| a * s).collect();
+        for (id, x) in ids.iter().zip(v) {
+            if let Some(j) = c.m.state_ids.iter().position(|s| s == id) { tol[j] = x / c.m.vol[j]; }
+        }
+        if tol.iter().any(|t| !(*t > 0.0 && t.is_finite())) { return Err("absolute tolerances must be positive".into()); }
+        Ok(tol)
+    }
+
     pub fn seed(&mut self) -> u64 { self.integrator_named("gillespie").map_or(0, |s| s.num("seed") as u64) }
     pub fn set_seed(&mut self, seed: u64) -> Result<(), String> {
         self.integrator_named("gillespie").unwrap().set("seed", Value::UInt(seed))?;
@@ -1000,13 +1093,19 @@ impl RoadRunner {
             .collect::<Vec<_>>().iter().map(|s| self.get_value(s)).collect::<Result<_, _>>()?;
         let y = match self.integ.name {
             "cvode" => {
-                let (rtol, atol) = (self.integ.num("relative_tolerance"), self.integ.num("absolute_tolerance"));
-                self.core_mut()?.advance(&times, &plan.outs, rtol, atol)?
+                let (rtol, tol) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?);
+                self.core_mut()?.advance(&times, &plan.outs, rtol, &tol)?
             }
             "gillespie" => {
                 let var = self.integ.get("variable_step_size")?.bool();
                 let (y, _) = self.ssa(&plan.outs, if var { None } else { Some(&times) })?;
                 y
+            }
+            "rk45" if self.integ.get("variable_step_size")?.bool() => {
+                let i = &self.integ;
+                let (hmin, hmax, eps, rows) = (i.num("minimum_time_step"), i.num("maximum_time_step"), i.num("epsilon"), i.num("max_output_rows").max(0.0) as usize);
+                let (t0, t1) = (times[0], times[times.len() - 1]);
+                self.core_mut()?.advance_rk45_variable(t0, t1, &plan.outs, hmin, hmax, eps, rows)?
             }
             name => {
                 use crate::fixed::Method;
@@ -1014,8 +1113,6 @@ impl RoadRunner {
                 let (method, step, atol) = match name {
                     "euler" => (Method::Euler, h / self.integ.num("subdivision_steps").max(1.0), 0.0),
                     "rk4" => (Method::Rk4, 0.0, 0.0),
-                    "rk45" if self.integ.get("variable_step_size")?.bool() =>
-                        return Err("rk45: variable_step_size=True is not supported; set it to False".into()),
                     "rk45" => (Method::Rk45, self.integ.num("maximum_time_step"), self.integ.num("epsilon")),
                     _ => return Err(format!("integrator {name} cannot simulate")),
                 };
@@ -1031,11 +1128,43 @@ impl RoadRunner {
     /// The last simulate()/gillespie() result.
     pub fn result(&self) -> Option<&Matrix> { self.result.as_ref() }
 
-    /// One integration step from t0 to t0 + h (cvode); returns the new time.
+    /// One integration step from t0 to t0 + h with the current integrator (as Integrator::integrate);
+    /// returns the new time. Variable-step rk45 / gillespie take one step (one accepted step / one
+    /// firing) and may end before t0 + h.
     pub fn one_step(&mut self, t0: f64, h: f64) -> Result<f64, String> {
-        if self.integ.name != "cvode" { return Err(format!("oneStep: integrator {}", self.integ.name)); }
-        let (rtol, atol) = (self.integ.num("relative_tolerance"), self.integ.num("absolute_tolerance"));
-        self.core_mut()?.advance(&[t0, t0 + h], &[], rtol, atol)?;
+        use crate::fixed::Method;
+        let var = self.integ.get("variable_step_size").is_ok_and(Value::bool);
+        let i = &self.integ;
+        let (hmin, hmax, eps) = (i.num("minimum_time_step"), i.num("maximum_time_step"), i.num("epsilon"));
+        let (method, step) = match self.integ.name {
+            "cvode" => {
+                let (rtol, tol) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?);
+                self.core_mut()?.advance(&[t0, t0 + h], &[], rtol, &tol)?;
+                return Ok(t0 + h);
+            }
+            "gillespie" => {
+                self.core_mut()?.t = t0;
+                if !var { return Ok(self.ssa(&[], Some(&[t0, t0 + h]))?.1); }
+                let (s0, e0) = (self.start, self.end);
+                (self.start, self.end) = (t0, t0 + h);
+                let g = self.integrator_named("gillespie").unwrap();
+                let rows = g.get("max_output_rows")?.clone();
+                g.set("max_output_rows", Value::Int(2))?;
+                let r = self.ssa(&[], None);
+                self.integrator_named("gillespie").unwrap().set("max_output_rows", rows)?;
+                (self.start, self.end) = (s0, e0);
+                return Ok(r?.1);
+            }
+            "rk45" if var => {
+                self.core_mut()?.advance_rk45_variable(t0, t0 + h, &[], hmin, hmax, eps, 2)?;
+                return Ok(self.time());
+            }
+            "rk45" => (Method::Rk45, hmax),
+            "rk4" => (Method::Rk4, 0.0),
+            "euler" => (Method::Euler, h / self.integ.num("subdivision_steps").max(1.0)),
+            name => return Err(format!("oneStep: integrator {name}")),
+        };
+        self.core_mut()?.advance_fixed(&[t0, t0 + h], &[], method, step, eps.max(0.0))?;
         Ok(t0 + h)
     }
 
@@ -1117,11 +1246,10 @@ impl RoadRunner {
         let plan = self.plan(&sel)?;
         let pre: Vec<f64> = plan.cols.iter().filter_map(|c| if let Col::Pre(s) = c { Some(s.clone()) } else { None })
             .collect::<Vec<_>>().iter().map(|s| self.get_value(s)).collect::<Result<_, _>>()?;
-        let cv = self.integrator_named("cvode").unwrap();
-        let (rtol, atol) = (cv.num("relative_tolerance"), cv.num("absolute_tolerance"));
+        let rtol = self.integrator_named("cvode").unwrap().num("relative_tolerance");
+        let (atol, asc) = (1.0, self.cvode_tolerances()?); // per-state absolute tolerances
         let c = self.core_mut()?;
         if c.m.has_algebraic() { return Err("gillespie: algebraic rules are not supported".into()); }
-        let asc = c.atol_scale()?;
         let (m, kres, x, outs) = (&c.m, &c.kres, &c.x, &plan.outs);
         let no = outs.len();
         let mut y = vec![f64::NAN; n * points * no];

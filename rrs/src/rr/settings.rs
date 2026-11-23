@@ -132,6 +132,8 @@ impl Solver {
     pub fn set(&mut self, key: &str, v: Value) -> Result<(), String> {
         let i = self.find(key)?;
         let p = &mut self.params[i];
+        // cvode's absolute_tolerance: a scalar, or one value per state (as libroadrunner's)
+        if let (true, Value::Doubles(_)) = (self.name == "cvode" && key == "absolute_tolerance", &v) { p.value = v; return Ok(()); }
         let v = p.value.coerce(v).map_err(|e| format!("{}.{key}: {e}", self.name))?;
         if p.fixed && v != p.default {
             return Err(format!("{}.{key} = {v:?} is not supported by the Nitro engine (only {:?})", self.name, p.default));

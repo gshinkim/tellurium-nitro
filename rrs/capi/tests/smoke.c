@@ -2,11 +2,13 @@
  * Build & run from the repo root, after `cargo build --release -p roadrunner_nitro_c_api` in rrs/:
  *   cc -Wall -I rrs/capi/include rrs/capi/tests/smoke.c -L rrs/target/release -lroadrunner_nitro_c_api \
  *      -Wl,-rpath,rrs/target/release -o /tmp/rrc_smoke && /tmp/rrc_smoke
+ * Leak check (macOS): leaks --atExit -- /tmp/rrc_smoke   (expects "0 leaks")
  */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "rrc_api.h"
 
 #define EQS(a, b) do { char* _s = (a); if (strcmp(_s, (b)) != 0) { printf("got [%s] want [%s]\n", _s, (b)); assert(0); } freeText(_s); } while (0)
@@ -105,8 +107,6 @@ int main(void)
     char* t = createTextMemory(4);
     assert(t && t[0] == 0);
     freeText(t);
-    assert(setTempFolder(NULL, "/tmp/rrc"));
-    EQS(getTempFolder(NULL), "/tmp/rrc");
     EQS(getlibSBMLVersion(NULL), "none");
     EQS(getAPIVersion(), "1.0");
     assert(strcmp(solverTypeToString(8), "double") == 0);
@@ -114,11 +114,69 @@ int main(void)
     assert(loc && strlen(loc) > 0);
     freeText(loc);
 
-    /* stubs fail cleanly */
-    assert(createRRInstance() == NULL);
+    /* NULL handles fail cleanly */
     assert(!loadSBML(NULL, "<sbml/>"));
-    assert(strstr(getLastError(), "not implemented yet"));
+    assert(strstr(getLastError(), "Failed to cast to a valid RoadRunner handle"));
     assert(simulate(NULL) == NULL && getNumberOfReactions(NULL) == -1);
+
+    /* a model: S1 -> S2 (k1), S2 -> S3 (k2), $X0 -> S1 (v0) */
+    static const char* sbml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<sbml xmlns=\"http://www.sbml.org/sbml/level3/version1/core\" level=\"3\" version=\"1\"><model id=\"m\">"
+        "<listOfCompartments><compartment id=\"c\" size=\"1\" constant=\"true\"/></listOfCompartments>"
+        "<listOfSpecies>"
+        "<species id=\"X0\" compartment=\"c\" initialConcentration=\"1\" hasOnlySubstanceUnits=\"false\" boundaryCondition=\"true\" constant=\"false\"/>"
+        "<species id=\"S1\" compartment=\"c\" initialConcentration=\"0\" hasOnlySubstanceUnits=\"false\" boundaryCondition=\"false\" constant=\"false\"/>"
+        "<species id=\"S2\" compartment=\"c\" initialConcentration=\"0\" hasOnlySubstanceUnits=\"false\" boundaryCondition=\"false\" constant=\"false\"/>"
+        "</listOfSpecies>"
+        "<listOfParameters><parameter id=\"v0\" value=\"2\" constant=\"true\"/><parameter id=\"k1\" value=\"0.5\" constant=\"true\"/>"
+        "<parameter id=\"k2\" value=\"0.25\" constant=\"true\"/></listOfParameters>"
+        "<listOfReactions>"
+        "<reaction id=\"J0\" reversible=\"false\"><listOfReactants><speciesReference species=\"X0\" stoichiometry=\"1\" constant=\"true\"/></listOfReactants>"
+        "<listOfProducts><speciesReference species=\"S1\" stoichiometry=\"1\" constant=\"true\"/></listOfProducts>"
+        "<kineticLaw><math xmlns=\"http://www.w3.org/1998/Math/MathML\"><apply><times/><ci>v0</ci><ci>X0</ci></apply></math></kineticLaw></reaction>"
+        "<reaction id=\"J1\" reversible=\"false\"><listOfReactants><speciesReference species=\"S1\" stoichiometry=\"1\" constant=\"true\"/></listOfReactants>"
+        "<listOfProducts><speciesReference species=\"S2\" stoichiometry=\"1\" constant=\"true\"/></listOfProducts>"
+        "<kineticLaw><math xmlns=\"http://www.w3.org/1998/Math/MathML\"><apply><times/><ci>k1</ci><ci>S1</ci></apply></math></kineticLaw></reaction>"
+        "<reaction id=\"J2\" reversible=\"false\"><listOfReactants><speciesReference species=\"S2\" stoichiometry=\"1\" constant=\"true\"/></listOfReactants>"
+        "<kineticLaw><math xmlns=\"http://www.w3.org/1998/Math/MathML\"><apply><times/><ci>k2</ci><ci>S2</ci></apply></math></kineticLaw></reaction>"
+        "</listOfReactions></model></sbml>";
+    RRHandle rr = createRRInstance();
+    assert(rr);
+    assert(setTempFolder(rr, "/tmp/rrc"));
+    EQS(getTempFolder(rr), "/tmp/rrc");
+    assert(!isModelLoaded(rr) && getNumberOfReactions(rr) == -1 && hasError());
+    assert(loadSBML(rr, sbml) && isModelLoaded(rr));
+    assert(getNumberOfReactions(rr) == 3 && getNumberOfFloatingSpecies(rr) == 2);
+    assert(setTimeCourseSelectionList(rr, "time, [S1], S2"));
+    RRCDataPtr res = simulateEx(rr, 0, 10, 11);
+    assert(res && res->RSize == 11 && res->CSize == 3);
+    assert(strcmp(res->ColumnHeaders[1], "[S1]") == 0);
+    assert(getRRCDataElement(res, 10, 0, &d) && d == 10);
+    /* S1(t) = 4 (1 - exp(-t/2)) */
+    assert(getRRCDataElement(res, 10, 1, &d) && fabs(d - 4 * (1 - exp(-5.0))) < 1e-5);
+    freeRRCData(res);
+    assert(steadyState(rr, &d) && d < 1e-6);
+    assert(getValue(rr, "[S1]", &d) && fabs(d - 4) < 1e-6);   /* v0 / k1 */
+    assert(getValue(rr, "S2", &d) && fabs(d - 8) < 1e-6);     /* v0 / k2 */
+    /* d S1 / d v0 = S1 / v0: scaled 1 */
+    assert(getCC(rr, "S1", "v0", &d) && fabs(d - 1) < 1e-6);
+    assert(getCC(rr, "J2", "k1", &d) && fabs(d) < 1e-6);
+    assert(!getCC(rr, "S1", "nope", &d) && hasError());
+    RRDoubleMatrixPtr jac = getFullJacobian(rr);
+    assert(jac && jac->RSize == 2 && jac->Data[0] == -0.5);
+    freeMatrix(jac);
+    RRVectorPtr fs = getFloatingSpeciesConcentrations(rr);
+    assert(fs && fs->Count == 2);
+    freeVector(fs);
+    RRStringArrayPtr ids = getFloatingSpeciesIds(rr);
+    EQS(stringArrayToString(ids), "S1 S2");
+    freeStringArray(ids);
+    RRListPtr syms = getAvailableTimeCourseSymbols(rr);
+    assert(getListLength(syms) == 12);
+    freeRRList(syms);
+    assert(freeRRInstance(rr));
+    assert(!freeRRInstance(NULL));
 
     printf("smoke OK\n");
     return 0;

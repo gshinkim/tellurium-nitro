@@ -699,6 +699,9 @@ impl PyRR {
     fn getIntegratorName(&self) -> &'static str { self.r.integrator().name }
     fn setIntegratorSetting(&mut self, key: &str, v: &Bound<'_, PyAny>) -> PyResult<()> { self.r.integrator_mut().set(key, to_value(v)?).map_err(verr) }
     fn getIntegratorSetting<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyAny>> { from_value(py, self.r.integrator().get(key).map_err(verr)?) }
+    /// CVODEIntegrator.setIndividualTolerance(sid, value): absolute tolerance on one variable's amount.
+    fn setIndividualTolerance(&mut self, sid: &str, value: f64) -> PyResult<()> { self.r.set_individual_tolerance(sid, value).map_err(verr) }
+    fn getAbsoluteToleranceVector(&mut self) -> PyResult<Vec<f64>> { self.r.absolute_tolerance_vector().map_err(verr) }
     fn getIntegratorSettings(&self) -> Vec<&'static str> { self.r.integrator().params.iter().map(|p| p.name).collect() }
     fn setSteadyStateSolver(&mut self, name: &str) -> PyResult<()> { self.r.set_steady_state_solver(name).map_err(verr) }
     fn getSteadyStateSolverName(&self) -> &'static str { self.r.steady_state_solver().name }
