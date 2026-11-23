@@ -41,6 +41,7 @@ pub mod layout;
 pub mod math;
 pub mod miriam;
 pub mod model;
+pub mod comp;
 pub mod ns;
 mod read;
 pub mod render;

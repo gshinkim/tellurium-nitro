@@ -14,6 +14,7 @@ rayon = "1.12"
 # Antimony -> SBML in pure Rust (copied from sys-bio/PathwayDesigner-rs, see crates/UPSTREAM)
 # DAE models (algebraic states, singular mass matrix) only: BDF with consistent initial conditions
 diffsol = { version = "0.20", default-features = false, features = ["nalgebra"] }
+sbml-io = { path = "crates/sbml-io" }
 antimony = { package = "antimony-rs", path = "crates/antimony", features = ["sbml"] }
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"

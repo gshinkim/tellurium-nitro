@@ -4,7 +4,6 @@
     res = m.mca_batch(['k1'], np.array([[0.5], [1.0]]))
 """
 import math
-import os
 import re
 
 import libsbml
@@ -575,16 +574,13 @@ def _rr_order(xs, ruled):  # roadrunner lists rule-determined symbols after the 
     return [x for x in xs if x not in ruled] + [x for x in xs if x in ruled]
 
 
-def _flatten_comp(doc, base=None):
-    """Flatten a hierarchical (comp) model in place, as roadrunner does; ``base``: directory that
-    external model definitions are relative to."""
-    if base:
-        doc.setLocationURI('file://' + os.path.join(os.path.abspath(base), ''))
-    props = libsbml.ConversionProperties()
-    props.addOption('flatten comp', True)
-    if doc.convert(props) != libsbml.LIBSBML_OPERATION_SUCCESS:
-        errs = [doc.getError(i).getMessage().strip() for i in range(doc.getNumErrors())]
-        raise NotImplementedError("comp model could not be flattened: %s" % '; '.join(errs[:3]))
+def _flatten_comp(sbml, base=None):
+    """Flatten a hierarchical (comp) model's SBML text (in Rust, as libsbml's flattener does); ``base``:
+    directory that external model definitions are relative to."""
+    try:
+        return roadrunner_nitro.flatten_comp(sbml, base)
+    except ValueError as e:
+        raise NotImplementedError("comp model could not be flattened: %s" % e)
 
 
 def _sub(ast, x, f):
@@ -990,8 +986,8 @@ def from_sbml(sbml, info=None, base=None):
     directory, for comp external model definitions."""
     doc = libsbml.readSBMLFromString(sbml)
     if doc.getModel() is not None and doc.getPlugin('comp') is not None and doc.isPackageEnabled('comp'):
-        _flatten_comp(doc, base)
-        sbml = libsbml.writeSBMLToString(doc)
+        sbml = _flatten_comp(sbml, base)
+        doc = libsbml.readSBMLFromString(sbml)
     m = doc.getModel()
     if m is not None:
         _drop_empty_math(m)
