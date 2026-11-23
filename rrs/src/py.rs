@@ -486,11 +486,44 @@ fn flatten_comp(sbml: &str, base: Option<String>) -> PyResult<String> {
     sbml_io::comp::flatten(sbml, base.as_deref().map(std::path::Path::new)).map_err(verr)
 }
 
+/// SBML text -> (Model, info dict), without roadrunner or libsbml (see crate::sbml::from_sbml).
+/// NotImplementedError: SBML the engine does not cover (comp: flatten first); ValueError: invalid SBML.
+#[pyfunction]
+fn from_sbml<'py>(py: Python<'py>, sbml: &str) -> PyResult<(PyModel, Bound<'py, PyDict>)> {
+    use crate::sbml::Error;
+    let (m, i) = crate::sbml::from_sbml(sbml).map_err(|e| match e {
+        Error::NotImplemented(s) => pyo3::exceptions::PyNotImplementedError::new_err(s),
+        Error::Invalid(s) => PyValueError::new_err(s),
+    })?;
+    let d = PyDict::new(py);
+    let [f, b, g, c, r] = i.ids;
+    d.set_item("ids", (f, b, g, c, r))?;
+    let nr = i.n.len().checked_div(i.rows.len()).unwrap_or(0);
+    let n = numpy::ndarray::Array2::from_shape_vec((i.rows.len(), nr), i.n).map_err(|e| verr(e.to_string()))?;
+    d.set_item("N", numpy::PyArray2::from_owned_array(py, n))?;
+    d.set_item("rows", i.rows)?;
+    d.set_item("comp_of", i.comp_of)?;
+    d.set_item("general", i.general)?;
+    d.set_item("changing", i.changing)?;
+    d.set_item("amount_params", i.amount_params)?;
+    d.set_item("rate_rule_ids", i.rate_rule_ids)?;
+    d.set_item("ia", i.ia.into_iter().collect::<std::collections::HashMap<_, _>>())?;
+    d.set_item("fdefs", i.fdefs.into_iter().collect::<std::collections::HashMap<_, _>>())?;
+    d.set_item("values", i.values)?;
+    d.set_item("n_events", i.n_events)?;
+    d.set_item("rule_vars", i.rule_vars)?;
+    d.set_item("hosu", i.hosu)?;
+    d.set_item("conversion_factors", i.conversion_factors)?;
+    d.set_item("srefs", i.srefs)?;
+    Ok((PyModel { m, pool: Default::default(), names: Default::default() }, d))
+}
+
 #[pymodule]
 fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;
+    m.add_function(wrap_pyfunction!(from_sbml, m)?)?;
     m.add_class::<Session>()?;
     m.add_class::<PyModel>()
 }

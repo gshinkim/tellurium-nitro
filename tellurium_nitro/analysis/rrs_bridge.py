@@ -981,9 +981,31 @@ def from_sbml(sbml, info=None, base=None):
 
     ``info`` also receives the model in roadrunner's terms: ids (floating, boundary, global parameter,
     compartment, reaction, rate-rule ids in roadrunner's order), rows/N (full stoichiometry), ia
-    (initial assignments), fdefs, values (initial values, SBML units), doc (libsbml document).
-    NotImplementedError / ValueError: not supported (load roadrunner instead). ``base``: the file's
-    directory, for comp external model definitions."""
+    (initial assignments), fdefs, values (initial values, SBML units), and of the rewritten model:
+    n_events, rule_vars, hosu, conversion_factors, srefs [(species, reaction, sign, id, has
+    stoichiometryMath)]. NotImplementedError / ValueError: not supported (load roadrunner instead).
+    ``base``: the file's directory, for comp external model definitions.
+
+    The Rust front end (roadrunner_nitro.from_sbml) does the work; NITRO_PY_FRONTEND=1 selects the
+    Python one below (libsbml) for A/B comparison."""
+    if os.environ.get('NITRO_PY_FRONTEND') == '1':
+        return _from_sbml_py(sbml, info, base)
+    if '/comp/' in sbml:  # ponytail: libsbml flattens comp until the Rust front end does
+        doc = libsbml.readSBMLFromString(sbml)
+        if doc.getModel() is not None and doc.getPlugin('comp') is not None and doc.isPackageEnabled('comp'):
+            _flatten_comp(doc, base)
+            sbml = libsbml.writeSBMLToString(doc)
+    m, out = roadrunner_nitro.from_sbml(sbml)
+    if info is not None:
+        # ia / fdefs as libsbml ASTs, as evaluate() and _names() take them
+        out['ia'] = {k: libsbml.parseL3Formula(v) for k, v in out['ia'].items()}
+        out['fdefs'] = {k: libsbml.parseL3Formula(v) for k, v in out['fdefs'].items()}
+        info.update(out)
+    return m
+
+
+def _from_sbml_py(sbml, info=None, base=None):
+    """from_sbml through libsbml (the Python front end the Rust one ports)."""
     doc = libsbml.readSBMLFromString(sbml)
     if doc.getModel() is not None and doc.getPlugin('comp') is not None and doc.isPackageEnabled('comp'):
         sbml = _flatten_comp(sbml, base)
@@ -1095,5 +1117,11 @@ def from_sbml(sbml, info=None, base=None):
         ruled = set(ar) | set(rrules)
         info.update(doc=doc, ia=ia, fdefs=fdefs, values=vals, rows=rows, N=N, rate_rule_ids=rrules,
                     ids=(_rr_order(rows, ruled), _rr_order([s for s in sp if s not in ri], ruled),
-                         _rr_order(list(pars), ruled), _rr_order(list(comps), ruled), reactions))
+                         _rr_order(list(pars), ruled), _rr_order(list(comps), ruled), reactions),
+                    n_events=m.getNumEvents(), rule_vars=[r.getVariable() for r in m.getListOfRules() if not r.isAlgebraic()],
+                    hosu={s for s in sp if sp[s].getHasOnlySubstanceUnits()},
+                    conversion_factors=[c for c in (m.getConversionFactor(), *(sp[s].getConversionFactor() for s in sp)) if c],
+                    srefs=[(sr.getSpecies(), rx.getId(), sg, sr.getId() if sr.isSetId() else None, sr.isSetStoichiometryMath())
+                           for rx in m.getListOfReactions()
+                           for sg, lst in ((-1, rx.getListOfReactants()), (1, rx.getListOfProducts())) for sr in lst])
     return out
