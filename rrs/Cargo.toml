@@ -20,6 +20,8 @@ diffsol = { version = "0.20", default-features = false, features = ["nalgebra"] 
 antimony = { package = "antimony-rs", path = "crates/antimony", features = ["sbml"] }
 # SBML reader (pure Rust): the SBML front end in src/sbml
 sbml-io = { path = "crates/sbml-io" }
+# eigenvalues (already in the tree through diffsol)
+nalgebra = "0.35"
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-jit = "0.137"

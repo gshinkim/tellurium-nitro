@@ -798,6 +798,13 @@ impl Model {
         for &(d, e, c) in &self.jfull { out[d as usize] += c * ev[e as usize]; }
     }
 
+    /// d state/dt (concentrations, state_ids order) at (w.s, t) from the loaded parameters.
+    pub fn state_rates(&self, w: &mut Work, t: f64, out: &mut [f64]) {
+        let Work { rr, v, s, hist, .. } = w;
+        self.rates_at(hist, rr, v, s, t);
+        self.rhs(v, out);
+    }
+
     #[inline]
     fn rhs(&self, v: &[f64], out: &mut [f64]) {
         out.fill(0.0);
