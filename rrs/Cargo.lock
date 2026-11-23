@@ -1374,6 +1374,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "diffsol",
+ "nalgebra",
  "numpy",
  "pyo3",
  "rayon",

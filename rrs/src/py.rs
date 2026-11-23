@@ -525,5 +525,186 @@ fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;
     m.add_function(wrap_pyfunction!(from_sbml, m)?)?;
     m.add_class::<Session>()?;
+    m.add_class::<PyRR>()?;
     m.add_class::<PyModel>()
+}
+
+// ---------------------------------------------------------------- RoadRunner (the Rust core)
+
+use crate::rr::{Matrix, RoadRunner, Value};
+
+type Mat<'py> = (Bound<'py, PyAny>, Vec<String>, Vec<String>);
+
+/// libroadrunner-like instance on the Rust core (crate::rr): RoadRunner(sbml=None, base=None).
+/// Matrices come back as (array, row ids, column ids).
+#[pyclass(unsendable, name = "RoadRunner")]
+struct PyRR { r: RoadRunner }
+
+fn m3<'py>(py: Python<'py>, m: Result<Matrix, String>) -> PyResult<Mat<'py>> {
+    let m = m.map_err(verr)?;
+    Ok((arr(py, m.data, &[m.nr, m.nc])?, m.rows, m.cols))
+}
+
+fn to_value(v: &Bound<'_, PyAny>) -> PyResult<Value> {
+    Ok(if let Ok(b) = v.cast::<pyo3::types::PyBool>() { Value::Bool(b.is_true()) }
+       else if let Ok(i) = v.extract::<i64>() { Value::Int(i) }
+       else if let Ok(u) = v.extract::<u64>() { Value::UInt(u) }
+       else if let Ok(f) = v.extract::<f64>() { Value::Double(f) }
+       else if let Ok(s) = v.extract::<String>() { Value::Str(s) }
+       else { Value::Doubles(v.extract::<Vec<f64>>()?) })
+}
+
+fn from_value<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match v {
+        Value::Bool(b) => pyo3::types::PyBool::new(py, *b).to_owned().into_any(),
+        Value::Int(i) => i.into_pyobject(py)?.into_any(),
+        Value::UInt(u) => u.into_pyobject(py)?.into_any(),
+        Value::Double(d) => d.into_pyobject(py)?.into_any(),
+        Value::Str(s) => s.into_pyobject(py)?.into_any(),
+        Value::Doubles(d) => d.clone().into_pyobject(py)?.into_any(),
+    })
+}
+
+fn cplx(py: Python<'_>, e: Result<Vec<(f64, f64)>, String>) -> PyResult<Bound<'_, PyAny>> {
+    let e = e.map_err(verr)?;
+    Ok(PyArray1::from_vec(py, e.into_iter().map(|(re, im)| numpy::Complex64::new(re, im)).collect()).into_any())
+}
+
+#[allow(non_snake_case)]
+#[pymethods]
+impl PyRR {
+    #[new]
+    #[pyo3(signature = (sbml=None, base=None))]
+    fn new(sbml: Option<&str>, base: Option<String>) -> PyResult<Self> {
+        let mut r = RoadRunner::new();
+        if let Some(s) = sbml { r.load_sbml(s, base.as_deref().map(std::path::Path::new)).map_err(verr)?; }
+        Ok(PyRR { r })
+    }
+    #[pyo3(signature = (sbml, base=None))]
+    fn load(&mut self, sbml: &str, base: Option<String>) -> PyResult<()> { self.r.load_sbml(sbml, base.as_deref().map(std::path::Path::new)).map_err(verr) }
+    fn isModelLoaded(&self) -> bool { self.r.is_model_loaded() }
+    fn clearModel(&mut self) { self.r.clear_model() }
+    fn getSBML(&self) -> PyResult<String> { self.r.get_sbml().map_err(verr) }
+    fn getCurrentSBML(&mut self) -> PyResult<String> { self.r.get_current_sbml().map_err(verr) }
+    fn regenerate(&mut self) -> PyResult<()> { self.r.regenerate().map_err(verr) }
+    fn saveState(&self, path: &str) -> PyResult<()> { self.r.save_state(std::path::Path::new(path)).map_err(verr) }
+    fn loadState(&mut self, path: &str) -> PyResult<()> { self.r.load_state(std::path::Path::new(path)).map_err(verr) }
+
+    /// simulate(start=None, end=None, points=None, selections=None) -> array (points x selections)
+    #[pyo3(signature = (start=None, end=None, points=None, selections=None))]
+    fn simulate<'py>(&mut self, py: Python<'py>, start: Option<f64>, end: Option<f64>, points: Option<usize>,
+                     selections: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(s) = start { self.r.start = s; }
+        if let Some(e) = end { self.r.end = e; }
+        if let Some(p) = points { self.r.points = p; }
+        if let Some(s) = selections { self.r.set_selections(&s).map_err(verr)?; }
+        let m = self.r.simulate().map_err(verr)?;
+        arr(py, m.data.clone(), &[m.nr, m.nc])
+    }
+    fn oneStep(&mut self, t: f64, h: f64) -> PyResult<f64> { self.r.one_step(t, h).map_err(verr) }
+    fn getCurrentTime(&self) -> f64 { self.r.time() }
+
+    #[getter]
+    fn get_timeCourseSelections(&self) -> Vec<String> { self.r.selections().to_vec() }
+    #[setter]
+    fn set_timeCourseSelections(&mut self, s: Vec<String>) -> PyResult<()> { self.r.set_selections(&s).map_err(verr) }
+    #[getter]
+    fn get_steadyStateSelections(&self) -> Vec<String> { self.r.steady_state_selections().to_vec() }
+    #[setter]
+    fn set_steadyStateSelections(&mut self, s: Vec<String>) -> PyResult<()> { self.r.set_steady_state_selections(&s).map_err(verr) }
+    #[getter]
+    fn get_conservedMoietyAnalysis(&self) -> bool { self.r.conservation_laws() }
+    #[setter]
+    fn set_conservedMoietyAnalysis(&mut self, on: bool) -> PyResult<()> { self.r.set_conservation_laws(on).map_err(verr) }
+    #[getter]
+    fn get_diffStepSize(&self) -> f64 { self.r.diff_step }
+    #[setter]
+    fn set_diffStepSize(&mut self, v: f64) { self.r.diff_step = v; }
+
+    fn setIntegrator(&mut self, name: &str) -> PyResult<()> { self.r.set_integrator(name).map_err(verr) }
+    fn getIntegratorName(&self) -> &'static str { self.r.integrator().name }
+    fn setIntegratorSetting(&mut self, key: &str, v: &Bound<'_, PyAny>) -> PyResult<()> { self.r.integrator_mut().set(key, to_value(v)?).map_err(verr) }
+    fn getIntegratorSetting<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyAny>> { from_value(py, self.r.integrator().get(key).map_err(verr)?) }
+    fn getIntegratorSettings(&self) -> Vec<&'static str> { self.r.integrator().params.iter().map(|p| p.name).collect() }
+    fn setSteadyStateSolver(&mut self, name: &str) -> PyResult<()> { self.r.set_steady_state_solver(name).map_err(verr) }
+    fn getSteadyStateSolverName(&self) -> &'static str { self.r.steady_state_solver().name }
+    fn setSteadyStateSolverSetting(&mut self, key: &str, v: &Bound<'_, PyAny>) -> PyResult<()> { self.r.steady_state_solver_mut().set(key, to_value(v)?).map_err(verr) }
+    fn getSteadyStateSolverSetting<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyAny>> { from_value(py, self.r.steady_state_solver().get(key).map_err(verr)?) }
+    fn getSeed(&mut self) -> u64 { self.r.seed() }
+    fn setSeed(&mut self, s: u64) -> PyResult<()> { self.r.set_seed(s).map_err(verr) }
+
+    fn getValue(&mut self, sel: &str) -> PyResult<f64> { self.r.get_value(sel).map_err(verr) }
+    fn setValue(&mut self, sel: &str, v: f64) -> PyResult<()> { self.r.set_value(sel, v).map_err(verr) }
+    fn __getitem__(&mut self, sel: &str) -> PyResult<f64> { self.getValue(sel) }
+    fn __setitem__(&mut self, sel: &str, v: f64) -> PyResult<()> { self.setValue(sel, v) }
+    fn getValues(&mut self, sels: Vec<String>) -> PyResult<Vec<f64>> { self.r.values(&sels).map_err(verr) }
+
+    fn getFloatingSpeciesIds(&self) -> Vec<String> { self.r.floating_ids() }
+    fn getBoundarySpeciesIds(&self) -> Vec<String> { self.r.boundary_ids() }
+    fn getGlobalParameterIds(&self) -> Vec<String> { self.r.global_parameter_ids() }
+    fn getCompartmentIds(&self) -> Vec<String> { self.r.compartment_ids() }
+    fn getReactionIds(&self) -> Vec<String> { self.r.reaction_ids() }
+    fn getRateRuleIds(&self) -> Vec<String> { self.r.rate_rule_ids() }
+    fn getIndependentFloatingSpeciesIds(&self) -> Vec<String> { self.r.independent_ids() }
+    fn getDependentFloatingSpeciesIds(&self) -> Vec<String> { self.r.dependent_ids() }
+    fn getConservedMoietyIds(&self) -> Vec<String> { self.r.conserved_moiety_ids() }
+    fn getEigenValueIds(&self) -> Vec<String> { self.r.eigenvalue_ids() }
+    fn getRatesOfChangeIds(&self) -> Vec<String> { self.r.rates_of_change_ids() }
+    fn getAvailableTimeCourseSymbols(&self) -> Vec<(&'static str, Vec<String>)> { self.r.available_time_course_symbols() }
+    fn getFloatingSpeciesConcentrations(&mut self) -> PyResult<Vec<f64>> { self.r.floating_concentrations().map_err(verr) }
+    fn getFloatingSpeciesAmounts(&mut self) -> PyResult<Vec<f64>> { self.r.floating_amounts().map_err(verr) }
+    fn getFloatingSpeciesInitConcentrations(&mut self) -> PyResult<Vec<f64>> { self.r.floating_init_concentrations().map_err(verr) }
+    fn getBoundarySpeciesConcentrations(&mut self) -> PyResult<Vec<f64>> { self.r.boundary_concentrations().map_err(verr) }
+    fn getGlobalParameterValues(&mut self) -> PyResult<Vec<f64>> { self.r.global_parameter_values().map_err(verr) }
+    fn getCompartmentVolumes(&mut self) -> PyResult<Vec<f64>> { self.r.compartment_volumes().map_err(verr) }
+    fn getReactionRates(&mut self) -> PyResult<Vec<f64>> { self.r.reaction_rates().map_err(verr) }
+    fn getRatesOfChange(&mut self) -> PyResult<Vec<f64>> { self.r.rates_of_change().map_err(verr) }
+
+    fn reset(&mut self) -> PyResult<()> { self.r.reset().map_err(verr) }
+    fn resetAll(&mut self) -> PyResult<()> { self.r.reset_all().map_err(verr) }
+    fn resetToOrigin(&mut self) -> PyResult<()> { self.r.reset_to_origin().map_err(verr) }
+    fn resetParameter(&mut self) -> PyResult<()> { self.r.reset_parameter().map_err(verr) }
+
+    fn steadyState(&mut self) -> PyResult<f64> { self.r.steady_state().map_err(verr) }
+    fn getSteadyStateValues(&mut self) -> PyResult<Vec<f64>> { self.r.steady_state_values().map_err(verr) }
+
+    fn getFullStoichiometryMatrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.stoichiometry_matrix()) }
+    fn getNrMatrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.reduced_stoichiometry_matrix()) }
+    fn getLinkMatrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.link_matrix()) }
+    fn getL0Matrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.l0_matrix()) }
+    fn getConservationMatrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.conservation_matrix()) }
+    fn getFullJacobian<'py>(&mut self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.full_jacobian()) }
+    fn getReducedJacobian<'py>(&mut self, py: Python<'py>) -> PyResult<Mat<'py>> { m3(py, self.r.reduced_jacobian()) }
+    fn getFullEigenValues<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { cplx(py, self.r.full_eigenvalues()) }
+    fn getReducedEigenValues<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { cplx(py, self.r.reduced_eigenvalues()) }
+    #[pyo3(signature = (scaled=false))]
+    fn getElasticityMatrix<'py>(&mut self, py: Python<'py>, scaled: bool) -> PyResult<Mat<'py>> { m3(py, self.r.elasticity_matrix(scaled)) }
+    #[pyo3(signature = (scaled=false))]
+    fn getConcentrationControlCoefficientMatrix<'py>(&mut self, py: Python<'py>, scaled: bool) -> PyResult<Mat<'py>> { m3(py, self.r.cc_matrix(scaled)) }
+    #[pyo3(signature = (scaled=false))]
+    fn getFluxControlCoefficientMatrix<'py>(&mut self, py: Python<'py>, scaled: bool) -> PyResult<Mat<'py>> { m3(py, self.r.fcc_matrix(scaled)) }
+    fn getCC(&mut self, var: &str, par: &str) -> PyResult<f64> { self.r.get_cc(var, par).map_err(verr) }
+    fn getuCC(&mut self, var: &str, par: &str) -> PyResult<f64> { self.r.get_ucc(var, par).map_err(verr) }
+    #[pyo3(signature = (reaction, x, steady=true))]
+    fn getEE(&mut self, reaction: &str, x: &str, steady: bool) -> PyResult<f64> { self.r.get_ee(reaction, x, steady).map_err(verr) }
+    #[pyo3(signature = (reaction, x, steady=true))]
+    fn getuEE(&mut self, reaction: &str, x: &str, steady: bool) -> PyResult<f64> { self.r.get_uee(reaction, x, steady).map_err(verr) }
+
+    /// gillespie(start, end, points=None) -> array: on a grid of `points`, or a row per firing.
+    #[pyo3(signature = (start, end, points=None))]
+    fn gillespie<'py>(&mut self, py: Python<'py>, start: f64, end: f64, points: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
+        let m = self.r.gillespie(start, end, points).map_err(verr)?;
+        arr(py, m.data.clone(), &[m.nr, m.nc])
+    }
+    /// gillespieRuns(n, start, end, points, seed=None) -> array (n, points, selections), all cores.
+    #[pyo3(signature = (n, start, end, points, seed=None))]
+    fn gillespieRuns<'py>(&mut self, py: Python<'py>, n: usize, start: f64, end: f64, points: usize, seed: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
+        let nc = self.r.selections().len();
+        let y = self.r.gillespie_runs(n, start, end, points, seed).map_err(verr)?;
+        arr(py, y, &[n, points, nc])
+    }
+    fn gillespieMeanSD<'py>(&mut self, py: Python<'py>, n: usize, start: f64, end: f64, points: usize) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let (a, b) = self.r.gillespie_mean_sd(n, start, end, points).map_err(verr)?;
+        Ok((arr(py, a.data, &[a.nr, a.nc])?, arr(py, b.data, &[b.nr, b.nc])?))
+    }
 }
