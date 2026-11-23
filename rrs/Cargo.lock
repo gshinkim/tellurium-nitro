@@ -22,6 +22,7 @@ name = "antimony-rs"
 version = "0.1.0"
 dependencies = [
  "sbml-io",
+ "serde_json",
 ]
 
 [[package]]
@@ -1376,6 +1377,14 @@ dependencies = [
  "numpy",
  "pyo3",
  "rayon",
+]
+
+[[package]]
+name = "roadrunner_nitro_c_api"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "roadrunner_nitro",
 ]
 
 [[package]]
