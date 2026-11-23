@@ -273,6 +273,20 @@ impl Core {
 
     /// Integrate from the current state over `times` (event state carried over), as Session.advance:
     /// a failed run is retried once with atol <= 1e-12. Returns outputs `outs` at `times`.
+    /// advance() with libroadrunner's euler / rk4 / rk45 (crate::fixed); the model is left at the end.
+    fn advance_fixed(&mut self, times: &[f64], outs: &[u32], method: crate::fixed::Method, step: f64, atol: f64)
+                     -> Result<Vec<f64>, String> {
+        let mut out = vec![0.0; times.len() * outs.len()];
+        let Core { m, w, kres, x, fresh, .. } = self;
+        if *fresh { m.events_reset(w); }
+        m.load(w, kres, x);
+        crate::fixed::integrate_fixed(m, w, method, times, step, 0.0, atol, outs, &mut out)?;
+        let (tend, xo) = (times[times.len() - 1], self.xo.clone());
+        self.m.record(&mut self.w, tend, &xo, &mut self.x);
+        (self.t, self.fresh, self.qok, self.live) = (tend, false, false, true);
+        Ok(out)
+    }
+
     fn advance(&mut self, times: &[f64], outs: &[u32], rtol: f64, atol: f64) -> Result<Vec<f64>, String> {
         let asc = self.atol_scale()?;
         let (no, nt) = (outs.len(), times.len());
@@ -994,7 +1008,19 @@ impl RoadRunner {
                 let (y, _) = self.ssa(&plan.outs, if var { None } else { Some(&times) })?;
                 y
             }
-            name => return Err(fixed_solver(name)),
+            name => {
+                use crate::fixed::Method;
+                let h = times[1] - times[0];
+                let (method, step, atol) = match name {
+                    "euler" => (Method::Euler, h / self.integ.num("subdivision_steps").max(1.0), 0.0),
+                    "rk4" => (Method::Rk4, 0.0, 0.0),
+                    "rk45" if self.integ.get("variable_step_size")?.bool() =>
+                        return Err("rk45: variable_step_size=True is not supported; set it to False".into()),
+                    "rk45" => (Method::Rk45, self.integ.num("maximum_time_step"), self.integ.num("epsilon")),
+                    _ => return Err(format!("integrator {name} cannot simulate")),
+                };
+                self.core_mut()?.advance_fixed(&times, &plan.outs, method, step, atol)?
+            }
         };
         self.result = Some(Matrix { nr: 0, nc: sel.len(), data: plan.apply(&y, &pre), rows: vec![], cols: sel });
         let r = self.result.as_mut().unwrap();
@@ -1378,8 +1404,3 @@ fn eig(j: &Matrix) -> Vec<(f64, f64)> {
     nalgebra::DMatrix::from_row_slice(j.nr, j.nc, &j.data).complex_eigenvalues().iter().map(|z| (z.re, z.im)).collect()
 }
 
-fn fixed_solver(name: &str) -> String {
-    // ponytail: rk4 / rk45 / euler go through crate::fixed::integrate_fixed(m, w, Method::{Rk4, Rk45,
-    // Euler}, times, step, rtol, atol, outs, out) once rrs/src/fixed.rs lands
-    format!("integrator {name}: fixed-step solvers are not built into this engine yet")
-}

@@ -330,10 +330,14 @@ def test_against_libroadrunner(name, sbml):
 
 def test_integrator_registry():
     b = rn.RoadRunner(rn.antimony_to_sbml(ANT['chain']))
-    for name in ('rk4', 'rk45', 'euler'):  # until rrs/src/fixed.rs lands
+    for name in ('rk4', 'euler'):  # crate::fixed (values vs libroadrunner: test_fixed_vs_roadrunner.py)
         b.setIntegrator(name)
-        with pytest.raises(ValueError):
-            b.simulate(0, 1, 5)
+        assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
+    b.setIntegrator('rk45')
+    with pytest.raises(ValueError):  # variable_step_size=True (default): adaptive output grid not built yet
+        b.simulate(0, 1, 5)
+    b.setIntegratorSetting('variable_step_size', False)
+    assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('cvode')
     with pytest.raises(ValueError):
         b.setIntegratorSetting('variable_step_size', True)  # not honoured: refused
