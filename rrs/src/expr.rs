@@ -234,9 +234,9 @@ impl Dag {
 // ---------------------------------------------------------------- parser
 
 #[derive(Clone, Debug, PartialEq)]
-enum Tok { Num(f64), Id(String), Sym(&'static str) }
+pub(crate) enum Tok { Num(f64), Id(String), Sym(&'static str) }
 
-fn lex(s: &str) -> Result<Vec<Tok>, String> {
+pub(crate) fn lex(s: &str) -> Result<Vec<Tok>, String> {
     let c: Vec<char> = s.chars().collect();
     let (mut i, mut out) = (0, vec![]);
     const SYMS: [&str; 17] = ["<=", ">=", "==", "!=", "&&", "||", "<", ">", "+", "-", "*", "/", "^", "(", ")", ",", "!"];

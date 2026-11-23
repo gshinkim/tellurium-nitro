@@ -518,12 +518,67 @@ fn from_sbml<'py>(py: Python<'py>, sbml: &str) -> PyResult<(PyModel, Bound<'py, 
     Ok((PyModel { m, pool: Default::default(), names: Default::default() }, d))
 }
 
+/// Model editing (crate::sbml::edit) for tests: ``sbml_edit("add_parameter", sbml, "k", 1.0)`` ->
+/// new SBML (get_kinetic_law: the formula; validate_current_sbml: ""). ValueError as libroadrunner raises.
+#[pyfunction]
+#[pyo3(signature = (op, sbml, *args))]
+fn sbml_edit(op: &str, sbml: &str, args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<String> {
+    use crate::sbml::edit::*;
+    let s = |i: usize| args.get_item(i)?.extract::<String>();
+    let f = |i: usize| args.get_item(i)?.extract::<f64>();
+    let b = |i: usize| args.get_item(i)?.extract::<bool>();
+    let v = |i: usize| args.get_item(i)?.extract::<Vec<String>>();
+    let r = match op {
+        "add_species_amount" => add_species_amount(sbml, &s(0)?, &s(1)?, f(2)?, b(3)?, b(4)?, &s(5)?),
+        "add_species_concentration" => add_species_concentration(sbml, &s(0)?, &s(1)?, f(2)?, b(3)?, b(4)?, &s(5)?),
+        "remove_species" => remove_species(sbml, &s(0)?),
+        "set_boundary" => set_boundary(sbml, &s(0)?, b(1)?),
+        "set_has_only_substance_units" => set_has_only_substance_units(sbml, &s(0)?, b(1)?),
+        "set_init_amount" => set_init_amount(sbml, &s(0)?, f(1)?),
+        "set_init_concentration" => set_init_concentration(sbml, &s(0)?, f(1)?),
+        "set_constant" => set_constant(sbml, &s(0)?, b(1)?),
+        "add_reaction_from_sbml" => add_reaction_from_sbml(sbml, &s(0)?),
+        "add_reaction" => {
+            let (re, pr) = (v(1)?, v(2)?);
+            let re: Vec<&str> = re.iter().map(String::as_str).collect();
+            let pr: Vec<&str> = pr.iter().map(String::as_str).collect();
+            add_reaction(sbml, &s(0)?, &re, &pr, &s(3)?)
+        }
+        "remove_reaction" => remove_reaction(sbml, &s(0)?, b(1)?),
+        "set_reversible" => set_reversible(sbml, &s(0)?, b(1)?),
+        "set_kinetic_law" => set_kinetic_law(sbml, &s(0)?, &s(1)?),
+        "get_kinetic_law" => get_kinetic_law(sbml, &s(0)?),
+        "add_parameter" => add_parameter(sbml, &s(0)?, f(1)?),
+        "remove_parameter" => remove_parameter(sbml, &s(0)?),
+        "add_compartment" => add_compartment(sbml, &s(0)?, f(1)?),
+        "remove_compartment" => remove_compartment(sbml, &s(0)?),
+        "add_initial_assignment" => add_initial_assignment(sbml, &s(0)?, &s(1)?),
+        "add_assignment_rule" => add_assignment_rule(sbml, &s(0)?, &s(1)?),
+        "add_rate_rule" => add_rate_rule(sbml, &s(0)?, &s(1)?),
+        "remove_rules" => remove_rules(sbml, &s(0)?),
+        "add_event" => add_event(sbml, &s(0)?, b(1)?, &s(2)?),
+        "add_trigger" => add_trigger(sbml, &s(0)?, &s(1)?),
+        "set_persistent" => set_persistent(sbml, &s(0)?, b(1)?),
+        "set_trigger_initial_value" => set_trigger_initial_value(sbml, &s(0)?, b(1)?),
+        "add_priority" => add_priority(sbml, &s(0)?, &s(1)?),
+        "add_delay" => add_delay(sbml, &s(0)?, &s(1)?),
+        "add_event_assignment" => add_event_assignment(sbml, &s(0)?, &s(1)?, &s(2)?),
+        "remove_event_assignments" => remove_event_assignments(sbml, &s(0)?, &s(1)?),
+        "remove_event" => remove_event(sbml, &s(0)?),
+        "validate_current_sbml" => validate_current_sbml(sbml).map(|_| String::new()),
+        "get_param_promoted_sbml" => get_param_promoted_sbml(sbml),
+        _ => return Err(PyValueError::new_err(format!("unknown edit '{op}'"))),
+    };
+    r.map_err(PyValueError::new_err)
+}
+
 #[pymodule]
 fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;
     m.add_function(wrap_pyfunction!(from_sbml, m)?)?;
+    m.add_function(wrap_pyfunction!(sbml_edit, m)?)?;
     m.add_class::<Session>()?;
     m.add_class::<PyModel>()
 }
