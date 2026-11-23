@@ -303,8 +303,7 @@ class ExtendedRoadRunner(roadrunner.roadrunner.RoadRunner):
         info = {}
         m = from_sbml(sbml, info, base)
         fids, bids, gids, cids, rids = ids = info['ids']
-        doc = info['doc'].getModel()
-        st = _RsModel(m, info, ids, [info['values'][c] for c in cids], 'symbols/time' in sbml or doc.getNumEvents() > 0,
+        st = _RsModel(m, info, ids, [info['values'][c] for c in cids], 'symbols/time' in sbml or info['n_events'] > 0,
                       extra=True)
         if not set(st.states) <= set(st.keys) or not set(sum(ids, [])) <= st.outs:
             raise NotImplementedError("not all of the model is in the Rust model")
@@ -315,28 +314,26 @@ class ExtendedRoadRunner(roadrunner.roadrunner.RoadRunner):
         # assignment re-evaluated with the current parameters and initial species (as roadrunner)
         tgt = [k for k in st.keys if k in fids or k in rr]
         ok = not (set(cids) & (info['changing'] | set(info['ia'])))  # constant compartments
-        plain = set(gids) - {x.getVariable() for x in doc.getListOfRules()}  # parameters without rules
+        plain = set(gids) - set(info['rule_vars'])  # parameters without rules
         for k in tgt:
             if k in info['ia']:
                 ok = ok and _names(info['ia'][k], set()) <= set(fids) | set(cids) | set(info['fdefs']) | plain
-        sp = {s: info['doc'].getModel().getSpecies(s) for s in fids + bids}
         attr = {}
         for s in fids + bids:
             attr.update({s: '[%s]' % s, s + '_conc': '[%s]' % s, s + '_amt': s})
         attr.update({k: k for k in gids + cids + rids})
-        srefs = [sr for rx in doc.getListOfReactions() for l in (rx.getListOfReactants(), rx.getListOfProducts()) for sr in l]
+        srefs = info['srefs']  # (species, reaction, sign, id, has stoichiometryMath)
         self.__dict__['_lz'] = dict(
             sbml=sbml, info=info, st=st, x=x0.copy(), x0=x0, t=0.0, oid=oid, xo=np.array([oid[k] for k in st.keys], dtype=int),
             o=lambda l: np.array([oid[k] for k in l], dtype=int), attr=attr, reset_ok=ok,
-            srefs=any(sr.isSetStoichiometryMath() for sr in srefs),  # these SBML views: roadrunner
+            srefs=any(sr[4] for sr in srefs),  # these SBML views: roadrunner
             # named stoichiometries: (row, reaction column, sign, id); their current values update N
-            nref=[(info['rows'].index(sr.getSpecies()), rids.index(sr.getParentSBMLObject().getParentSBMLObject().getId()),
-                   -1 if sr.getParentSBMLObject().getElementName() == 'listOfReactants' else 1, sr.getId())
-                  for sr in srefs if sr.isSetId() and sr.getSpecies() in info['rows']],
+            nref=[(info['rows'].index(s), rids.index(j), sg, sid) for s, j, sg, sid, _ in srefs
+                  if sid and s in info['rows']],
             tgt=np.array([st.kpos[k] for k in tgt], dtype=int), tgt_ids=tgt, model=_LazyModel(self),
-            hosu={s for s in sp if sp[s].getHasOnlySubstanceUnits()},
+            hosu=set(info['hosu']),
             # roadrunner bakes these into the model: changing them needs roadrunner
-            fixed=cids + [c for c in (doc.getConversionFactor(), *(sp[s].getConversionFactor() for s in sp)) if c],
+            fixed=cids + list(info['conversion_factors']),
             sel=['time'] + ['[%s]' % s for s in fids] + [v for v in rr if v not in fids], ssel=['[%s]' % s for s in fids])
 
     def _load_rr(self):
@@ -1698,7 +1695,7 @@ class _LazyModel(object):
 
     @_lzm
     def getNumEvents(self, lz):
-        return lz['info']['doc'].getModel().getNumEvents()
+        return lz['info']['n_events']
 
     @_lzm
     def getNumRateRules(self, lz):

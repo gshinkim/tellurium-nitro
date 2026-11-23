@@ -15,6 +15,8 @@ rayon = "1.12"
 # DAE models (algebraic states, singular mass matrix) only: BDF with consistent initial conditions
 diffsol = { version = "0.20", default-features = false, features = ["nalgebra"] }
 antimony = { package = "antimony-rs", path = "crates/antimony", features = ["sbml"] }
+# SBML reader (pure Rust): the SBML front end in src/sbml
+sbml-io = { path = "crates/sbml-io" }
 cranelift-codegen = "0.137"
 cranelift-frontend = "0.137"
 cranelift-jit = "0.137"

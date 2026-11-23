@@ -5,3 +5,4 @@ pub mod sens;
 #[cfg(feature = "python")]
 mod py;
 pub mod rand;
+pub mod sbml;
