@@ -183,7 +183,8 @@ impl M {
             comps: m.compartments.iter().map(|x| Comp { id: x.id.clone(), size: x.size, constant: x.constant.unwrap_or(true) }).collect(),
             species: m.species.iter().map(|x| Sp {
                 id: x.id.clone(), comp: x.compartment.clone(), amt: x.initial_amount, conc: x.initial_concentration,
-                hosu: x.has_only_substance_units.unwrap_or(false), boundary: x.boundary_condition.unwrap_or(false),
+                hosu: x.has_only_substance_units.unwrap_or(false), // a constant species never changes: roadrunner lists it with the boundary species
+                boundary: x.boundary_condition.unwrap_or(false) || x.constant.unwrap_or(false),
                 constant: x.constant.unwrap_or(false), cf: x.conversion_factor.clone().filter(|s| !s.is_empty()),
             }).collect(),
             params: m.parameters.iter().map(|x| Par { id: x.id.clone(), value: x.value, constant: x.constant.unwrap_or(true) }).collect(),
@@ -764,6 +765,20 @@ mod tests {
         let v = at(&m, 1.0, &["S", "J"]);
         assert!((v[0] - 5.0 * (-0.5f64).exp()).abs() < 1e-7, "{v:?}"); // concentration
         assert!((v[1] - 0.5 * 10.0 * (-0.5f64).exp()).abs() < 1e-6, "{v:?}"); // k * amount
+    }
+
+    #[test]
+    fn constant_species_is_boundary() {
+        // constant="true" without boundaryCondition (BioModels 33): roadrunner lists it as a boundary species
+        let s = doc(&format!(r#"<listOfCompartments><compartment id="c" size="1" constant="true"/></listOfCompartments>
+<listOfSpecies><species id="S" compartment="c" initialConcentration="1" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="false"/>
+<species id="E" compartment="c" initialConcentration="2" hasOnlySubstanceUnits="false" boundaryCondition="false" constant="true"/></listOfSpecies>
+<listOfReactions><reaction id="J" reversible="false"><listOfReactants><speciesReference species="S" stoichiometry="1" constant="true"/></listOfReactants>
+<listOfModifiers><modifierSpeciesReference species="E"/></listOfModifiers>
+<kineticLaw><math {MATH}><apply><times/><ci>E</ci><ci>S</ci></apply></math></kineticLaw></reaction></listOfReactions>"#));
+        let (_, info) = from_sbml(&s).unwrap();
+        assert_eq!(info.ids[0], vec!["S".to_string()]);
+        assert_eq!(info.ids[1], vec!["E".to_string()]);
     }
 
     #[test]

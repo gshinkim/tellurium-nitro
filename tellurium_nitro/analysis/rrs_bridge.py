@@ -4,6 +4,7 @@
     res = m.mca_batch(['k1'], np.array([[0.5], [1.0]]))
 """
 import math
+import os
 import re
 
 import libsbml
@@ -990,11 +991,8 @@ def from_sbml(sbml, info=None, base=None):
     Python one below (libsbml) for A/B comparison."""
     if os.environ.get('NITRO_PY_FRONTEND') == '1':
         return _from_sbml_py(sbml, info, base)
-    if '/comp/' in sbml:  # ponytail: libsbml flattens comp until the Rust front end does
-        doc = libsbml.readSBMLFromString(sbml)
-        if doc.getModel() is not None and doc.getPlugin('comp') is not None and doc.isPackageEnabled('comp'):
-            _flatten_comp(doc, base)
-            sbml = libsbml.writeSBMLToString(doc)
+    if '/comp/' in sbml:
+        sbml = _flatten_comp(sbml, base)
     m, out = roadrunner_nitro.from_sbml(sbml)
     if info is not None:
         # ia / fdefs as libsbml ASTs, as evaluate() and _names() take them
@@ -1100,7 +1098,7 @@ def _from_sbml_py(sbml, info=None, base=None):
             raise NotImplementedError("initial rateOf(%s) of an assignment rule" % x)
         return 0.0
 
-    rows = [s for s in sp if not sp[s].getBoundaryCondition()]
+    rows = [s for s in sp if not sp[s].getBoundaryCondition() and not sp[s].getConstant()]  # constant: boundary, as roadrunner
     reactions = [x.getId() for x in m.getListOfReactions()]
     N = np.zeros((len(rows), len(reactions)))
     ri = {s: i for i, s in enumerate(rows)}
