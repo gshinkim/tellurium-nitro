@@ -6,6 +6,7 @@
 //! species concentrations and parameters, as `Model::new` takes them.
 mod math;
 mod transform;
+pub mod edit;
 
 use crate::model::{EventDef, Model, Rules};
 use math::*;
