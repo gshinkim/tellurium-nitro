@@ -9,7 +9,8 @@ GPU-accelerated, parallel metabolic control analysis over many parameter sets.
 
 How the work is split:
   * steady states + unscaled elasticities: the Rust engine ``roadrunner_nitro`` (rrs/) on all
-    cores when it is built and supports the model, else roadrunner in parallel worker processes
+    cores when its batch model takes the model, else one RoadRunner steady state per sample
+    (in parallel worker processes)
   * C = -L (N_R E L)^-1 N_R,  F = I + E C,  and scaling: one batched solve on the GPU
 
 Scripts (not notebooks) that use more than one process need the usual
@@ -70,16 +71,15 @@ _rr = None
 
 def _init_worker(sbml):
     global _rr
-    from roadrunner.roadrunner import RoadRunner  # plain libroadrunner, not tellurium's Rust-backed subclass
-    _rr = RoadRunner(sbml)
-    # always on: with it off, every steadyState() rebuilds + re-JITs the model twice (2.4x slower)
+    from ..roadrunner.extended_roadrunner import ExtendedRoadRunner
+    _rr = ExtendedRoadRunner(sbml)
     _rr.conservedMoietyAnalysis = True
 
 
 def _sample(params):
     _rr.resetAll()
     for k, v in params.items():
-        _rr[k] = float(v)  # numpy ints are rejected by roadrunner
+        _rr[k] = float(v)  
     try:
         _rr.steadyState()
         return (np.array(_rr.getUnscaledElasticityMatrix()),
@@ -117,8 +117,8 @@ def controlCoefficients(r, samples=None, processes=None):
     :param samples: parameter sets to evaluate. Either a dict of equal-length
         sequences ``{'k1': [...], 'k2': [...]}`` (zipped, not a grid), a list of
         dicts, or a pandas DataFrame. None evaluates the model's current values once.
-    :param processes: CPU threads (Rust engine) or worker processes (roadrunner fallback)
-        for the steady states. Default: all cores (Rust); roadrunner: all cores at 64+ samples, else 1.
+    :param processes: CPU threads (batch engine) or worker processes (per-sample path)
+        for the steady states. Default: all cores (batch); per-sample: all cores at 64+ samples, else 1.
     :returns: dict of numpy arrays, first axis = sample:
         ``ccc``/``fcc``/``elasticities`` (scaled), ``uccc``/``ufcc`` (unscaled),
         plus ``species``, ``reactions`` id lists and ``ok`` (False where no
@@ -148,12 +148,12 @@ def controlCoefficients(r, samples=None, processes=None):
     # ponytail: GPU ignored here; the per-sample algebra is ~5 us on CPU, a GPU copy costs more
     try:
         res = m.mca_batch(keys, vals, threads=processes)
-    except ValueError:  # rate rules (or unknown key: roadrunner then raises its own error)
+    except ValueError:  # rate rules (or unknown key: the per-sample path raises its own error)
         return _cc_roadrunner(r, samples, processes)
     out = [res[k] for k in _KEYS]
     ok = res['ok']
     bad = np.flatnonzero(~ok)
-    if bad.size:  # retry Rust failures with roadrunner's solvers
+    if bad.size:  # retry batch failures with RoadRunner's steady-state solver (presimulation etc.)
         rr = _cc_roadrunner(r, [samples[i] for i in bad], processes)
         for dst, k in zip(out, _KEYS):
             dst[bad] = rr[k]
@@ -166,22 +166,12 @@ _KEYS = ('ccc', 'fcc', 'elasticities', 'uccc', 'ufcc')
 
 
 def _rust_model(r):
-    """The runner's own (cached) Rust model, or None when roadrunner has to do it."""
-    if hasattr(r, '_rs'):  # ExtendedRoadRunner: the model it already built (and its turbo switch)
-        from ..roadrunner.extended_roadrunner import _Fallback
-        try:
-            return r._rs().m
-        except _Fallback as e:
-            if 'installed' not in str(e) and 'turbo is off' not in str(e):
-                warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
-            return None
-    try:  # a plain roadrunner.RoadRunner
-        from .rrs_bridge import from_roadrunner
+    """The Rust batch model of the runner at its current values, or None when it can't take the model."""
+    from .rrs_bridge import from_roadrunner
+    try:
         return from_roadrunner(r)
-    except ImportError:
-        return None  # roadrunner_nitro not built: roadrunner path
     except NotImplementedError as e:
-        warnings.warn("te.controlCoefficients: Rust engine can't run this model (%s); using roadrunner." % e)
+        warnings.warn("te.controlCoefficients: the batch engine can't run this model (%s); one steady state at a time." % e)
         return None
 
 

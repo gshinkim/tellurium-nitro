@@ -3,13 +3,9 @@ This module creates an SBMLDiagram for the given SBML model using graphviz.
 """
 
 from __future__ import print_function, division, absolute_import
-import roadrunner
 import warnings
+from ..roadrunner.extended_roadrunner import Logger
 import tempfile
-try:
-    import libsbml
-except ImportError:
-    import tesbml as libsbml
 
 try:
     from IPython.display import Image, display
@@ -40,6 +36,7 @@ class SBMLDiagram(object):
         :param modifiers:
         :type modifiers:
         """
+        import libsbml  # optional (python-libsbml): network diagrams only
         # load model
         if isinstance(sbml, str):
             self.doc = libsbml.readSBMLFromString(sbml)
@@ -84,7 +81,7 @@ class SBMLDiagram(object):
             import pygraphviz as pgv
         except ImportError as e:
             pgv = None
-            roadrunner.Logger.log(roadrunner.Logger.LOG_WARNING, str(e))
+            Logger.log(Logger.LOG_WARNING, str(e))
             warnings.warn("'pygraphviz' could not be imported, cannot draw network diagrams", ImportWarning, stacklevel=2)
 
         g = pgv.AGraph(strict=False, directed=True)

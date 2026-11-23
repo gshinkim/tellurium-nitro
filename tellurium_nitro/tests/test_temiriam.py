@@ -4,7 +4,7 @@ Testing temiriam module
 from __future__ import absolute_import, print_function
 import pytest
 import requests
-import roadrunner
+import tellurium_nitro as te
 from tellurium_nitro import temiriam
 
 
@@ -41,5 +41,5 @@ def test_getSBMLFromBiomodelsURN2():
     print(sbml)
     print("*" * 80)
 
-    r = roadrunner.RoadRunner(sbml)
+    r = te.loadSBMLModel(sbml)
     assert r is not None

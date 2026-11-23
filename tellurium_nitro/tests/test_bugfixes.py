@@ -73,9 +73,12 @@ def test_execute_omex_removes_working_dir(monkeypatch):
     assert created and not any(os.path.exists(d) for d in created)
 
 
-def test_does_not_patch_libroadrunner():
-    """Importing tellurium_nitro leaves libroadrunner's RoadRunner alone, so regular tellurium in the same process is unaffected."""
-    import roadrunner
-    import tellurium_nitro as te
-    assert roadrunner.RoadRunner is not te.roadrunner.ExtendedRoadRunner
-    assert te.roadrunner.ExtendedRoadRunner.__bases__ == (roadrunner.roadrunner.RoadRunner,)
+def test_no_libroadrunner():
+    """tellurium_nitro runs without libroadrunner: importing it and simulating loads no `roadrunner` module
+    (in a fresh process: other tests in this session may import libroadrunner for their references)."""
+    import subprocess
+    import sys
+    code = ("import sys, tellurium_nitro as te; te.loada('S1 -> S2; k1*S1; k1 = 0.5; S1 = 10').simulate(0, 1, 3); "
+            "print([m for m in sys.modules if m.split('.')[0] in ('roadrunner', 'libsbml')])")
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, check=True).stdout
+    assert out.strip().endswith('[]'), out

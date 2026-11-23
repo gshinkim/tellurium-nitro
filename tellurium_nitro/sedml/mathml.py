@@ -16,10 +16,6 @@ except ImportError:
     pass  # not available in py2.7
 
 from math import *
-try:
-    import libsbml
-except:
-    import tesbml as libsbml
 import operator
 
 def product(*args):
@@ -196,6 +192,7 @@ if __name__ == "__main__":
     """
 
     # evaluate the function with the values
+    import libsbml  # optional (python-libsbml): SED-ML math
     astnode = libsbml.readMathMLFromString(mathmlStr)
 
     y = 5

@@ -119,8 +119,8 @@ def getODEsFromModel (roadrunnerModel):
     >>> r = te.loada ('S1 -> S2; k1*S1; k1=1')
     >>> te.getODEsFromModel (r)
     """       
-    from roadrunner import RoadRunner
-    if type (roadrunnerModel) == RoadRunner:
+    from ..roadrunner.extended_roadrunner import ExtendedRoadRunner
+    if isinstance(roadrunnerModel, ExtendedRoadRunner):
        extractor = ODEExtractor (roadrunnerModel.getSBML())
     else:
        raise RuntimeError('The argument to getODEsFromModel should be a roadrunner variable')
