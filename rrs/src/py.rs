@@ -658,8 +658,14 @@ impl PyRR {
     fn load(&mut self, sbml: &str, base: Option<String>) -> PyResult<()> { self.r.load_sbml(sbml, base.as_deref().map(std::path::Path::new)).map_err(verr) }
     fn isModelLoaded(&self) -> bool { self.r.is_model_loaded() }
     fn clearModel(&mut self) { self.r.clear_model() }
-    fn getSBML(&self) -> PyResult<String> { self.r.get_sbml().map_err(verr) }
-    fn getCurrentSBML(&mut self) -> PyResult<String> { self.r.get_current_sbml().map_err(verr) }
+    #[pyo3(signature = (level=0, version=0))]
+    fn getSBML(&self, level: u32, version: u32) -> PyResult<String> {
+        self.r.sbml_converted(level, version).map_err(verr)
+    }
+    #[pyo3(signature = (level=0, version=0))]
+    fn getCurrentSBML(&mut self, level: u32, version: u32) -> PyResult<String> {
+        self.r.current_sbml_converted(level, version).map_err(verr)
+    }
     fn regenerate(&mut self) -> PyResult<()> { self.r.regenerate().map_err(verr) }
     fn saveState(&self, path: &str) -> PyResult<()> { self.r.save_state(std::path::Path::new(path)).map_err(verr) }
     fn loadState(&mut self, path: &str) -> PyResult<()> { self.r.load_state(std::path::Path::new(path)).map_err(verr) }
@@ -800,4 +806,85 @@ impl PyRR {
         let (a, b) = self.r.gillespie_mean_sd(n, start, end, points).map_err(verr)?;
         Ok((arr(py, a.data, &[a.nr, a.nc])?, arr(py, b.data, &[b.nr, b.nc])?))
     }
+
+    fn getKMatrix<'py>(&self, py: Python<'py>) -> PyResult<Mat<'py>> {
+        m3(py, self.r.k_matrix())
+    }
+    fn getExtendedStoichiometryMatrix<'py>(&mut self, py: Python<'py>) -> PyResult<Mat<'py>> {
+        m3(py, self.r.extended_stoichiometry_matrix())
+    }
+    #[pyo3(signature = (boundary=false))]
+    fn getReactantsStoichiometryMatrix<'py>(&mut self, py: Python<'py>, boundary: bool) -> PyResult<Mat<'py>> {
+        m3(py, self.r.reactants_products_matrix(true, boundary))
+    }
+    #[pyo3(signature = (boundary=false))]
+    fn getProductsStoichiometryMatrix<'py>(&mut self, py: Python<'py>, boundary: bool) -> PyResult<Mat<'py>> {
+        m3(py, self.r.reactants_products_matrix(false, boundary))
+    }
+    fn getStoichiometryIds(&self) -> PyResult<Vec<String>> { self.r.stoichiometry_ids().map_err(verr) }
+    fn getStoichiometryId(&self, index: usize) -> PyResult<String> { self.r.stoichiometry_id(index).map_err(verr) }
+    #[pyo3(signature = (id, reaction=None))]
+    fn getStoichiometryIndex(&self, id: &str, reaction: Option<&str>) -> PyResult<isize> {
+        self.r.stoichiometry_index(id, reaction).map_err(verr)
+    }
+    #[pyo3(signature = (index, reaction=None))]
+    fn getStoichiometry(&mut self, index: usize, reaction: Option<usize>) -> PyResult<f64> {
+        match reaction {
+            Some(ri) => self.r.stoichiometry_cell(index, ri, false),
+            None => self.r.stoichiometry(index),
+        }.map_err(verr)
+    }
+    #[pyo3(signature = (index, reaction=None))]
+    fn getInitStoichiometry(&mut self, index: isize, reaction: Option<isize>) -> PyResult<f64> {
+        if index < 0 || reaction.is_some_and(|r| r < 0) { return Ok(f64::NAN); }
+        match reaction {
+            Some(ri) => self.r.stoichiometry_cell(index as usize, ri as usize, true),
+            None => self.r.init_stoichiometry(index as usize),
+        }.map_err(verr)
+    }
+    #[pyo3(signature = (index, value_or_reaction, value=None))]
+    fn setStoichiometry(&mut self, index: usize, value_or_reaction: &Bound<'_, PyAny>, value: Option<f64>) -> PyResult<i32> {
+        match value {
+            Some(v) => self.r.set_stoichiometry_cell(index, value_or_reaction.extract()?, v),
+            None => self.r.set_stoichiometry(index, value_or_reaction.extract()?),
+        }.map_err(verr)
+    }
+    fn getSteadyStateThreshold(&self) -> f64 { self.r.steady_state_threshold() }
+    fn setSteadyStateThreshold(&mut self, value: f64) { self.r.set_steady_state_threshold(value); }
+    #[getter(steadyStateThresh)]
+    fn steady_state_thresh(&self) -> f64 { self.r.steady_state_threshold() }
+    #[setter(steadyStateThresh)]
+    fn set_steady_state_thresh(&mut self, value: f64) { self.r.set_steady_state_threshold(value); }
+    fn resetSeed(&mut self) -> PyResult<()> { self.r.reset_seed().map_err(verr) }
+
+    #[allow(clippy::too_many_arguments)]
+    fn getFrequencyResponse<'py>(&mut self, py: Python<'py>, startFrequency: f64, numberOfDecades: f64,
+                                  numberOfPoints: usize, parameterName: &str, variableName: &str,
+                                  useDB: bool, useHz: bool) -> PyResult<Bound<'py, PyAny>> {
+        let data = self.r.frequency_response(startFrequency, numberOfDecades, numberOfPoints,
+                                             parameterName, variableName, useDB, useHz).map_err(verr)?;
+        arr(py, data, &[numberOfPoints, 3])
+    }
+    #[pyo3(signature = (currentTime, stepSize, reset=true))]
+    fn internalOneStep(&mut self, currentTime: f64, stepSize: f64, reset: bool) -> PyResult<f64> {
+        self.r.internal_one_step(currentTime, stepSize, reset).map_err(verr)
+    }
+    #[pyo3(signature = (types=-1, eigen=true))]
+    fn getIds(&self, types: i64, eigen: bool) -> Vec<String> { self.r.ids_of_type(types, eigen) }
+    #[pyo3(signature = (road_runner=true))]
+    fn getSupportedIdTypes(&self, road_runner: bool) -> i64 { self.r.supported_id_types(road_runner) }
+
+    fn getEventIds(&self) -> Vec<String> { self.r.event_ids() }
+    fn getNumEvents(&self) -> usize { self.r.num_events() }
+    fn getStateVectorIds(&self) -> Vec<String> { self.r.state_vector_ids() }
+    #[pyo3(signature = (time=None, y=None))]
+    fn getEventRoots(&mut self, time: Option<f64>, y: Option<Vec<f64>>) -> PyResult<Vec<f64>> {
+        self.r.event_roots(time, y.as_deref()).map_err(verr)
+    }
+    #[pyo3(signature = (time=None, y=None))]
+    fn getPiecewiseTriggerRoots(&mut self, time: Option<f64>, y: Option<Vec<f64>>) -> PyResult<Vec<f64>> {
+        self.r.piecewise_trigger_roots(time, y.as_deref()).map_err(verr)
+    }
+    fn getNumPiecewiseTriggers(&self) -> PyResult<usize> { self.r.num_piecewise_triggers().map_err(verr) }
+    fn getRandom(&mut self) -> f64 { self.r.random() }
 }

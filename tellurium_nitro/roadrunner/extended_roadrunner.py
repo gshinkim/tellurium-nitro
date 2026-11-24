@@ -120,10 +120,40 @@ class Config(object):
 
 
 class SelectionRecord(object):
-    """libroadrunner's selection type flags (the ones reset(options) takes)."""
+    """libroadrunner's selection bit flags for getIds and reset."""
     TIME, CONCENTRATION, AMOUNT, RATE, BOUNDARY, FLOATING, _COMPARTMENT, _GLOBAL_PARAMETER = 1, 2, 4, 8, 16, 32, 64, 128
     REACTION, INITIAL, CURRENT, UNSCALED, ELASTICITY, CONTROL = 256, 512, 1024, 2048, 4096, 8192
+    EIGENVALUE_REAL, ELEMENT, STOICHIOMETRY, UNKNOWN = 0x4000, 0x8000, 0x10000, 0x20000
+    DEPENDENT, INDEPENDENT, CONSERVED_MOIETY = 0x40000, 0x80000, 0x100000
+    STATE_VECTOR = SBML_INITIALIZE = 0x200000
+    EVENT, EIGENVALUE_IMAG, MULTI_SPECIES_REFERENCE = 0x400000, 0x800000, 0x1000000
+    EIGENVALUE_COMPLEX = EIGENVALUE_REAL | EIGENVALUE_IMAG
+    UNKNOWN_CONCENTRATION, UNKNOWN_ELEMENT = UNKNOWN | CONCENTRATION, UNKNOWN | ELEMENT
+
+    COMPARTMENT = 0xc0440
+    GLOBAL_PARAMETER = 0xc0480
+    FLOATING_AMOUNT, FLOATING_CONCENTRATION = 0xc0424, 0xc0422
+    INDEPENDENT_FLOATING_AMOUNT, DEPENDENT_FLOATING_AMOUNT = 0x80424, 0x40424
+    FLOATING_AMOUNT_RATE, FLOATING_CONCENTRATION_RATE = 0x40028, 0x4002a
+    BOUNDARY_AMOUNT, BOUNDARY_CONCENTRATION = 0xc0414, 0xc0412
+    INDEPENDENT_BOUNDARY_AMOUNT, DEPENDENT_BOUNDARY_AMOUNT = 0x80414, 0x40414
+    BOUNDARY_AMOUNT_RATE, BOUNDARY_CONCENTRATION_RATE = 0x40018, 0x4001a
+    GLOBAL_PARAMETER_RATE, REACTION_RATE, COMPARTMENT_RATE = 0x88, 0x40108, 0xc0448
+
+    INITIAL_AMOUNT, INITIAL_CONCENTRATION = 0xc0204, 0xc0202
+    INITIAL_FLOATING_AMOUNT, INITIAL_FLOATING_CONCENTRATION = 0xc0224, 0xc0222
+    INITIAL_BOUNDARY_AMOUNT, INITIAL_BOUNDARY_CONCENTRATION = 0xc0214, 0xc0212
+    INITIAL_COMPARTMENT, INITIAL_GLOBAL_PARAMETER = 0xc0240, 0xc0280
+    DEPENDENT_INITIAL_GLOBAL_PARAMETER = 0x40280
+    INITIAL_STOICHIOMETRY = INITIAL | STOICHIOMETRY | DEPENDENT | INDEPENDENT
+    INITIAL_MULTI_SPECIES_REFERENCE = INITIAL | MULTI_SPECIES_REFERENCE | DEPENDENT | INDEPENDENT
+    UNSCALED_ELASTICITY, UNSCALED_CONTROL = UNSCALED | ELASTICITY, UNSCALED | CONTROL
+
     ALL = -1
+    ALL_INDEPENDENT, ALL_DEPENDENT = ~DEPENDENT, ~INDEPENDENT
+    ALL_INDEPENDENT_AMOUNT, ALL_DEPENDENT_AMOUNT = ALL_INDEPENDENT & ~CONCENTRATION, ALL_DEPENDENT & ~CONCENTRATION
+    ALL_INDEPENDENT_CONCENTRATION, ALL_DEPENDENT_CONCENTRATION = ALL_INDEPENDENT & ~AMOUNT, ALL_DEPENDENT & ~AMOUNT
+    MODEL_STATE = ALL_INDEPENDENT_AMOUNT & ~INITIAL
 
 
 # ---------------------------------------------------------------------
@@ -276,10 +306,40 @@ class ExecutableModel(object):
         return self._r.getInfo()
 
     def getNumEvents(self):
-        return len(self.getEventIds())
+        return self._r._rr.getNumEvents()
 
     def getEventIds(self):
-        return _sbml_ids(self._r._rr.getSBML(), 'event', 'id')
+        return self._r._rr.getEventIds()
+
+    def getIds(self, types=SelectionRecord.ALL):
+        return self._r._rr.getIds(types, False)
+
+    def getSupportedIdTypes(self):
+        return self._r._rr.getSupportedIdTypes(False)
+
+    def getNumPiecewiseTriggers(self):
+        return self._r._rr.getNumPiecewiseTriggers()
+
+    def getEventRoots(self, time=None, y=None, gdot=None):
+        return self._roots(self._r._rr.getEventRoots, time, y, gdot)
+
+    def getPiecewiseTriggerRoots(self, time=None, y=None, gdot=None):
+        return self._roots(self._r._rr.getPiecewiseTriggerRoots, time, y, gdot)
+
+    @staticmethod
+    def _roots(get, time, y, gdot):
+        roots = get(time, y)
+        if gdot is None:
+            return np.asarray(roots, dtype=float)
+        if len(gdot) != len(roots):
+            raise ValueError("expected %d root outputs" % len(roots))
+        gdot[:] = roots
+
+    def getEventIndex(self, eid):
+        return next((i for i, name in enumerate(self.getEventIds()) if name == eid), -1)
+
+    def getRandom(self):
+        return self._r._rr.getRandom()
 
     def getAssignmentRuleIds(self):
         return _sbml_ids(self._r._rr.getSBML(), 'assignmentRule', 'variable')
@@ -344,13 +404,26 @@ class ExecutableModel(object):
     def getCompartmentIndexForBoundarySpecies(self, i):
         return self._compartment_index(self._r._rr.getBoundarySpeciesIds()[i])
 
-    def getStoichiometry(self, speciesIndex, reactionIndex):
-        n, rows, cols = self._r._rr.getFullStoichiometryMatrix()
-        rr = self._r._rr
-        return float(np.asarray(n)[rows.index(rr.getFloatingSpeciesIds()[speciesIndex]), cols.index(rr.getReactionIds()[reactionIndex])])
+    def getStoichiometry(self, *args):
+        return self._r._rr.getStoichiometry(*args)
+
+    def getInitStoichiometry(self, *args):
+        return self._r._rr.getInitStoichiometry(*args)
+
+    def getStoichiometryIds(self):
+        return self._r._rr.getStoichiometryIds()
+
+    def getStoichiometryId(self, index):
+        return self._r._rr.getStoichiometryId(index)
+
+    def getStoichiometryIndex(self, *args):
+        return self._r._rr.getStoichiometryIndex(*args)
+
+    def setStoichiometry(self, *args):
+        return self._r._rr.setStoichiometry(*args)
 
     def getStateVectorId(self, i):
-        return list(self._r._rr.getRateRuleIds() + self._r._rr.getFloatingSpeciesIds())[i]
+        return self._r._rr.getStateVectorIds()[i]
 
 
 def _model_group(ids, getters, setters):
@@ -512,16 +585,12 @@ class ExtendedRoadRunner(object):
         return self.model
 
     def getSBML(self, level=0, version=0):
-        """The SBML as loaded (with model edits)."""
-        if level or version:
-            raise ValueError("getSBML: converting to another SBML level/version is not supported")
-        return self._rr.getSBML()
+        """The loaded SBML, optionally converted to another level and version."""
+        return self._rr.getSBML(level, version)
 
     def getCurrentSBML(self, level=0, version=0):
-        """The SBML with the current values as initial values."""
-        if level or version:
-            raise ValueError("getCurrentSBML: converting to another SBML level/version is not supported")
-        return self._rr.getCurrentSBML()
+        """SBML with current values as initial values, optionally converted."""
+        return self._rr.getCurrentSBML(level, version)
 
     def getParamPromotedSBML(self, sbml=None):
         """SBML with local parameters promoted to global ones (of ``sbml``, default the current model)."""
@@ -742,6 +811,17 @@ class ExtendedRoadRunner(object):
     def setFluxThreshold(self, value):
         self._rr.setFluxThreshold(float(value))
 
+    def getSteadyStateThreshold(self):
+        return self._rr.getSteadyStateThreshold()
+
+    def setSteadyStateThreshold(self, value):
+        self._rr.setSteadyStateThreshold(float(value))
+
+    steadyStateThresh = property(getSteadyStateThreshold, setSteadyStateThreshold)
+
+    def resetSeed(self):
+        self._rr.resetSeed()
+
     def getSeed(self):
         return self._rr.getSeed()
 
@@ -785,6 +865,10 @@ class ExtendedRoadRunner(object):
 
     def getSimulationData(self):
         return self._data
+
+    def internalOneStep(self, currentTime, stepSize, reset=True):
+        self._ran('internalOneStep')
+        return self._rr.internalOneStep(currentTime, stepSize, reset)
 
     def oneStep(self, currentTime, stepSize, reset=True):
         self._ran('oneStep')
@@ -1020,6 +1104,24 @@ class ExtendedRoadRunner(object):
     def getFullStoichiometryMatrix(self):
         return self._mat('getFullStoichiometryMatrix')
 
+    def getKMatrix(self):
+        return self._mat('getKMatrix')
+
+    def getExtendedStoichiometryMatrix(self):
+        return self._mat('getExtendedStoichiometryMatrix')
+
+    def getReactantsStoichiometryMatrix(self, boundary=False):
+        return self._mat('getReactantsStoichiometryMatrix', boundary)
+
+    def getProductsStoichiometryMatrix(self, boundary=False):
+        return self._mat('getProductsStoichiometryMatrix', boundary)
+
+    def getFrequencyResponse(self, startFrequency, numberOfDecades, numberOfPoints,
+                             parameterName, variableName, useDB, useHz):
+        self._ran('getFrequencyResponse')
+        return self._rr.getFrequencyResponse(startFrequency, numberOfDecades, numberOfPoints,
+                                             parameterName, variableName, useDB, useHz)
+
     def getReducedStoichiometryMatrix(self):
         return self._mat('getNrMatrix')
 
@@ -1098,6 +1200,35 @@ class ExtendedRoadRunner(object):
         return self._rr.getuEE(reactionName, parameterName, False)
 
     # ------------------------------------------------------------ ids and value vectors
+    def getIds(self, types=SelectionRecord.ALL):
+        return self._rr.getIds(types)
+
+    def getSupportedIdTypes(self):
+        return self._rr.getSupportedIdTypes()
+
+    def getEventRoots(self, time=None, y=None, gdot=None):
+        return self.model.getEventRoots(time, y, gdot)
+
+    def getPiecewiseTriggerRoots(self, time=None, y=None, gdot=None):
+        return self.model.getPiecewiseTriggerRoots(time, y, gdot)
+
+    def getStoichiometry(self, *args):
+        return self.model.getStoichiometry(*args)
+
+    def getInitStoichiometry(self, *args):
+        return self.model.getInitStoichiometry(*args)
+
+    def getStoichiometryId(self, index):
+        return self.model.getStoichiometryId(index)
+
+    def getStoichiometryIndex(self, *args):
+        return self.model.getStoichiometryIndex(*args)
+
+    def setStoichiometry(self, *args):
+        result = self.model.setStoichiometry(*args)
+        self._changed()
+        return result
+
     def getIndependentFloatingSpeciesIds(self):
         return list(self._rr.getIndependentFloatingSpeciesIds())
 
@@ -1251,7 +1382,7 @@ class ExtendedRoadRunner(object):
         'getGlobalParameterIds', 'getGlobalParameterValues', 'getNumGlobalParameters',
         'getCompartmentIds', 'getCompartmentVolumes', 'getNumCompartments',
         'getNumConservedMoieties', 'getReactionIds', 'getReactionRates', 'getNumReactions', 'getNumEvents',
-        'getNumRateRules']
+        'getNumRateRules', 'getEventIds', 'getNumPiecewiseTriggers', 'getStoichiometryIds']
 
     # ---------------------------------------------------------------------
     # Jarnac compatibility layer
