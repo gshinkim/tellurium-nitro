@@ -41,11 +41,16 @@ impl Matrix {
 #[derive(Debug, Clone)]
 enum Col { Out(usize), Mul(usize, usize), Div(usize, usize), Lin(Vec<(usize, f64)>), Pre(String) }
 
+#[derive(Clone)]
 struct Plan { outs: Vec<u32>, cols: Vec<Col> }
 
 impl Plan {
     /// Engine rows y (len(outs) each) -> selection rows; Pre columns take `pre` (value before the run).
-    fn apply(&self, y: &[f64], pre: &[f64]) -> Vec<f64> {
+    fn apply(&self, y: Vec<f64>, pre: &[f64]) -> Vec<f64> {
+        // every column is the engine output of the same index: the rows are already the result
+        if self.cols.len() == self.outs.len() && self.cols.iter().enumerate().all(|(k, c)| matches!(c, Col::Out(i) if *i == k)) {
+            return y;
+        }
         let no = self.outs.len().max(1);
         let nt = if self.outs.is_empty() { 0 } else { y.len() / no };
         let mut out = Vec::with_capacity(nt * self.cols.len());
@@ -68,6 +73,8 @@ impl Plan {
 
 /// The compiled model and its state.
 struct Core {
+    /// the last time-course plan: (selections, conserved moiety analysis, plan); dies with the model
+    plan_cache: Option<(Vec<String>, bool, Plan)>,
     m: Model,
     info: Info,
     keys: Vec<String>,
@@ -179,7 +186,7 @@ impl Core {
             (s.id.clone(), s.initial_concentration.or(s.initial_amount.map(|a| a / v)).unwrap_or(0.0))
         })).collect();
         let w = m.work();
-        Ok(Core { xi: x0.clone(), x: x0.clone(), x0, t: 0.0, tgt, ia: ok.then_some(ia), cconst, sp, rx, plain, nss, ls_nr, ls_cell: Default::default(), w, fresh: true,
+        Ok(Core { plan_cache: None, xi: x0.clone(), x: x0.clone(), x0, t: 0.0, tgt, ia: ok.then_some(ia), cconst, sp, rx, plain, nss, ls_nr, ls_cell: Default::default(), w, fresh: true,
                   live: false, q, qok: false, rd: None, csum: vec![], stoich_edit: None, internal_step: None, ls_rows, ls_n, rule_init, keys, kres, kpos, xo, m, info })
     }
 
@@ -1040,8 +1047,12 @@ impl RoadRunner {
             cols.push(match sel::parse(s)? {
                 Sel::Id(k) | Sel::Conc(k) if c.is_species(&k) => {
                     let br = s.trim().starts_with('[');
-                    let (i, v) = (o(c.reg(&k)?), o(c.reg(c.comp_of(&k))?));
-                    match (br, c.info.amount_params.contains(&k)) { (true, true) => Col::Div(i, v), (false, false) => Col::Mul(i, v), _ => Col::Out(i) }
+                    let i = o(c.reg(&k)?);
+                    match (br, c.info.amount_params.contains(&k)) {
+                        (true, true) => Col::Div(i, o(c.reg(c.comp_of(&k))?)),
+                        (false, false) => Col::Mul(i, o(c.reg(c.comp_of(&k))?)),
+                        _ => Col::Out(i),  // already in the selected units: no volume needed
+                    }
                 }
                 Sel::Id(k) if self.csum_index(&k).is_some() => Col::Pre(s.clone()),
                 Sel::Id(k) => Col::Out(o(c.reg(&k)?)),
@@ -1174,7 +1185,11 @@ impl RoadRunner {
     pub fn simulate(&mut self) -> Result<&Matrix, String> {
         let times = self.grid()?;
         let sel = self.sel.clone();
-        let plan = self.plan(&sel)?;
+        let cached = self.c.as_ref().and_then(|c| c.plan_cache.as_ref()).filter(|(s, m, _)| *s == sel && *m == self.cma).map(|p| p.2.clone());
+        let plan = match cached {
+            Some(p) => p,
+            None => { let p = self.plan(&sel)?; self.core_mut()?.plan_cache = Some((sel.clone(), self.cma, p.clone())); p }
+        };
         let pre: Vec<f64> = plan.cols.iter().filter_map(|c| if let Col::Pre(s) = c { Some(s.clone()) } else { None })
             .collect::<Vec<_>>().iter().map(|s| self.get_value(s)).collect::<Result<_, _>>()?;
         let y = match self.integ.name {
@@ -1208,7 +1223,7 @@ impl RoadRunner {
                 self.core_mut()?.advance_fixed(&times, &plan.outs, method, step, atol)?
             }
         };
-        self.result = Some(Matrix { nr: 0, nc: sel.len(), data: plan.apply(&y, &pre), rows: vec![], cols: sel });
+        self.result = Some(Matrix { nr: 0, nc: sel.len(), data: plan.apply(y, &pre), rows: vec![], cols: sel });
         let r = self.result.as_mut().unwrap();
         r.nr = r.data.len() / r.nc.max(1);
         Ok(r)
@@ -1326,7 +1341,7 @@ impl RoadRunner {
                 None => None,
             };
             let (y, _) = self.ssa(&plan.outs, grid.as_deref())?;
-            let data = plan.apply(&y, &pre);
+            let data = plan.apply(y, &pre);
             Ok(Matrix { nr: data.len() / sel.len().max(1), nc: sel.len(), data, rows: vec![], cols: sel })
         })();
         (self.start, self.end) = (s0, e0);
@@ -1365,7 +1380,7 @@ impl RoadRunner {
             if !ok { r.fill(f64::NAN); }
         });
         let per = points * no;
-        Ok((0..n).flat_map(|i| plan.apply(&y[i * per..(i + 1) * per], &pre)).collect())
+        Ok((0..n).flat_map(|i| plan.apply(y[i * per..(i + 1) * per].to_vec(), &pre)).collect())
     }
 
     /// Mean and standard deviation (n - 1) over n Gillespie runs on the grid.
