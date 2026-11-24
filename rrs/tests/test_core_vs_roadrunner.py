@@ -528,7 +528,8 @@ def test_steady_state_settings():
         seen[key] = out
     # the behaviour the settings must produce (as libroadrunner)
     # settings index: 0 neither, 1 approx only, 2 presimulation only, 3 both (SS_SETTINGS)
-    assert seen['slow/nleq1/0'] == 'both fail'  # no presimulation: Newton meets a singular Jacobian
+    # no presimulation: libroadrunner's Newton meets a singular Jacobian; Nitro's engine solver finds it (verified in ss_check)
+    assert seen['slow/nleq1/0'].startswith('core finds')
     assert seen['slow/nleq1/2'] == 'match' and seen['slow/newton/2'] == 'match'  # presimulation rescues
     assert seen['slow/nleq2/0'] == 'match'  # nleq2's rank-deficient steps need none
     assert seen['const/nleq2/3'] == 'match (approximation)'  # approximation rescues a model with no steady state
@@ -719,6 +720,17 @@ def test_amount_rate_rule_in_assignment_compartment():
     r.simulate(0, 2, 3)
     assert r.getValue("S1'") == pytest.approx(2.0, abs=1e-12)
     assert r.getValue('S1') == pytest.approx(5.0, abs=1e-8)
+
+
+def test_steady_state_found_where_newton_alone_fails():
+    # sosbench 00009 (MAPK cascade) after simulate(0, 10): Newton fails from there with default settings
+    # (libroadrunner: "Maximum iterations exceeded"), but the model has a steady state. Nitro finds it.
+    f = next(p for p in SOS if os.sep + '00009' + os.sep in p)
+    r = rn.RoadRunner(open(f).read())
+    r.simulate(0, 10, 6)
+    r.steadyState()
+    x = np.array([r.getValue(i.rstrip("'")) for i in r.getRatesOfChangeIds()])
+    assert np.max(np.abs(r.getRatesOfChange())) <= 1e-9 * np.max(np.abs(x))  # as ss_check: a true steady state
 
 
 def test_reset_reevaluates_initial_assignment_with_function():

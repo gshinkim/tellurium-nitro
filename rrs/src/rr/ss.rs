@@ -107,6 +107,27 @@ impl Core {
     /// solution (states, rates).
     pub(super) fn solve_with(&mut self, cfg: &SsCfg) -> Result<Option<f64>, String> {
         if self.nss { return Err("steady state: the model has events or time-dependent rates".into()); }
+        let start = (self.x.clone(), self.t);
+        match self.solve_settings(cfg) {
+            Err(e) if self.robust_from(start) => { let _ = e; Ok(None) }
+            r => r,
+        }
+    }
+
+    /// Where libroadrunner's settings give up but a steady state exists (e.g. Newton diverges from a
+    /// transient state), the engine's own solver finds it: damped Newton, then integration toward it
+    /// with Newton after each horizon (model::steady_state). A model with no steady state still fails.
+    fn robust_from(&mut self, (x, t): (Vec<f64>, f64)) -> bool {
+        (self.x, self.t) = (x, t);
+        self.touch();
+        self.m.load(&mut self.q, &self.kres, &self.x);
+        let ok = self.m.steady_state(&mut self.q);
+        self.qok = false;
+        if ok { let s = self.q.s.clone(); self.take_states(&s); }
+        ok
+    }
+
+    fn solve_settings(&mut self, cfg: &SsCfg) -> Result<Option<f64>, String> {
         if self.newton_here(&cfg.newton, cfg.time0) { return Ok(None); }
         let mut err = "steady state not found (Newton failed from the current state)".to_string();
         if let Some(times) = &cfg.presim {
