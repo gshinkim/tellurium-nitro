@@ -83,6 +83,8 @@ class inlineOmex(object):
                 if os.path.sep == '\\':
                     path = path.replace(os.path.sep, '/')
                 phrasedml.setReferencedSBML(path, sbml_asset.getContent())
+                if path.endswith('.xml'):  # phraSED-ML may name the model without its extension
+                    phrasedml.setReferencedSBML(path[:-4], sbml_asset.getContent())
             phrasedml.convertString(t)
             phrasedml.addDotXMLToModelSources(False)
             sedml = phrasedml.getLastSEDML()
@@ -119,7 +121,12 @@ class inlineOmex(object):
                     args = parseMagicArgs(line.split()[1:])
                     return S_PML(True, args=args), self.pml if self.force else None, None, self.args if self.force else None
                 if not self.force and self.sb_start.match(line) != None:
+                    models.update(re.findall(r'\b(?:model|module)\s+\*?\s*([A-Za-z_]\w*)', line))
                     return S_SB(self.force, line+'\n'), self.pml, None, self.args
+                name = re.match(r'^\s*([A-Za-z_]\w*)\s+is\s+"', line)
+                if not self.force and name and name.group(1) in models:
+                    # Antimony's display name of a model, written after its 'end' (sbmlToAntimony does)
+                    return self, None, line + '\n', self.args
                 else:
                     self.pml += line + '\n'
                     return self, None, None, None
@@ -152,6 +159,7 @@ class inlineOmex(object):
 
             def dump(self): return None, self.sb, self.args
 
+        models = set()  # Antimony models seen so far
         s = S_PML()
 
         sources = []

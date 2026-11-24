@@ -450,11 +450,23 @@ class inlineOmexImporter:
         for entry in self.sedml_entries:
             sedml_str = self.omex.extractEntryToString(entry.getLocation()).replace('BIOMD0000000012,xml',
                                                                                     'BIOMD0000000012.xml')
+            resources = self.makeSBMLResourceMap(self.fixSep(os.path.dirname(entry.getLocation())))
+            # models the SED-ML references by URN are not in the archive: fetch them and inline them
+            # as Antimony, so the inline OMEX is self-contained (phraSED-ML can't resolve URNs)
+            for urn in sorted(set(re.findall(r'source="(urn:miriam:[^"]+)"', sedml_str))):
+                from tellurium_nitro import temiriam
+                local = urn.split(':')[-1].split('.')[0] + '.xml'
+                sbml = temiriam.getSBMLFromBiomodelsURN(urn)
+                sedml_str = sedml_str.replace('source="%s"' % urn, 'source="%s"' % local)
+                resources[self.formatPhrasedmlResource(local)] = sbml
+                output += (('' if self.headerless else '%model {}\n'.format(local)) +
+                           antimonyConverter().sbmlToAntimony(sbml)[1].rstrip() + '\n' +
+                           ('// -- End Antimony block\n\n' if self.write_block_delimiter_comments else ''))
             phrasedml_output = ""
             try:
                 phrasedml_output = phrasedmlImporter.fromContent(
                     sedml_str,
-                    self.makeSBMLResourceMap(self.fixSep(os.path.dirname(entry.getLocation())))
+                    resources
                 ).toPhrasedml().rstrip().replace('compartment', 'compartment_')
             except Exception as e:
                 errmsg = 'Could not read embedded SED-ML file or could not convert to phraSED-ML: {}.\n{}'.format(entry.getLocation(), e.what())

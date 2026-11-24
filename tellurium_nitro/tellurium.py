@@ -94,6 +94,8 @@ def setDefaultPlottingEngine(engine):
         raise ValueError('Plotting engine is not supported: {}'.format(engine))
     global __default_plotting_engine
     __default_plotting_engine = engine
+    from .plotting.api import nextFigure
+    nextFigure.tiledFigure = None  # a tiled figure belongs to the engine that made it
 
 
 def disablePlotting():

@@ -23,7 +23,6 @@ class InlineOmexTestCase(unittest.TestCase):
         matplotlib.pyplot.switch_backend(self.backend)
         matplotlib.pyplot.close('all')
 
-    @pytest.mark.skip
     def test_repressilatorToInlineOmex(self):
         importer = convert_omex.inlineOmexImporter.fromFile(OMEX_REPRESSILATOR)
         assert importer is not None

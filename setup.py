@@ -52,6 +52,7 @@ setup(name='tellurium_nitro',
           # SBW-derived
           'libroadrunner_nitro',  # the Rust engine: pip install ./rrs
           'antimony>=3.1.0',
+          'phrasedml>=1.3',
           # standards
           'python-libnuml>=1.0.0',
           'python-libsedml>=2.0.17',
