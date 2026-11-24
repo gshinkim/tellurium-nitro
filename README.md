@@ -8,6 +8,7 @@ analyses (steady states, control coefficients, sensitivities) run hundreds to th
 - [What is different from regular tellurium?](#what-is-different-from-regular-tellurium)
 - [Install it (about 10 minutes)](#install-tellurium-nitro-step-by-step)
 - [Use it](#use-it)
+- [Use it without Python: the C library](#use-it-without-python-the-c-library-libroadrunners-c-api)
 - [How much faster is it?](#how-much-faster-is-it)
 - [How do we know the answers are right?](#how-do-we-know-the-answers-are-right)
 - [For experts: how it works](#for-experts-how-it-works)
@@ -54,6 +55,7 @@ before. libroadrunner and libsbml are not needed: the Rust engine does all the w
 | Processor cores used | 1 | all of them, when it helps |
 | Models roadrunner refuses (delays, algebraic rules, fast reactions) | error | **runs them** |
 | SBML Test Suite (the standard correctness test) | — | **1923 of 1923 cases pass** |
+| Use from C, C++, MATLAB, Julia, C#… | libroadrunner's C API (`libroadrunner_c_api`) | **the same C API** (`libroadrunner_nitro_c_api`, all 350 functions) |
 | How you install it | `pip install tellurium` | from this GitHub page (see below) |
 
 New things you can do that regular tellurium can't:
@@ -121,6 +123,9 @@ It should print `Nitro engine on: True`. If the import fails, step 6 didn't fini
 
 From now on, activate the environment (step 4, `source .venv/bin/activate`) whenever you want to use Nitro.
 
+**8. (Optional) Build the C library**, if you want to use Nitro from C, C++, MATLAB, Julia or another
+language instead of Python: see [Use it without Python](#use-it-without-python-the-c-library-libroadrunners-c-api).
+
 Tested on macOS (Apple Silicon). Linux and Windows should work, but they're untested.
 
 ## Use it
@@ -152,30 +157,128 @@ r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
 r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
 
-### Use it from C, C++, MATLAB, Julia, R, C#… (libroadrunner's C API)
+### Use it without Python: the C library (libroadrunner's C API)
 
-Programs that use libroadrunner's shared library can use Nitro's instead. `libroadrunner_nitro_c_api` (`.dylib` on
-macOS, `.so` on Linux, `.dll` on Windows) exports all 350 functions of libroadrunner's C API (`rrc_api.h`,
-`rrc_types.h`, `rrc_utilities.h`), with the same names and arguments. The original headers are in `rrs/capi/include`.
+Many programs use libroadrunner through its shared library and C API instead of Python: C and C++ programs,
+MATLAB, Julia, R, C#, Delphi and others. Nitro provides the same thing: a shared library,
+`libroadrunner_nitro_c_api`, that exports **all 350 functions** of libroadrunner's C API (`rrc_api.h`,
+`rrc_types.h`, `rrc_utilities.h`) with the same names, arguments and memory rules. It does not need Python,
+libroadrunner or libsbml.
+
+**1. Build the library** (needs Rust, step 2 of the install; takes 1-3 minutes):
 
 ```bash
-cd rrs && cargo build --release -p roadrunner_nitro_c_api   # -> rrs/target/release/libroadrunner_nitro_c_api.dylib
+cd rrs
+cargo build --release -p roadrunner_nitro_c_api
+cd ..
 ```
+
+This makes one file in `rrs/target/release/`:
+
+| System | File |
+|---|---|
+| macOS | `libroadrunner_nitro_c_api.dylib` |
+| Linux | `libroadrunner_nitro_c_api.so` (untested) |
+| Windows | `roadrunner_nitro_c_api.dll` (untested) |
+
+The C headers are in `rrs/capi/include/`. They are libroadrunner's own headers, unchanged.
+
+**2. Check it:** this lists every function in the headers and confirms the library exports it.
+
+```bash
+python rrs/capi/tests/check_exports.py        # prints: 350 declared / 350 exported
+```
+
+**3. Use it from C or C++.** A complete example is in
+[`rrs/capi/examples/simulate.c`](rrs/capi/examples/simulate.c): it loads a model, simulates it, finds the steady
+state and a control coefficient. The core of it:
 
 ```c
 #include "rrc_api.h"
+
 RRHandle rr = createRRInstance();
-loadSBMLFromFile(rr, "model.xml");
-RRCDataPtr result = simulateEx(rr, 0, 10, 100);   // same calls as with libroadrunner
-freeRRCData(result);
+if (!loadSBMLFromFile(rr, "model.xml"))            /* or loadSBML(rr, sbml_text) */
+    printf("error: %s\n", getLastError());
+RRCDataPtr result = simulateEx(rr, 0, 10, 100);    /* time 0 to 10, 100 points */
+double value;
+getRRCDataElement(result, 99, 1, &value);          /* last row, first species */
+freeRRCData(result);                               /* free what the API returns, as with libroadrunner */
 freeRRInstance(rr);
 ```
 
-Link with `-lroadrunner_nitro_c_api`, or load the file the way your language loads libroadrunner's (MATLAB
-`loadlibrary`, Julia `ccall`, C# `DllImport`). The full SBML Test Suite passes through the C API alone, with no
-Python: `python benchmarks/sts/run_capi.py <suite>/cases/semantic out.jsonl --all`. Where libroadrunner's C API had
-a bug, Nitro returns the correct result (for example `getRatesOfChange` values match `getRatesOfChangeIds`, and
-`"cc(S1, k1)"` selections are no longer split at the comma).
+Compile and run it (macOS; on Linux use `-Wl,-rpath,...` the same way):
+
+```bash
+cc -I rrs/capi/include rrs/capi/examples/simulate.c \
+   -L rrs/target/release -lroadrunner_nitro_c_api -Wl,-rpath,$PWD/rrs/target/release -o simulate
+./simulate                  # the model built into the example
+./simulate my_model.xml     # any SBML file
+```
+
+**4. Use it from Python without tellurium** (`ctypes`, part of Python):
+
+```python
+import ctypes
+rr = ctypes.CDLL("rrs/target/release/libroadrunner_nitro_c_api.dylib")
+rr.createRRInstance.restype = ctypes.c_void_p
+rr.loadSBMLFromFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+rr.simulateEx.restype = ctypes.c_void_p
+rr.simulateEx.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_int]
+rr.getRRCDataElement.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_double)]
+rr.getRRDataNumRows.argtypes = [ctypes.c_void_p]
+rr.freeRRCData.argtypes = [ctypes.c_void_p]
+rr.freeRRInstance.argtypes = [ctypes.c_void_p]
+
+h = rr.createRRInstance()
+rr.loadSBMLFromFile(h, b"model.xml")
+res = rr.simulateEx(h, 0.0, 10.0, 11)
+v = ctypes.c_double()
+rr.getRRCDataElement(res, rr.getRRDataNumRows(res) - 1, 1, ctypes.byref(v))
+print(v.value)
+rr.freeRRCData(res); rr.freeRRInstance(h)
+```
+
+**5. Use it from other languages.** Load the library file the way you load libroadrunner's, with the headers from
+`rrs/capi/include` (these were not tested here):
+
+- MATLAB: `loadlibrary('libroadrunner_nitro_c_api', 'rrc_api.h', 'addheader', 'rrc_types.h')`, then
+  `calllib('libroadrunner_nitro_c_api', 'createRRInstance')`.
+- Julia: `ccall((:createRRInstance, "libroadrunner_nitro_c_api"), Ptr{Cvoid}, ())`.
+- C#: `[DllImport("roadrunner_nitro_c_api")] static extern IntPtr createRRInstance();`
+
+**6. Switch an existing libroadrunner program to Nitro.** Either link it with `-lroadrunner_nitro_c_api` instead of
+`-lroadrunner_c_api`, or, without recompiling, give Nitro's library libroadrunner's file name and put it where the
+program looks for libroadrunner. On macOS:
+
+```bash
+cp rrs/target/release/libroadrunner_nitro_c_api.dylib /path/to/libroadrunner_c_api.dylib
+install_name_tool -id @rpath/libroadrunner_c_api.dylib /path/to/libroadrunner_c_api.dylib
+```
+
+A program built against libroadrunner (`-lroadrunner_c_api`) then runs on Nitro's engine unchanged (tested with
+the example above).
+
+**How we know it's right.** The whole SBML Test Suite runs through the C library alone, with no Python involved:
+all 1789 time-course cases and all 100 stochastic cases pass. (The other 34 cases are flux-balance problems,
+which libroadrunner's C API doesn't do either.) Reproduce:
+
+```bash
+python benchmarks/sts/run_capi.py <suite>/cases/semantic capi.jsonl --all
+python benchmarks/sts/run_capi_stochastic.py <suite>/cases/stochastic capi_stoch.jsonl 10000
+python -m pytest rrs/capi/tests                # every section of the API, plus a C test with no memory leaks
+```
+
+**Where it differs from libroadrunner's C API: only where libroadrunner's was wrong.**
+
+| Function | libroadrunner | Nitro |
+|---|---|---|
+| `getRatesOfChange` | values in a different order from `getRatesOfChangeIds` | values match the ids |
+| `setTimeCourseSelectionList("time, cc(S1, k1)")` | splits inside `cc(...)` at the comma | splits only between selections |
+| `loadSimulationSettings` | settings have no effect | start, duration, steps and tolerances are applied |
+| `getFloatingSpeciesInitialConcentrationByIndex` | bad index returns "success" without a value | bad index is an error |
+| `getConfigurationXML`, `writeRRData` | declared but missing | implemented |
+| `steadyState` | gives up when Newton fails from the current state | also finds steady states Newton alone misses |
+| euler / rk4 / rk45 integrators | ignore events after the start time | apply every event |
 
 ### Run many simulations at once
 
