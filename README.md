@@ -1,7 +1,7 @@
 # Tellurium Nitro
 
 **Regular tellurium, with a new math engine that is much faster.** Your code and your results stay the same. You
-just get them sooner: simulations run up to about 8 times faster, big models load about 30 times faster, and heavy
+just get them sooner: simulations run up to about 8 times faster, big models load about 95 times faster, and heavy
 analyses (steady states, control coefficients, sensitivities) run hundreds to thousands of times faster.
 
 - [The story](#the-story)
@@ -152,6 +152,31 @@ r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
 r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
 
+### Use it from C, C++, MATLAB, Julia, R, C#… (libroadrunner's C API)
+
+Programs that use libroadrunner's shared library can use Nitro's instead. `libroadrunner_nitro_c_api` (`.dylib` on
+macOS, `.so` on Linux, `.dll` on Windows) exports all 350 functions of libroadrunner's C API (`rrc_api.h`,
+`rrc_types.h`, `rrc_utilities.h`), with the same names and arguments. The original headers are in `rrs/capi/include`.
+
+```bash
+cd rrs && cargo build --release -p roadrunner_nitro_c_api   # -> rrs/target/release/libroadrunner_nitro_c_api.dylib
+```
+
+```c
+#include "rrc_api.h"
+RRHandle rr = createRRInstance();
+loadSBMLFromFile(rr, "model.xml");
+RRCDataPtr result = simulateEx(rr, 0, 10, 100);   // same calls as with libroadrunner
+freeRRCData(result);
+freeRRInstance(rr);
+```
+
+Link with `-lroadrunner_nitro_c_api`, or load the file the way your language loads libroadrunner's (MATLAB
+`loadlibrary`, Julia `ccall`, C# `DllImport`). The full SBML Test Suite passes through the C API alone, with no
+Python: `python benchmarks/sts/run_capi.py <suite>/cases/semantic out.jsonl --all`. Where libroadrunner's C API had
+a bug, Nitro returns the correct result (for example `getRatesOfChange` values match `getRatesOfChangeIds`, and
+`"cc(S1, k1)"` selections are no longer split at the comma).
+
 ### Run many simulations at once
 
 Give each setting you want to change a list of values. Nitro runs one simulation per position in the lists, all
@@ -184,9 +209,9 @@ All timings are on an Apple M5 Pro (18 cores, 48 GB), macOS, Python 3.12, libroa
 
 | What you do | Regular tellurium | Tellurium Nitro | Faster by |
 |---|---:|---:|---:|
-| Load a 1000-species, 3400-reaction model | 30.9 s | 1.03 s | **30x** |
+| Load a 1000-species, 3400-reaction model | 30.9 s | 0.32 s | **95x** |
 | Simulate that model (`simulate(0, 100, 1000)`) | 284 ms | 42 ms | **6.8x** |
-| Simulate it again after `reset()` | 282 ms | 37 ms | **7.6x** |
+| Simulate it again after `reset()` | 282 ms | 41 ms | **6.9x** |
 | Simulate a 40-species model | 1.14 ms | 0.221 ms | **5.1x** |
 | Steady state, 40-species model | 244 ms | 0.0475 ms | **5,133x** |
 | Control coefficients, 40-species model | 590 ms | 0.0394 ms | **14,979x** |
@@ -293,9 +318,9 @@ Regular tellurium is the `tellurium` package with libroadrunner. Reproduce with
 
 | Task | Regular tellurium | Tellurium Nitro | Speedup |
 |---|---:|---:|---:|
-| load (`te.loada`) | 30.9 s | 3.1 s | **10x** |
+| load (`te.loada`) | 30.9 s | 0.32 s | **95x** |
 | first `simulate` | 284 ms | 42 ms | **6.8x** |
-| `reset()` + `simulate` again | 282 ms | 37 ms | **7.6x** |
+| `reset()` + `simulate` again | 282 ms | 41 ms | **6.9x** |
 
 The largest difference from regular tellurium at any point is 2.9e-5.
 
