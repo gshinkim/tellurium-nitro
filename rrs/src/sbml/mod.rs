@@ -4,7 +4,7 @@
 //! rules, amounts / concentrations). Fast reactions and algebraic rules are rewritten first
 //! (`transform`); the compiler then writes every rate, rule and event as an infix formula over
 //! species concentrations and parameters, as `Model::new` takes them.
-mod math;
+pub(crate) mod math;
 mod transform;
 pub mod edit;
 

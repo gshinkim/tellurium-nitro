@@ -199,6 +199,21 @@ impl Rk45 {
     }
 }
 
+/// Step RK45 once, carrying its step proposal between calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rk45_step(m: &Model, w: &mut Work, t0: f64, t1: f64, hmin: f64, hmax: f64,
+                        eps: f64, next_h: &mut f64) -> Result<f64, String> {
+    if m.has_algebraic() || m.has_delays() { return Err("rk45 requires an ordinary differential equation".into()); }
+    if m.has_events() && m.apply_events(w, t0).is_none() { return Err("event cascade does not terminate".into()); }
+    let mut rk = Rk45::new(m.nx, hmin, if hmax > 0.0 { hmax } else { 1.0 }, eps);
+    rk.hcur = *next_h;
+    let mut y = w.s.clone();
+    let t = rk.integrate(m, w, &mut y, t0, t1, true)?;
+    w.s.copy_from_slice(&y);
+    *next_h = rk.hcur;
+    Ok(t)
+}
+
 /// libroadrunner's rk45 with variable_step_size = true (RoadRunner::simulate's variable step branch):
 /// a row at t0, then one row per accepted step, the last step cut to end exactly at t1; at most
 /// `max_rows` rows (0: no limit). `hmax` <= 0: 1. Events as `integrate_fixed`. Returns (times, rows

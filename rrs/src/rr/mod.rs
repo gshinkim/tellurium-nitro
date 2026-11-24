@@ -14,6 +14,7 @@ mod regen_test;
 pub use eig::eigenvalues;
 mod sel;
 mod settings;
+mod extra;
 
 pub use cons::Ls;
 pub use sel::{parse as parse_selection, Sel};
@@ -90,13 +91,14 @@ struct Core {
     ls_rows: Vec<String>, ls_n: Vec<f64>, ls_nr: usize,
     /// libstruct's analysis and csum_dep, computed on first use (a dense QR: seconds on big models)
     ls_cell: std::cell::OnceCell<(Ls, Vec<usize>)>,
-    /// dependent species (index into ls's dependents) with a moiety total: those not set by rules
     /// initial concentrations of rule-set floating species as the SBML declares them (0 if unset)
     rule_init: HashMap<String, f64>,
     w: Work, fresh: bool, live: bool, // the running simulation (event state, delay history)
     q: Work, qok: bool,               // scratch work loaded with (x, t) when qok
     rd: Option<RateDerivs>,
     csum: Vec<f64>,
+    stoich_edit: Option<extra::StoichEdit>,
+    internal_step: Option<(&'static str, f64, f64)>,
 }
 
 fn names_of(src: &str) -> Option<HashSet<String>> {
@@ -178,7 +180,7 @@ impl Core {
         })).collect();
         let w = m.work();
         Ok(Core { xi: x0.clone(), x: x0.clone(), x0, t: 0.0, tgt, ia: ok.then_some(ia), cconst, sp, rx, plain, nss, ls_nr, ls_cell: Default::default(), w, fresh: true,
-                  live: false, q, qok: false, rd: None, csum: vec![], ls_rows, ls_n, rule_init, keys, kres, kpos, xo, m, info })
+                  live: false, q, qok: false, rd: None, csum: vec![], stoich_edit: None, internal_step: None, ls_rows, ls_n, rule_init, keys, kres, kpos, xo, m, info })
     }
 
     fn fids(&self) -> &[String] { &self.info.ids[0] }
@@ -443,6 +445,7 @@ pub struct RoadRunner {
     cma: bool,
     pub diff_step: f64,
     pub flux_threshold: f64,
+    steady_state_threshold: f64,
     integ: Solver,
     integs: Vec<Solver>, // settings of the integrators not current
     ss: Solver,
@@ -455,7 +458,7 @@ impl Default for RoadRunner { fn default() -> Self { Self::new() } }
 impl RoadRunner {
     pub fn new() -> RoadRunner {
         RoadRunner { sbml: String::new(), base: None, c: None, start: 0.0, end: 5.0, points: 51, times: None, sel: vec![], ssel: vec![],
-                     cma: false, diff_step: 0.02, flux_threshold: 1e-9, integ: Solver::integrator("cvode").unwrap(),
+                     cma: false, diff_step: 0.02, flux_threshold: 1e-9, steady_state_threshold: 0.01, integ: Solver::integrator("cvode").unwrap(),
                      integs: INTEGRATORS[1..].iter().map(|n| Solver::integrator(n).unwrap()).collect(),
                      ss: Solver::steady_state("nleq2").unwrap(), seed_ctr: (u64::MAX, 0), result: None }
     }
@@ -490,9 +493,11 @@ impl RoadRunner {
 
     /// Compile self.sbml; carry the state of `old` (by id; ids whose initial value changed take the
     /// new one), and bake changed compartment volumes into the engine model.
-    fn rebuild(&mut self, old: Option<Core>) -> Result<(), String> {
+    fn rebuild(&mut self, mut old: Option<Core>) -> Result<(), String> {
+        let edited = old.as_ref().and_then(|c| c.stoich_edit.as_ref()).filter(|e| e.source == self.sbml);
+        let runtime = edited.map_or(self.sbml.as_str(), |e| e.runtime.as_str());
         let compile1 = |sizes: &[(String, f64)]| -> Result<Core, String> {
-            let (m, info, text) = compile(&self.sbml, self.base.as_deref(), sizes)?;
+            let (m, info, text) = compile(runtime, self.base.as_deref(), sizes)?;
             let nss = self.sbml.contains("symbols/time") || info.n_events > 0;
             Core::new(m, info, nss, &text)
         };
@@ -516,6 +521,7 @@ impl RoadRunner {
             (c2.x0, c2.xi, c2.x, c2.t, c2.ia) = (c.x0, c.xi, c.x, c.t, c.ia);
             c = c2;
         }
+        if edited.is_some() { c.carry_stoich_edit(old.as_mut().unwrap()); }
         c.touch();
         self.c = Some(c);
         if self.cma { self.c.as_mut().unwrap().csum = self.csum_now()?; }
@@ -541,13 +547,26 @@ impl RoadRunner {
 
     /// The SBML with the current values as initial values (initial assignments removed).
     pub fn get_current_sbml(&mut self) -> Result<String, String> {
-        let text = if self.sbml.contains("/comp/") { sbml_io::comp::flatten(&self.sbml, self.base.as_deref())? } else { self.sbml.clone() };
+        self.current_sbml(false)
+    }
+
+    fn current_sbml(&mut self, update_stoichiometry: bool) -> Result<String, String> {
+        let runtime = self.runtime_sbml()?;
+        let update_stoichiometry = update_stoichiometry || runtime != self.sbml;
+        let text = if runtime.contains("/comp/") { sbml_io::comp::flatten(runtime, self.base.as_deref())? } else { runtime.to_owned() };
         let mut doc = read_doc(&text)?;
         let c = self.core_mut()?;
         let Some(m) = doc.model.as_mut() else { return Ok(text) };
         let mut val = |id: &str| -> Option<f64> { c.reg(id).ok().map(|r| c.out(&[r])[0]) };
         for p in &mut m.parameters { if let Some(v) = val(&p.id) { p.value = Some(v); } }
         for x in &mut m.compartments { if let Some(v) = val(&x.id) { x.size = Some(v); } }
+        if update_stoichiometry {
+            for r in &mut m.reactions {
+                for sr in r.reactants.iter_mut().chain(&mut r.products) {
+                    if let Some(v) = sr.id.as_deref().and_then(&mut val) { sr.stoichiometry = Some(v); }
+                }
+            }
+        }
         for s in &mut m.species {
             if !c.is_species(&s.id) || c.reg(&s.id).is_err() { continue; }
             if s.initial_concentration.is_some() { s.initial_concentration = Some(c.species(&s.id, true)?); }
@@ -720,6 +739,7 @@ impl RoadRunner {
                 return Err(format!("cannot perform moiety conversion when floating species have events ({s})"));
             }
         }
+        if on && self.c.is_some() { self.reset_stoichiometry()?; }
         self.cma = on;
         if self.c.is_some() {
             if on { self.c.as_mut().unwrap().csum = self.csum_now()?; }
@@ -958,6 +978,7 @@ impl RoadRunner {
     }
     /// reset() plus parameters, compartments and boundary species to their initial values.
     pub fn reset_all(&mut self) -> Result<(), String> {
+        self.reset_stoichiometry()?;
         let c = self.core_mut()?;
         let vols_changed = c.cconst.iter().any(|k| c.kpos.get(k).is_some_and(|&j| c.x[j] != c.xi[j]));
         c.x = c.xi.clone();
