@@ -658,6 +658,7 @@ impl RoadRunner {
     }
     pub fn compartment_ids(&self) -> Vec<String> { self.ids(3) }
     pub fn reaction_ids(&self) -> Vec<String> { self.ids(4) }
+    pub fn event_ids(&self) -> Vec<String> { self.c.as_ref().map_or(vec![], |c| c.info.event_ids.clone()) }
     pub fn rate_rule_ids(&self) -> Vec<String> { self.c.as_ref().map_or(vec![], |c| c.info.rate_rule_ids.clone()) }
     pub fn conserved_moiety_ids(&self) -> Vec<String> {
         match &self.c { Some(c) if self.cma => (0..c.csum_dep().len()).map(|k| format!("_CSUM{k}")).collect(), _ => vec![] }

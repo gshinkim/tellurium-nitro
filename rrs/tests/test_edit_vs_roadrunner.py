@@ -1,17 +1,31 @@
-"""Model editing (roadrunner_nitro.sbml_edit, rrs/src/sbml/edit.rs) vs libroadrunner's own editing.
+"""Replay SBML edits against the outcomes in reference/edit.npz."""
 
-For every model and every edit sequence: apply it with libroadrunner (r.addSpecies... then
-r.getSBML()) and with sbml_edit, load both results into a fresh libroadrunner, and compare
-ids, initial values and a short simulation (rtol 1e-6). Both failing (edit or load) counts as a match.
-Run with the venv python, roadrunner_nitro built from this tree first on PYTHONPATH.
-"""
-import glob, os, pickle, re, sys
+import glob
+import os
+import re
+import signal
+
+import antimony
 import numpy as np
-import antimony, roadrunner
-import roadrunner_nitro as nitro
+import pytest
 
-roadrunner.Logger.setLevel(roadrunner.Logger.LOG_FATAL)
 HERE = os.path.dirname(os.path.abspath(__file__))
+REF = os.path.join(HERE, 'reference', 'edit.npz')
+SNAPSHOT_IDS = ('FloatingSpecies', 'BoundarySpecies', 'GlobalParameter', 'Compartment', 'Reaction', 'Event')
+SNAPSHOT_VALUES = ('FloatingSpeciesConcentrations', 'BoundarySpeciesConcentrations',
+                   'GlobalParameterValues', 'CompartmentVolumes')
+# Keep integration error below the comparison tolerance on both engines.
+INTEGRATOR_TOLERANCES = dict(relative_tolerance=1e-12, absolute_tolerance=1e-15)
+# The original comparison had no outcome for these libroadrunner segfaults.
+REFERENCE_SEGFAULTS = {
+    f'{model}/34-add_initial_assignment'
+    for model in ('00014-sbml-l2v2.xml', '00022-sbml-l2v1.xml', '00033-sbml-l2v1.xml',
+                  '10000-sbml-l2v1.xml', '10001-sbml-l2v1.xml', 'repressilator-sbml-l2v1.xml')
+} | {
+    f'{model}/35-add_initial_assignment'
+    for model in ('00033-sbml-l2v1.xml', '10000-sbml-l2v1.xml', '10001-sbml-l2v1.xml',
+                  'repressilator-sbml-l2v1.xml')
+}
 
 ANT = ['''function f(x, y)
   x*y
@@ -51,83 +65,8 @@ def models():
     return out
 
 
-def camel(op):
-    special = {'add_reaction_from_sbml': 'addReaction', 'add_reaction': 'addReaction',
-               'validate_current_sbml': 'validateCurrentSBML'}
-    if op in special:
-        return special[op]
-    a, *b = op.split('_')
-    return a + ''.join(x.title() for x in b)
-
-
-def rr_apply(sbml, steps):
-    r = roadrunner.RoadRunner(sbml)
-    for op, args in steps:
-        if op == 'remove_reaction':
-            r.removeReaction(args[0], args[1])
-        elif op == 'add_reaction_from_sbml':  # the Python wrapper's addReaction(*args) hides this overload
-            roadrunner._roadrunner.RoadRunner_addReaction(r, args[0], True)
-        else:
-            getattr(r, camel(op))(*args)
-    return r.getSBML()  # the edited document (getCurrentSBML bakes in current values, dropping initial assignments)
-
-
-def ours_apply(sbml, steps):
-    for op, args in steps:
-        sbml = nitro.sbml_edit(op, sbml, *args)
-    return sbml
-
-
-def snapshot(sbml):
-    r = roadrunner.RoadRunner(sbml)
-    ids = (r.model.getFloatingSpeciesIds(), r.model.getBoundarySpeciesIds(), r.model.getGlobalParameterIds(),
-           r.model.getCompartmentIds(), r.model.getReactionIds(), list(r.model.getEventIds()))
-    init = np.concatenate([r.model.getFloatingSpeciesConcentrations(), r.model.getBoundarySpeciesConcentrations(),
-                           r.model.getGlobalParameterValues(), r.model.getCompartmentVolumes()])
-    sim = np.asarray(r.simulate(0, 10, 51))
-    return ids, init, sim
-
-
-def close(a, b):
-    return a.shape == b.shape and np.allclose(a, b, rtol=1e-6, atol=1e-9 * max(1.0, np.nanmax(np.abs(a), initial=0)), equal_nan=True)
-
-
-def result(fn, sbml, steps):
-    """snapshot(fn(sbml, steps)) in a forked child (libroadrunner segfaults on some edits): the snapshot,
-    'ERR: ...' if it raised, CRASH if the child died."""
-    rd, wr = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(rd)
-        try:
-            out = snapshot(fn(sbml, steps))
-        except Exception as e:
-            out = 'ERR: ' + str(e).splitlines()[0][:100] if str(e) else 'ERR'
-        with os.fdopen(wr, 'wb') as f:
-            pickle.dump(out, f)
-        os._exit(0)
-    os.close(wr)
-    with os.fdopen(rd, 'rb') as f:
-        data = f.read()
-    os.waitpid(pid, 0)
-    return pickle.loads(data) if data else CRASH
-
-
-CRASH = 'CRASH'
-
-
-def show(x, other):
-    """An error, or what differs from `other`: ids not in it, else 'values'."""
-    if isinstance(x, str) or isinstance(other, str):
-        return x if isinstance(x, str) else 'loaded fine'
-    d = [sorted(set(a) - set(b)) for a, b in zip(x[0], other[0])]
-    return f'ids {d}, order {[a == b for a, b in zip(x[0], other[0])]}' if x[0] != other[0] else 'same ids, values differ'
-
-
-def cases(sbml):
-    r = roadrunner.RoadRunner(sbml)
-    fl, bd, gp = r.model.getFloatingSpeciesIds(), r.model.getBoundarySpeciesIds(), r.model.getGlobalParameterIds()
-    cp, rx = r.model.getCompartmentIds(), r.model.getReactionIds()
+def cases(sbml, ids):
+    fl, _, gp, cp, rx, _ = ids
     level = 3 if 'level="3"' in sbml else 2
     a, b = fl[0], fl[-1]
     p = gp[0] if gp else 'k_none'
@@ -176,70 +115,86 @@ def cases(sbml):
         ev + one('add_event_assignment', 'Ex', p, '3') + one('remove_parameter', p),
     ]
     c += [one('remove_rules', v) for v in rules] + [one('remove_rules', 'nope')]
-    return c, rx
+    c += [one('get_kinetic_law', rid) for rid in rx]
+    c += [one('get_param_promoted_sbml'), one('validate_current_sbml')]
+    return c
 
 
-def main():
-    n = bad = both_err = 0
-    tally, crashed = {}, []
-    for name, sbml in models():
-        cs, rx = cases(sbml)
-        for steps in cs:
-            x, y = result(rr_apply, sbml, steps), result(ours_apply, sbml, steps)
-            if x == CRASH:  # libroadrunner died: nothing to compare with
-                crashed.append((name, steps[-1][0], 'ours: ' + (y if isinstance(y, str) else 'loads and simulates')))
-                continue
-            if isinstance(x, str) or isinstance(y, str):
-                ok = isinstance(x, str) and isinstance(y, str)
-                both_err += ok
-            else:
-                ok = x[0] == y[0] and close(x[1], y[1]) and close(x[2], y[2])
-            n += 1
-            key = '+'.join(op for op, _ in steps)
-            t = tally.setdefault(key, [0, 0]); t[0] += ok; t[1] += 1
-            if not ok:
-                bad += 1
-                print(f'MISMATCH {name} {[(op, tuple(str(v)[:40] for v in a)) for op, a in steps]}\n  roadrunner: {show(x, y)}\n  ours:       {show(y, x)}')
-        # getKineticLaw: our formula, read back by libsbml, prints as libsbml's own
-        r = roadrunner.RoadRunner(sbml)
-        for rid in rx:
-            ours = nitro.sbml_edit('get_kinetic_law', sbml, rid)
-            r2 = roadrunner.RoadRunner(sbml)
-            r2.setKineticLaw(rid, ours, False)
-            ok = r2.getKineticLaw(rid) == r.getKineticLaw(rid)
-            n += 1; bad += not ok
-            t = tally.setdefault('get_kinetic_law', [0, 0]); t[0] += ok; t[1] += 1
-            if not ok:
-                print(f'MISMATCH {name} getKineticLaw {rid}: {r.getKineticLaw(rid)!r} vs ours {ours!r}')
-        # getParamPromotedSBML
-        x, y = result(lambda s, _: roadrunner.RoadRunner.getParamPromotedSBML(s), sbml, None), \
-            result(lambda s, _: nitro.sbml_edit('get_param_promoted_sbml', s), sbml, None)
-        ok = not isinstance(x, str) and not isinstance(y, str) and x[0] == y[0] and close(x[1], y[1]) and close(x[2], y[2])
-        n += 1; bad += not ok
-        t = tally.setdefault('get_param_promoted_sbml', [0, 0]); t[0] += ok; t[1] += 1
-        if not ok:
-            print(f'MISMATCH {name} getParamPromotedSBML\n  {x if isinstance(x, str) else x[0]}\n  {y if isinstance(y, str) else y[0]}')
-        # validateCurrentSBML: pass / fail only
-        try:
-            roadrunner.RoadRunner(sbml).validateCurrentSBML(); vx = True
-        except Exception:
-            vx = False
-        try:
-            nitro.sbml_edit('validate_current_sbml', sbml); vy = True
-        except ValueError:
-            vy = False
-        t = tally.setdefault('validate_current_sbml', [0, 0]); t[0] += vx == vy; t[1] += 1
-        n += 1; bad += vx != vy
-        if vx != vy:
-            print(f'MISMATCH {name} validateCurrentSBML: roadrunner {vx}, ours {vy}')
-    for k, (g, t) in sorted(tally.items()):
-        print(f'{g:3d}/{t:<3d} {k}')
-    for c in crashed:
-        print('libroadrunner crashed (skipped):', *c)
-    print(f'{n - bad}/{n} match ({both_err} of them: both raise)')
-    return bad
+def keyed_cases(name, sbml, ids):
+    for i, steps in enumerate(cases(sbml, ids)):
+        ops = '+'.join(op for op, _ in steps)
+        yield f'{name}/{i:02d}-{ops}', steps
 
 
-if __name__ == '__main__':
-    print(nitro.__file__)
-    sys.exit(1 if main() else 0)
+def model_ids(model):
+    return tuple(list(getattr(model, f'get{kind}Ids')()) for kind in SNAPSHOT_IDS)
+
+
+def snapshot(r, model):
+    ids = model_ids(model)
+    init = np.concatenate([getattr(model, f'get{kind}')() for kind in SNAPSHOT_VALUES])
+    return dict(ids=ids, init=init, sim=np.asarray(r.simulate(0, 10, 51)))
+
+
+def replay_cases():
+    with np.load(REF, allow_pickle=True) as ref:
+        for name, sbml in models():
+            for key, steps in keyed_cases(name, sbml, ref[f'{name}/ids']):
+                expected = ref[key].item()
+                if 'signal' in expected:
+                    assert key in REFERENCE_SEGFAULTS and expected['signal'] == signal.SIGSEGV, key
+                    continue
+                yield pytest.param(sbml, steps, expected, id=key)
+
+
+def assert_close(actual, expected):
+    scale = max(1.0, np.nanmax(np.abs(expected), initial=0))
+    assert actual.shape == expected.shape
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-9 * scale)
+
+
+def pytest_generate_tests(metafunc):
+    if metafunc.function is test_edit:
+        metafunc.parametrize('sbml, steps, expected', list(replay_cases()))
+
+
+def test_edit(sbml, steps, expected):
+    import roadrunner_nitro as nitro
+
+    op, args = steps[0]
+    if op == 'get_kinetic_law':
+        rid, = args
+
+        def rates(formula):
+            # Keep the original reaction's local parameters and model functions in scope.
+            edited = nitro.sbml_edit('set_kinetic_law', sbml, rid, formula)
+            return np.asarray(nitro.RoadRunner(edited).simulate(0, 1, 6, [rid]))
+
+        formula = nitro.sbml_edit(op, sbml, rid)
+        assert_close(rates(formula), rates(expected['formula']))
+        return
+    if op == 'validate_current_sbml':
+        if expected['valid']:
+            nitro.sbml_edit(op, sbml)
+        else:
+            with pytest.raises(ValueError):
+                nitro.sbml_edit(op, sbml)
+        return
+
+    def apply():
+        edited = sbml
+        for op, args in steps:
+            edited = nitro.sbml_edit(op, edited, *args)
+        r = nitro.RoadRunner(edited)
+        for setting, value in INTEGRATOR_TOLERANCES.items():
+            r.setIntegratorSetting(setting, value)
+        return snapshot(r, r)
+
+    if 'error' in expected:
+        with pytest.raises(ValueError):
+            apply()
+    else:
+        actual = apply()
+        assert actual['ids'] == expected['ids']
+        assert_close(actual['init'], expected['init'])
+        assert_close(actual['sim'], expected['sim'])
