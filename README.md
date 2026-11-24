@@ -1,7 +1,7 @@
 # Tellurium Nitro
 
 **Regular tellurium, with a new math engine that is much faster.** Your code and your results stay the same. You
-just get them sooner: simulations run up to about 8 times faster, big models load about 95 times faster, and heavy
+just get them sooner: simulations run about 2 to 8 times faster, big models load about 100 times faster, and heavy
 analyses (steady states, control coefficients, sensitivities) run hundreds to thousands of times faster.
 
 - [The story](#the-story)
@@ -49,7 +49,7 @@ before. libroadrunner and libsbml are not needed: the Rust engine does all the w
 | How you write code | `import tellurium as te` | `import tellurium_nitro as te`; every command after that is **the same** |
 | Results | roadrunner's answers | **The same answers** (within the solver's normal error), and more exact for control coefficients |
 | Math engine | roadrunner (C++) | New Rust engine (no libroadrunner, no libsbml) |
-| Simulate a model over time | baseline | **about 1.4-8x faster** |
+| Simulate a model over time | baseline | **about 2-8x faster** |
 | Load a 1000-reaction model | about 30 s | **about 0.3 s** |
 | Steady state, control coefficients, sensitivities | baseline | **600 to 130,000x faster** |
 | Processor cores used | 1 | all of them, when it helps |
@@ -312,9 +312,9 @@ All timings are on an Apple M5 Pro (18 cores, 48 GB), macOS, Python 3.12, libroa
 
 | What you do | Regular tellurium | Tellurium Nitro | Faster by |
 |---|---:|---:|---:|
-| Load a 1000-species, 3400-reaction model | 30.9 s | 0.32 s | **95x** |
-| Simulate that model (`simulate(0, 100, 1000)`) | 284 ms | 42 ms | **6.8x** |
-| Simulate it again after `reset()` | 282 ms | 41 ms | **6.9x** |
+| Load a 1000-species, 3400-reaction model | 30.9 s | 0.30 s | **103x** |
+| Simulate that model (`simulate(0, 100, 1000)`) | 284 ms | 38 ms | **7.5x** |
+| Simulate it again after `reset()` | 282 ms | 37 ms | **7.6x** |
 | Simulate a 40-species model | 1.14 ms | 0.22 ms | **5.2x** |
 | Steady state, 40-species model | 244 ms | 0.029 ms | **8,407x** |
 | Control coefficients, 40-species model | 590 ms | 0.0173 ms | **34,228x** |
@@ -425,9 +425,9 @@ Regular tellurium is the `tellurium` package with libroadrunner. Reproduce with
 
 | Task | Regular tellurium | Tellurium Nitro | Speedup |
 |---|---:|---:|---:|
-| load (`te.loada`) | 30.9 s | 0.32 s | **95x** |
-| first `simulate` | 284 ms | 42 ms | **6.8x** |
-| `reset()` + `simulate` again | 282 ms | 41 ms | **6.9x** |
+| load (`te.loada`) | 30.9 s | 0.30 s | **103x** |
+| first `simulate` | 284 ms | 38 ms | **7.5x** |
+| `reset()` + `simulate` again | 282 ms | 37 ms | **7.6x** |
 
 The largest difference from regular tellurium at any point is 2.9e-5.
 
@@ -475,7 +475,7 @@ official release, so they are upstream issues. Wall time is about the same for a
 mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation.
 
 **This repository's own tests** (Python package, Rust core and C API, including SED-ML/OMEX), run in a fresh
-environment with only Nitro installed (no libroadrunner, no libsbml): **3346 passed, 0 failed**. 4 tests are
+environment with only Nitro installed (no libroadrunner, no libsbml): **3347 passed, 0 failed**. 4 tests are
 skipped; all 4 skips come unchanged from upstream tellurium. Answers are compared with libroadrunner's,
 recorded once in `rrs/tests/reference/` and `tellurium_nitro/tests/reference/`, so the tests never need
 libroadrunner installed.
@@ -537,44 +537,34 @@ Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.m
   - **MCA:** closed form, `C = -L (N_R E L)^-1 N_R` and `F = I + E C`.
   - **Sensitivities:** forward, one parameter per core.
   - **Gillespie SSA.**
-- **Bridge** (`tellurium_nitro/analysis/rrs_bridge.py`): builds the Rust model straight from the SBML (libsbml). No
-  roadrunner compile is needed.
+- **SBML reader** (`rrs/src/sbml/`, on the pure-Rust `rrs/crates/sbml-io`): reads SBML Level 1-3 straight into
+  the engine, including hierarchical `comp` models (flattened in `sbml-io/src/comp.rs`). No libsbml, and no
+  roadrunner compile: a 1000-species model loads in about 0.3 s.
 - **Antimony:** read by a pure-Rust reader (`rrs/crates/antimony`, from
   [PathwayDesigner-rs](https://github.com/sys-bio/PathwayDesigner-rs)), about 4x faster to load than libantimony.
   Anything it rejects goes to libantimony. `te.antimony(False)` always uses libantimony. Species are listed in
   declaration order, which can differ from libantimony's, so select result columns by name, not position.
-  `te.SBML(False)` is reserved for a Rust SBML reader (`rrs/crates/sbml-io`); SBML is still read with libsbml.
-- **Lazy roadrunner:** `te.loada` and `te.loadSBMLModel` no longer compile the model in roadrunner, which used to take
-  about 10 s at 1000 reactions.
-  - **Served by Nitro without loading roadrunner:**
-    - `simulate`, `steadyState`, MCA, sensitivities and gillespie
-    - values, reset, selections and ids
-    - `getCurrentSBML` and `getAntimony`
-  - **Loads roadrunner once, keeping the current state:**
-    - link and conservation matrices, and `conservedMoietyAnalysis = True`
-    - model edits (`addReaction`, etc.)
-    - integrators other than cvode or gillespie
-    - anything else Nitro doesn't serve
-- **Facade** (`tellurium_nitro/roadrunner/extended_roadrunner.py`): for each call, it decides between Rust and roadrunner
-  and keeps the roadrunner object in sync, so selections, getters and plotting keep working.
-- **What Rust handles:**
-  - `simulate`, including the gillespie integrator and `oneStep`
-  - `steadyState` and its variants
-  - every elasticity, control-coefficient, Jacobian and eigenvalue matrix, `getCC` and `getuCC`
-  - `timeSeriesSensitivities` (k = 0, 1)
-  - `te.controlCoefficients`
-- **Still on roadrunner, and why:**
-  - **Scalar getters** (~1 µs in C++): the call into Rust would cost more than it saves.
-  - **Structural matrices** (stoichiometry, link, conservation): computed once by libstruct, so the choice of
-    independent species stays consistent.
-  - **`getFrequencyResponse`:** no reference to verify a Rust version against.
-  - **`k ≥ 2` sensitivities.**
-- **Known differences from roadrunner:**
-  - Roadrunner carries sensitivity state into the next `timeSeriesSensitivities` call, even after `reset()`.
-    Nitro starts each call fresh.
-  - Roadrunner ignores event changes inside sensitivities.
+- **RoadRunner core** (`rrs/src/rr/`): libroadrunner's instance behaviour in Rust: selections, get/set values,
+  reset, simulate, `oneStep`, steady state (with the nleq1/nleq2/newton settings, presimulation and
+  approximation), Jacobians, eigenvalues (LAPACK's `zgeev`, ported, so the order matches libroadrunner's),
+  elasticities and control coefficients, conserved moiety analysis (libstruct's QR, ported, so the species order
+  and `_CSUM` totals match), Gillespie, integrator settings, model editing (`rrs/src/sbml/edit.rs`), SBML level
+  and version conversion, and save/load state. The Python `ExtendedRoadRunner` and the C library are both thin
+  layers over this one core.
+- **Integrators:** cvode (BDF / Rodas4, honours tolerances per species, step limits and variable step output),
+  gillespie, and libroadrunner's euler, rk4 and rk45 (`rrs/src/fixed.rs`).
+- **C library** (`rrs/capi/`): all 350 functions of libroadrunner's C API on the core; see
+  [Use it without Python](#use-it-without-python-the-c-library-libroadrunners-c-api).
+- **Where Nitro gives the correct answer and libroadrunner doesn't** (each case has a test):
+  - Control coefficients and elasticities are exact, not finite differences.
+  - euler, rk4 and rk45 apply events after the start time; libroadrunner ignores them.
+  - rk45 stays accurate on very small or very large values (sosbench 00009, 00033).
+  - Steady states that Newton can't reach from the current state are still found (e.g. sosbench 00009
+    after `simulate(0, 10)`); models with no steady state still fail.
+  - Roadrunner carries sensitivity state into the next `timeSeriesSensitivities` call, even after `reset()`, and
+    ignores event changes inside sensitivities; Nitro starts each call fresh and applies them.
   - Roadrunner returns uninitialised values from `getDependentRatesOfChange` when moiety analysis is on.
-  - Nitro gives the correct values in all three cases. The tests document each one.
+  - C API bugs, listed in the C library section above.
 
 ## From Tellurium Turbo: batched control coefficients and GPU
 
@@ -665,19 +655,28 @@ for large models with many samples. CUDA was not benchmarked.
 
 ## Changed files (vs sys-bio/tellurium)
 
-- `rrs/` (new): Rust engine `roadrunner_nitro` (`src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT,
-  `src/model.rs` solvers/integrators/events/SSA/MCA, `src/sens.rs` sensitivities, `src/rand.rs` `distrib` random draws, `src/py.rs` bindings, `check.py`)
-- `tellurium_nitro/analysis/rrs_bridge.py` (new): SBML -> Rust batch model
+- `rrs/` (new): Rust engine `roadrunner_nitro`
+  - `src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT, `src/model.rs` solvers/integrators/events/SSA/MCA,
+    `src/sens.rs` sensitivities, `src/rand.rs` `distrib` random draws, `src/fixed.rs` euler/rk4/rk45
+  - `src/sbml/` SBML reader, model editing, level/version conversion; `src/rr/` the RoadRunner core;
+    `src/py.rs` Python bindings
+  - `crates/sbml-io` (SBML reader/writer, `comp` flattening), `crates/antimony` (Antimony reader)
+  - `capi/` (new): the C library `libroadrunner_nitro_c_api`, libroadrunner's headers, tests, `examples/simulate.c`
+  - `tests/`: core, editing, integrator, conversion and limits tests against libroadrunner's recorded answers
 - `tellurium_nitro/roadrunner/extended_roadrunner.py`: libroadrunner's Python API on the Rust core (no libroadrunner)
+- `tellurium_nitro/analysis/rrs_bridge.py` (new): SBML -> Rust batch model for `simulateBatch`, sensitivities and
+  `te.controlCoefficients`
 - `tellurium_nitro/analysis/gpu.py` (new): `te.gpu()`, `te.getGPU()`, `te.controlCoefficients()` (Rust first)
-- `tellurium_nitro/__init__.py`: exports `te.turbo`, `te.gpu`, `te.getGPU`, `te.controlCoefficients`
-- `tellurium_nitro/tests/test_turbo.py` (+ `make_reference.py`, `reference/turbo.npz`), `tellurium_nitro/tests/test_gpu.py` (new): results vs libroadrunner's recorded answers
-- `tellurium_nitro/visualization/sbmldiagram.py`: removed the Python 2 `six` import
-- `setup.py`: optional extra `gpu` (`torch>=2.0`)
-- `benchmarks/` (new): `run.py` (speed/efficiency/accuracy), `tests.py` (pytest suite on all three), `sosbench/`
 - `tellurium_nitro/analysis/fba.py` (new): `te.fba()`, flux balance analysis with SciPy HiGHS
-- `benchmarks/sts/` (new): SBML Test Suite runners, report and per-case results
-- `benchmarks/bigmodel/` (new): 1000-species benchmark model and runner
+- `tellurium_nitro/__init__.py`: exports `te.turbo`, `te.gpu`, `te.getGPU`, `te.controlCoefficients`
+- `tellurium_nitro/teconverters/`: inline OMEX works for archives that reference BioModels by URN
+- `tellurium_nitro/tests/test_turbo.py` (+ `make_reference.py`, `reference/turbo.npz`), `tellurium_nitro/tests/test_gpu.py`,
+  `tellurium_nitro/tests/test_bugfixes.py` (new): results vs libroadrunner's recorded answers, and bug regressions
+- `tellurium_nitro/visualization/sbmldiagram.py`: removed the Python 2 `six` import
+- `setup.py` / `requirements.txt`: `libroadrunner_nitro` instead of libroadrunner and python-libsbml; `phrasedml`;
+  optional extra `gpu` (`torch>=2.0`)
+- `benchmarks/` (new): `run.py` (speed/efficiency/accuracy), `tests.py` (pytest suite on all three), `sosbench/`,
+  `sts/` (SBML Test Suite runners through Python, the core and the C API), `bigmodel/` (1000-species model)
 - `docs/specJIT.pdf` (plain-language explainer), `docs/roadrunner-rs-spec.md` (technical spec)
 
 > **Everything below is the original sys-bio/tellurium README.** Its `pip install tellurium` instructions install
