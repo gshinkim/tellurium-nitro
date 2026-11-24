@@ -761,8 +761,8 @@ class ExtendedRoadRunner(object):
             points = int(steps) + 1
         rr = self._rr
         sel = None if selections is None else list(selections)
-        # gillespie / rk45 on a grid when points/times are given, else their variable steps
-        vss = rr.getIntegratorName() in ('gillespie', 'rk45') and (points is not None or times is not None) and \
+        # Explicit output points request a grid even when the integrator uses variable steps.
+        vss = rr.getIntegratorName() in ('cvode', 'gillespie', 'rk45') and (points is not None or times is not None) and \
             rr.getIntegratorSetting('variable_step_size')
         if vss:
             rr.setIntegratorSetting('variable_step_size', False)

@@ -587,8 +587,10 @@ def test_integrator_registry():
     b.setIntegratorSetting('variable_step_size', False)
     assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('cvode')
-    with pytest.raises(ValueError):
-        b.setIntegratorSetting('variable_step_size', True)  # not honoured: refused
+    b.reset()
+    b.setIntegratorSetting('variable_step_size', True)
+    y = np.asarray(b.simulate(0, 1, 5))
+    assert y.shape[0] > 5 and y[0, 0] == 0 and y[-1, 0] == 1
     b.setIntegratorSetting('maximum_num_steps', 5000)
     with pytest.raises(ValueError):
         b.setIntegrator('lsoda')
@@ -596,6 +598,64 @@ def test_integrator_registry():
     assert b.getSteadyStateSolverSetting('allow_presimulation') is True
     b.setSteadyStateSolverSetting('presimulation_time', 10)
     assert b.getSteadyStateSolverSetting('presimulation_time') == 10.0
+
+
+def test_cvode_step_settings():
+    sbml = rn.antimony_to_sbml("S1 -> S2; 0.4*S1; S1 = 10; S2 = 0")
+    b = rn.RoadRunner(sbml)
+    b.setIntegratorSetting('variable_step_size', True)
+    b.setIntegratorSetting('initial_time_step', 1e-4)
+    b.setIntegratorSetting('minimum_time_step', 1e-4)
+    b.setIntegratorSetting('maximum_time_step', 0.04)
+    y = np.asarray(b.simulate(0, 1, 5))
+    assert y[0, 0] == 0 and y[-1, 0] == 1
+    dt = np.diff(y[:, 0])
+    assert dt[0] == pytest.approx(1e-4)
+    assert np.all(dt[:-1] >= 1e-4 - 1e-15)
+    assert np.max(dt) == pytest.approx(0.04)
+    ref = rn.RoadRunner(sbml)
+    ref.setIntegratorSetting('relative_tolerance', 1e-12)
+    ref.setIntegratorSetting('absolute_tolerance', 1e-14)
+    tight = np.asarray(ref.simulateTimes(y[:, 0].tolist()))
+    np.testing.assert_allclose(y[:, 1:], tight[:, 1:], rtol=2e-5, atol=1e-6)
+
+    b.reset()
+    b.setIntegratorSetting('max_output_rows', 3)
+    truncated = np.asarray(b.simulate(0, 1, 5))
+    np.testing.assert_array_equal(truncated, y[:3])
+    assert b.getCurrentTime() == truncated[-1, 0]
+
+    b.reset()
+    b.setIntegratorSetting('variable_step_size', False)
+    b.setIntegratorSetting('maximum_num_steps', 1)
+    with pytest.raises(ValueError, match='integration failed'):
+        b.simulate(0, 1, 2)
+    b.setIntegratorSetting('multiple_steps', True)
+    assert np.asarray(b.simulate(0, 1, 2))[-1, 0] == 1
+
+
+def test_gillespie_step_settings():
+    b = rn.RoadRunner(rn.antimony_to_sbml("S1 -> ; 100; S1 = 1"))
+    b.setIntegrator('gillespie')
+    b.setSeed(17)
+    b.setIntegratorSetting('nonnegative', True)
+    b.setIntegratorSetting('minimum_time_step', 0.25)
+    y = np.asarray(b.simulate(0, 1, 2))
+    np.testing.assert_array_equal(y[:, 0], [0, 0.25, 0.5, 0.75, 1])
+    np.testing.assert_array_equal(y[:, 1], [1, 0, 0, 0, 0])
+    b.reset()
+    b.setIntegratorSetting('maximum_num_steps', 1)
+    with pytest.raises(ValueError, match='maximum_num_steps'):
+        b.simulate(0, 1, 2)
+
+    b = rn.RoadRunner(rn.antimony_to_sbml("S1 -> ; 0; S1 = 1"))
+    b.setIntegrator('gillespie')
+    b.setIntegratorSetting('maximum_time_step', 0.25)
+    y = np.asarray(b.simulate(0, 1, 2))
+    np.testing.assert_array_equal(y[:, 0], [0, 0.25, 0.5, 0.75, 1])
+    b.reset()
+    b.setIntegratorSetting('variable_step_size', False)
+    np.testing.assert_array_equal(np.asarray(b.simulate(0, 1, 2))[:, 0], [0, 1])
 
 
 def test_gillespie_and_state(tmp_path):

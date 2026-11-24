@@ -19,7 +19,7 @@ pub use cons::Ls;
 pub use sel::{parse as parse_selection, Sel};
 pub use settings::{Solver, Value, INTEGRATORS, STEADY_STATE_SOLVERS};
 
-use crate::model::{Key, Model, Rows, Work};
+use crate::model::{Ctl, Key, Model, Rows, Work};
 use crate::sbml::Info;
 use crate::sens::RateDerivs;
 use std::collections::{HashMap, HashSet};
@@ -331,8 +331,9 @@ impl Core {
     }
 
     /// Integrate from the current state, carrying event state and retrying with tighter tolerances.
-    /// `tol`: absolute tolerance per state (RoadRunner::cvode_tolerances).
-    fn advance(&mut self, times: &[f64], outs: &[u32], rtol: f64, tol: &[f64]) -> Result<Vec<f64>, String> {
+    /// `tol`: absolute tolerance per state (RoadRunner::cvode_tolerances); `ctl`: the cvode settings
+    /// (with ctl.var: rows at the solver's steps from times[0] to the last time, model left at the last row).
+    fn advance(&mut self, times: &[f64], outs: &[u32], rtol: f64, tol: &[f64], ctl: Ctl) -> Result<Vec<f64>, String> {
         let asc = self.atol_scale()?;
         // the retry: every state at most 1e-12 times its scale
         let retry = tol.iter().zip(&asc).map(|(&t, &a)| (1e-12 * a / t).min(1.0)).fold(1.0, f64::min);
@@ -340,25 +341,30 @@ impl Core {
         let mut out = vec![0.0; nt * no];
         let Core { m, w, kres, x, fresh, .. } = self;
         w.atol_scale.copy_from_slice(tol);
+        w.ctl = ctl;
         if *fresh { m.events_reset(w); }
         let saved = m.event_state(w);
+        let hist = w.hist.save();
         let mut tried = f64::NAN;
         let mut ok = false;
         let atol = tol.iter().zip(&asc).map(|(&t, &a)| t / a).fold(0.0, f64::max);
         for a in [1.0, retry] {
             if a == tried { break; }
             tried = a;
-            let hist = w.hist.save(); // a continued run keeps its delay() history
             m.load(w, kres, x);
-            if !*fresh { w.hist.restore(hist); }
+            if !*fresh { w.hist.restore(hist.clone()); }
             if m.simulate_cont(w, times, rtol, a, outs, &mut out) { ok = true; break; }
             let _ = m.set_event_state(w, saved.0.clone(), saved.1.clone());
         }
-        if !ok { return Err(format!("integration failed (atol {atol:e} and 1e-12)")); }
+        w.ctl = Ctl::default();
+        if !ok {
+            w.hist.restore(hist);
+            return Err(format!("integration failed (atol {atol:e} and 1e-12)"));
+        }
+        let (tend, out) = if ctl.var { (*w.rows.0.last().unwrap(), std::mem::take(&mut w.rows.1)) } else { (times[nt - 1], out) };
         if out.iter().any(|v| !v.is_finite()) && (0..out.len()).any(|i| !out[i].is_finite() && out[i % no.max(1)].is_finite()) {
             return Err("integration went non-finite".into());
         }
-        let tend = times[nt - 1];
         let xo = self.xo.clone();
         self.m.record(&mut self.w, tend, &xo, &mut self.x);
         self.t = tend;
@@ -1115,6 +1121,12 @@ impl RoadRunner {
         Ok(tol)
     }
 
+    /// The cvode settings the engine honours; maximum_num_steps 0: CVODE's default 20000 (as roadrunner).
+    fn cvode_ctl(&self) -> Ctl {
+        let c = self.integ.ctl();
+        Ctl { max_steps: if c.max_steps > 0 { c.max_steps } else { 20000 }, ..c }
+    }
+
     pub fn seed(&mut self) -> u64 { self.integrator_named("gillespie").map_or(0, |s| s.num("seed") as u64) }
     pub fn set_seed(&mut self, seed: u64) -> Result<(), String> {
         self.integrator_named("gillespie").unwrap().set("seed", Value::UInt(seed))?;
@@ -1143,8 +1155,11 @@ impl RoadRunner {
             .collect::<Vec<_>>().iter().map(|s| self.get_value(s)).collect::<Result<_, _>>()?;
         let y = match self.integ.name {
             "cvode" => {
-                let (rtol, tol) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?);
-                self.core_mut()?.advance(&times, &plan.outs, rtol, &tol)?
+                let (rtol, tol, ctl) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?, self.cvode_ctl());
+                // An explicit sampling grid takes precedence over the output mode.
+                let ctl = Ctl { var: ctl.var && self.times.is_none(), ..ctl };
+                let ts = if ctl.var { vec![times[0], times[times.len() - 1]] } else { times };
+                self.core_mut()?.advance(&ts, &plan.outs, rtol, &tol, ctl)?
             }
             "gillespie" => {
                 let var = self.integ.get("variable_step_size")?.bool();
@@ -1179,8 +1194,7 @@ impl RoadRunner {
     pub fn result(&self) -> Option<&Matrix> { self.result.as_ref() }
 
     /// One integration step from t0 to t0 + h with the current integrator (as Integrator::integrate);
-    /// returns the new time. Variable-step rk45 / gillespie take one step (one accepted step / one
-    /// firing) and may end before t0 + h.
+    /// returns the new time. Variable-step integrators may end before t0 + h.
     pub fn one_step(&mut self, t0: f64, h: f64) -> Result<f64, String> {
         use crate::fixed::Method;
         let var = self.integ.get("variable_step_size").is_ok_and(Value::bool);
@@ -1188,9 +1202,9 @@ impl RoadRunner {
         let (hmin, hmax, eps) = (i.num("minimum_time_step"), i.num("maximum_time_step"), i.num("epsilon"));
         let (method, step) = match self.integ.name {
             "cvode" => {
-                let (rtol, tol) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?);
-                self.core_mut()?.advance(&[t0, t0 + h], &[], rtol, &tol)?;
-                return Ok(t0 + h);
+                let (rtol, tol, ctl) = (self.integ.num("relative_tolerance"), self.cvode_tolerances()?, self.cvode_ctl());
+                self.core_mut()?.advance(&[t0, t0 + h], &[], rtol, &tol, Ctl { max_rows: 2, ..ctl })?;
+                return Ok(self.time());
             }
             "gillespie" => {
                 self.core_mut()?.t = t0;
@@ -1230,30 +1244,41 @@ impl RoadRunner {
     /// start to end). Returns (rows of outs, end time); the model is left at the end.
     fn ssa(&mut self, outs: &[u32], grid: Option<&[f64]>) -> Result<(Vec<f64>, f64), String> {
         let seed = self.run_seed();
-        let max_rows = self.integrator_named("gillespie").unwrap().num("max_output_rows") as usize;
+        let ctl = self.integrator_named("gillespie").unwrap().ctl();
+        let max_rows = if ctl.max_rows > 0 { ctl.max_rows } else { usize::MAX };
         let (start, end) = (self.start, self.end);
+        // variable steps with minimum_time_step: libroadrunner's rows every minimum_time_step
+        let hgrid: Option<Vec<f64>> = (grid.is_none() && ctl.hmin > 0.0).then(|| {
+            let mut g: Vec<f64> = (0..).map(|k| start + k as f64 * ctl.hmin).take_while(|&t| t < end).take(max_rows).collect();
+            if g.len() < max_rows { g.push(end); }
+            g
+        });
+        let grid = grid.or(hgrid.as_deref());
         let c = self.core_mut()?;
         if c.m.has_algebraic() { return Err("gillespie: algebraic rules are not supported".into()); }
         let all: Vec<u32> = outs.iter().chain(&c.xo).copied().collect();
         let no = all.len();
         c.m.load(&mut c.w, &c.kres, &c.x);
-        let (y, tend, cols) = match grid {
+        c.w.ctl = ctl;
+        let r = match grid {
             Some(t) => {
                 let mut y = vec![0.0; t.len() * no];
-                if !c.m.gillespie(&mut c.w, t, seed, &all, &mut y) { return Err("gillespie failed".into()); }
-                (y, t[t.len() - 1], no)
+                c.m.gillespie(&mut c.w, t, seed, &all, &mut y).then(|| (y, t[t.len() - 1], no))
             }
-            None => {
-                let r = c.m.gillespie_steps(&mut c.w, start, end, seed, &all, max_rows).ok_or("gillespie failed")?;
-                (r, end, no + 1)
-            }
+            None => c.m.gillespie_steps(&mut c.w, start, end, seed, &all, max_rows).map(|r| {
+                let cols = no + 1;
+                let last = r[r.len() - cols];
+                (r, last, cols)
+            }),
         };
+        c.w.ctl = Ctl::default();
+        let (y, tend, cols) = r.ok_or_else(|| if ctl.max_steps > 0 { format!("gillespie failed (maximum_num_steps {} reached?)", ctl.max_steps) } else { "gillespie failed".into() })?;
         let nt = y.len() / cols;
         let off = cols - no; // variable steps: time first
         let last = &y[(nt - 1) * cols + off..nt * cols];
         let nk = c.keys.len();
         c.x.copy_from_slice(&last[outs.len()..outs.len() + nk]);
-        c.t = if grid.is_some() { tend } else { y[(nt - 1) * cols] };
+        c.t = tend;
         c.fresh = true;
         c.touch();
         let rows: Vec<f64> = (0..nt).flat_map(|r| y[r * cols + off..r * cols + off + outs.len()].to_vec()).collect();
@@ -1298,6 +1323,8 @@ impl RoadRunner {
             .collect::<Vec<_>>().iter().map(|s| self.get_value(s)).collect::<Result<_, _>>()?;
         let rtol = self.integrator_named("cvode").unwrap().num("relative_tolerance");
         let (atol, asc) = (1.0, self.cvode_tolerances()?); // per-state absolute tolerances
+        let g = self.integrator_named("gillespie").unwrap().ctl();
+        let ctl = Ctl { var: false, ..g }; // ensembles always sample a fixed grid
         let c = self.core_mut()?;
         if c.m.has_algebraic() { return Err("gillespie: algebraic rules are not supported".into()); }
         let (m, kres, x, outs) = (&c.m, &c.kres, &c.x, &plan.outs);
@@ -1310,7 +1337,7 @@ impl RoadRunner {
             m.load(w, kres, x);
             let s = seed.wrapping_add(i as u64);
             let ok = if ode { w.atol_scale.copy_from_slice(&asc); m.reseed(w, s); m.simulate(w, &times, rtol, atol, outs, r) }
-                     else { m.gillespie(w, &times, s, outs, r) };
+                     else { w.ctl = ctl; m.gillespie(w, &times, s, outs, r) };
             if !ok { r.fill(f64::NAN); }
         });
         let per = points * no;

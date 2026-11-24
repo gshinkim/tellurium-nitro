@@ -1,5 +1,5 @@
 //! Integrator and steady-state solver registries with libroadrunner's names, setting types and
-//! defaults. Settings the engine can't honour accept only their default value (Err otherwise).
+//! defaults.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value { Bool(bool), Int(i64), UInt(u64), Double(f64), Str(String), Doubles(Vec<f64>) }
@@ -29,7 +29,7 @@ impl Value {
 }
 
 #[derive(Debug, Clone)]
-pub struct Param { pub name: &'static str, pub display: &'static str, pub hint: &'static str, pub value: Value, default: Value, fixed: bool }
+pub struct Param { pub name: &'static str, pub display: &'static str, pub hint: &'static str, pub value: Value, default: Value }
 
 #[derive(Debug, Clone)]
 pub struct Solver { pub name: &'static str, pub hint: &'static str, pub description: &'static str, pub params: Vec<Param> }
@@ -40,10 +40,8 @@ pub const STEADY_STATE_SOLVERS: [&str; 4] = ["nleq1", "nleq2", "newton", "newton
 use Value::*;
 
 fn p(name: &'static str, display: &'static str, hint: &'static str, v: Value) -> Param {
-    Param { name, display, hint, default: v.clone(), value: v, fixed: false }
+    Param { name, display, hint, default: v.clone(), value: v }
 }
-/// A setting the engine only runs at its default value.
-fn fixed(name: &'static str, display: &'static str, hint: &'static str, v: Value) -> Param { Param { fixed: true, ..p(name, display, hint, v) } }
 
 fn clock_seed() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) % (1 << 52)
@@ -61,11 +59,11 @@ impl Solver {
                     p("maximum_bdf_order", "Maximum BDF Order", "Specifies the maximum order for BDF.", Int(5)),
                     p("maximum_adams_order", "Maximum Adams Order", "Specifies the maximum order for Adams-Moulton.", Int(12)),
                     p("maximum_num_steps", "Maximum Number of Steps", "Specifies the maximum number of steps per time step.", Int(20000)),
-                    fixed("maximum_time_step", "Maximum Time Step", "Specifies the maximum absolute step size (0: no limit).", Double(0.0)),
-                    fixed("minimum_time_step", "Minimum Time Step", "Specifies the minimum absolute step size (0: no limit).", Double(0.0)),
-                    fixed("initial_time_step", "Initial Time Step", "Specifies the initial time step size (0: estimated).", Double(0.0)),
-                    fixed("multiple_steps", "Multiple Steps", "Perform a multiple time step simulation.", Bool(false)),
-                    fixed("variable_step_size", "Variable Step Size", "Perform a variable time step simulation.", Bool(false)),
+                    p("maximum_time_step", "Maximum Time Step", "Specifies the maximum absolute step size (0: no limit).", Double(0.0)),
+                    p("minimum_time_step", "Minimum Time Step", "Specifies the minimum absolute step size (0: no limit).", Double(0.0)),
+                    p("initial_time_step", "Initial Time Step", "Specifies the initial time step size (0: estimated).", Double(0.0)),
+                    p("multiple_steps", "Multiple Steps", "Perform a multiple time step simulation.", Bool(false)),
+                    p("variable_step_size", "Variable Step Size", "Perform a variable time step simulation.", Bool(false)),
                     p("max_output_rows", "Maximum Output Rows", "For variable step size simulations, the maximum number of rows in the result.", Int(100000)),
                 ]),
             "gillespie" => ("gillespie", "Gillespie Direct Method SSA",
@@ -73,11 +71,11 @@ impl Solver {
                 vec![
                     p("seed", "Seed", "Seed of the random number generator.", UInt(clock_seed())),
                     p("variable_step_size", "Variable Step Size", "Perform a variable time step simulation.", Bool(true)),
-                    fixed("minimum_time_step", "Minimum Time Step", "Specifies the minimum absolute step size.", Double(0.0)),
-                    fixed("maximum_time_step", "Maximum Time Step", "Specifies the maximum absolute step size.", Double(0.0)),
-                    fixed("nonnegative", "Non-negative species only", "Prevents species amounts from going negative.", Bool(false)),
+                    p("minimum_time_step", "Minimum Time Step", "Specifies the minimum absolute step size.", Double(0.0)),
+                    p("maximum_time_step", "Maximum Time Step", "Specifies the maximum absolute step size.", Double(0.0)),
+                    p("nonnegative", "Non-negative species only", "Prevents species amounts from going negative.", Bool(false)),
                     p("max_output_rows", "Maximum Output Rows", "For variable step size simulations, the maximum number of rows in the result.", Int(100000)),
-                    fixed("maximum_num_steps", "Maximum Number of Steps", "Maximum number of steps (0: no limit).", Int(0)),
+                    p("maximum_num_steps", "Maximum Number of Steps", "Maximum number of steps (0: no limit).", Int(0)),
                 ]),
             "rk4" => ("rk4", "Internal RK4 ODE solver", "Fixed-step fourth-order Runge-Kutta.", vec![]),
             "rk45" => ("rk45", "Internal RK45 ODE solver", "Runge-Kutta-Fehlberg 4(5) with adaptive steps.", vec![
@@ -159,14 +157,25 @@ impl Solver {
         let p = &mut self.params[i];
         // cvode's absolute_tolerance: a scalar, or one value per state (as libroadrunner's)
         if let (true, Value::Doubles(_)) = (self.name == "cvode" && key == "absolute_tolerance", &v) { p.value = v; return Ok(()); }
-        let v = p.value.coerce(v).map_err(|e| format!("{}.{key}: {e}", self.name))?;
-        if p.fixed && v != p.default {
-            return Err(format!("{}.{key} = {v:?} is not supported by the Nitro engine (only {:?})", self.name, p.default));
-        }
-        p.value = v;
+        p.value = p.default.coerce(v).map_err(|e| format!("{}.{key}: {e}", self.name))?;
         Ok(())
     }
     pub fn reset(&mut self) { for p in &mut self.params { p.value = p.default.clone(); } }
     /// Numeric value of a setting (NaN if missing or not a number).
     pub fn num(&self, key: &str) -> f64 { self.get(key).map_or(f64::NAN, Value::f64) }
+
+    /// The settings the engine's cvode / gillespie solvers take (model::Ctl; missing or <= 0: unset).
+    /// Nonstiff ODE runs use Rodas4, a one-step method with a fixed order and the same
+    /// error tolerances. maximum_adams_order is result-neutral because no Adams history is used.
+    pub fn ctl(&self) -> crate::model::Ctl {
+        let n = |k: &str| { let x = self.num(k); if x > 0.0 { x } else { 0.0 } };
+        let b = |k: &str| self.get(k).is_ok_and(Value::bool);
+        crate::model::Ctl {
+            h0: n("initial_time_step"), hmin: n("minimum_time_step"), hmax: n("maximum_time_step"),
+            max_steps: n("maximum_num_steps") as usize,
+            max_order: if b("stiff") { n("maximum_bdf_order") as usize } else { 0 },
+            nonstiff: self.name == "cvode" && !b("stiff"),
+            var: b("variable_step_size"), max_rows: n("max_output_rows") as usize, multi: b("multiple_steps"), nonneg: b("nonnegative"),
+        }
+    }
 }

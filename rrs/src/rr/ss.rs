@@ -86,7 +86,7 @@ impl Core {
     /// per state as roadrunner's).
     fn advance_default(&mut self, times: &[f64]) -> Result<(), String> {
         let tol: Vec<f64> = self.atol_scale()?.iter().map(|s| 1e-12 * s).collect();
-        self.advance(times, &[], 1e-6, &tol).map(|_| ())
+        self.advance(times, &[], 1e-6, &tol, crate::model::Ctl::default()).map(|_| ())
     }
 
     /// Floating species amounts (independent ones with moieties, as auto_moiety_analysis) and
