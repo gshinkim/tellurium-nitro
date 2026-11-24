@@ -47,6 +47,10 @@ impl Hist {
     /// The recorded series (t, y, f), borrowed.
     pub fn series(&self) -> [&[f64]; 3] { [&self.t, &self.y, &self.f] }
 
+    pub(crate) fn snapshot(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        (self.t.clone(), self.y.clone(), self.f.clone())
+    }
+
     /// State at tp into out (Hermite between recorded points; before the first: the first; after the
     /// last: linear to (t_now, s_now)).
     fn state_at(&self, tp: f64, s_now: &[f64], t_now: f64, out: &mut [f64]) {
@@ -1421,6 +1425,18 @@ impl Model {
         w.pend.iter().fold(end, |t, p| t.min(p.0))
     }
 
+    pub(crate) fn event_roots(&self, w: &mut Work, t: f64) -> Vec<f64> {
+        self.aux_at(&w.hist, &mut w.ra, &w.s, t);
+        self.events.iter().map(|e| if w.ra[e.trig as usize] != 0.0 { 1.0 } else { -1.0 }).collect()
+    }
+
+    /// Is any event trigger true at (w.s, t)?
+    pub fn any_trigger(&self, w: &mut Work, t: f64) -> bool {
+        let Work { ra, s, hist, .. } = w;
+        self.aux_at(hist, ra, s, t);
+        self.events.iter().any(|e| ra[e.trig as usize] != 0.0)
+    }
+
     /// Process trigger transitions and execute due events at t (as `simulate` does between steps).
     /// None if a cascade does not terminate, else whether any event executed.
     pub fn apply_events(&self, w: &mut Work, t: f64) -> Option<bool> { self.events_at(w, t) }
@@ -1517,10 +1533,22 @@ impl Model {
     /// `simulate` keeping the event state (trigger values, pending delayed events) in `w`, as a
     /// roadrunner simulate call that continues from the previous one.
     pub fn simulate_cont(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
+        self.simulate_until(w, times, rtol, atol, outs, out, None)
+    }
+
+    /// One accepted native integration step, stopping early at an event.
+    pub(crate) fn integrate_one(&self, w: &mut Work, t: f64, end: f64, rtol: f64, h: &mut f64) -> Option<f64> {
+        let mut reached = t;
+        self.simulate_until(w, &[t, end], rtol, 1.0, &[], &mut [], Some((&mut reached, h))).then_some(reached)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_until(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64],
+                      step_out: Option<(&mut f64, &mut f64)>) -> bool {
         crate::rand::seed(w.rng.next_u64()); // distrib draws
         w.rows.0.clear();
         w.rows.1.clear();
-        if self.alg.contains(&true) { return self.simulate_dae(w, times, rtol, atol, outs, out); }
+        if self.alg.contains(&true) { return self.simulate_dae(w, times, rtol, atol, outs, out, step_out.map(|(t, _)| t)); }
         let (no, nt) = (outs.len(), times.len());
         let ev = self.has_events();
         let tend = times[nt - 1];
@@ -1530,10 +1558,17 @@ impl Model {
         let mut bdf = !w.ctl.nonstiff && (rtol < BDF_BELOW_RTOL || (1..BDF_MAX).contains(&w.ctl.max_order));
         let dl = !self.dly.is_empty(); // delay(): one-step Rodas4, steps no longer than the shortest delay
         if dl { bdf = false; }
-        w.bdf.order = 0;
-        if ev && self.events_at(w, t).is_none() { return false; }
+        let mut h = step_out.as_ref().map_or(0.0, |(_, h)| **h);
+        if h == 0.0 { w.bdf.order = 0; }
+        if ev {
+            match self.events_at(w, t) {
+                None => return false,
+                Some(true) => w.bdf.order = 0,
+                Some(false) => {}
+            }
+        }
         if dl && w.hist.t.last().is_none_or(|&x| x < t) { self.hist_push(w, t); }
-        let (mut h, mut q, mut n) = (0.0, 0, 0); // n: steps since the last output
+        let (mut q, mut n) = (0, 0); // n: steps since the last output
         if !self.push_row(w, t, outs) { return true; }
         for _ in 0..MAX_STEPS * 10 {
             while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; n = 0; }
@@ -1590,6 +1625,12 @@ impl Model {
                 self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]);
                 q += 1;
             }
+            if let Some((time, next_h)) = step_out {
+                *time = t;
+                // A positive value also tells the next call to keep BDF history.
+                *next_h = if bdf { tn - times[0] } else { h };
+                return true;
+            }
         }
         false
     }
@@ -1612,7 +1653,9 @@ impl Model {
     /// diffsol's interpolant, a pending delayed event comes due, or the end time. Events then fire
     /// as in `simulate_cont` and diffsol restarts from the post-event state. delay() is not
     /// supported here (returns false).
-    fn simulate_dae(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn simulate_dae(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64],
+                    mut reached: Option<&mut f64>) -> bool {
         use diffsol::{NalgebraLU, NalgebraMat, NalgebraVec, OdeBuilder, OdeSolverMethod, OdeSolverStopReason, Vector};
         if !self.dly.is_empty() { return false; }
         let (nx, no, nt) = (self.nx, outs.len(), times.len());
@@ -1710,6 +1753,17 @@ impl Model {
                     self.record_y(hist, ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
                     q += 1;
                     n = 0;
+                }
+                if let Some(time) = reached.take() {
+                    if te < tn {
+                        let Ok(y) = solver.interpolate(te) else { return false };
+                        get(&y, &mut w.s);
+                    } else {
+                        get(solver.state().y, &mut w.s);
+                    }
+                    if has_ev && self.events_at(w, te).is_none() { return false; }
+                    *time = te;
+                    return true;
                 }
                 if te < tn || (cap == segment_end && matches!(reason, OdeSolverStopReason::TstopReached)) {
                     if te < tn {
