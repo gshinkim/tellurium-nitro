@@ -6,6 +6,8 @@
 //! species concentrations and parameters, as `Model::new` takes them.
 pub(crate) mod math;
 mod transform;
+pub(crate) mod convert;
+mod units;
 pub mod edit;
 
 use crate::model::{EventDef, Model, Rules};
@@ -32,6 +34,7 @@ pub(crate) fn inval(s: String) -> Error { Error::Invalid(s) }
 /// What the Python side needs besides the model (rrs_bridge's `info`).
 #[derive(Debug, Default)]
 pub struct Info {
+    pub(crate) piecewise_roots: Vec<u32>,
     /// (floating, boundary, global parameter, compartment, reaction) ids in roadrunner's order.
     pub ids: [Vec<String>; 5],
     pub comp_of: HashMap<String, String>,
@@ -104,6 +107,20 @@ impl Rx {
 
 impl M {
     fn fdefs(&self) -> Fdefs { self.fdefs.iter().map(|(f, a, b)| (f.clone(), (a.clone(), b.clone()))).collect() }
+    fn piecewise_conditions(&self) -> Result<Vec<E>, Error> {
+        let fd = self.fdefs();
+        let mut conditions = vec![];
+        for r in &self.rules { collect_piecewise(&r.math, &fd, &mut conditions, 0)?; }
+        for r in &self.reactions {
+            if let Some((Some(expr), locals)) = &r.kl {
+                let locals = locals.iter().map(|(id, value)| (id.clone(), num(*value))).collect();
+                collect_piecewise(&expr.subst(&locals), &fd, &mut conditions, 0)?;
+            }
+        }
+        for e in &self.events { collect_piecewise(&e.trigger, &fd, &mut conditions, 0)?; }
+        Ok(conditions)
+    }
+
     fn sids(&self) -> HashSet<String> {
         let mut s: HashSet<String> = self.comps.iter().map(|c| c.id.clone()).chain(self.species.iter().map(|x| x.id.clone()))
             .chain(self.params.iter().map(|p| p.id.clone())).chain(self.fdefs.iter().map(|f| f.0.clone()))
@@ -193,6 +210,28 @@ impl M {
             ias, rules, constraints, reactions, events,
         })
     }
+}
+
+/// A branch root is positive when that branch wins, including the otherwise branch.
+fn collect_piecewise(e: &E, fd: &Fdefs, out: &mut Vec<E>, depth: usize) -> Result<(), Error> {
+    if depth > 50 { return Err(inval("recursive SBML function".into())); }
+    if let E::Call(f, args) = e {
+        let (params, body) = fd.get(f).ok_or_else(|| inval(format!("unknown SBML function '{f}'")))?;
+        let bindings = params.iter().cloned().zip(args.iter().cloned()).collect();
+        return collect_piecewise(&body.subst(&bindings), fd, out, depth + 1);
+    }
+    if let E::Op(f, args) = e {
+        if f == "piecewise" {
+            let mut remaining = E::Num(1.0);
+            for pair in args.chunks_exact(2) {
+                out.push(math::op("and", vec![remaining.clone(), pair[1].clone()]));
+                remaining = math::op("and", vec![remaining, math::op("not", vec![pair[1].clone()])]);
+            }
+            if args.len() % 2 != 0 { out.push(remaining); }
+        }
+        for arg in args { collect_piecewise(arg, fd, out, depth)?; }
+    }
+    Ok(())
 }
 
 /// roadrunner lists rule-determined symbols after the others.
@@ -292,6 +331,7 @@ pub fn from_sbml(sbml: &str) -> Result<(Model, Info), Error> {
     if doc.namespaces.iter().any(|(_, u)| u.contains("/arrays/")) { return Err(nimp("SBML package".into())); }
     let Some(sm) = doc.model.as_ref() else { return Err(inval("SBML errors: no model".into())) };
     let mut m = M::read(sm)?;
+    let piecewise = m.piecewise_conditions()?;
     let mut pre = vec![];
     let prefer = transform::fast_to_algebraic(&mut m, &mut pre)?;
     let dae = transform::algebraic_to_assignment(&mut m, &prefer)?;
@@ -318,12 +358,15 @@ pub fn from_sbml(sbml: &str) -> Result<(Model, Info), Error> {
         conc.insert(s.id.clone(), if s.hosu { v / init.vals[&s.comp] } else { v });
     }
     let mut info = Info::default();
-    let model = compile(&m, &rows, &reactions, &nm, &conc, &mut init, &mut info, &dae, &pre)?;
+    let model = compile(&m, &rows, &reactions, &nm, &conc, &mut init, &mut info, &dae, &pre, &piecewise)?;
 
     let ruled: HashSet<String> = m.rules.iter().filter(|r| r.kind != RK::Alg).map(|r| r.var.clone()).collect();
     let ids = |v: Vec<String>| rr_order(&v, &ruled);
+    let lowered_refs: HashSet<_> = sm.parameters.iter().filter(|p| convert::is_stoichiometry_parameter(p))
+        .map(|p| p.id.as_str()).chain(sm.reactions.iter().filter(|r| r.fast == Some(true))
+            .flat_map(|r| r.reactants.iter().chain(&r.products)).filter_map(|sr| sr.id.as_deref())).collect();
     info.ids = [ids(rows.clone()), ids(m.species.iter().filter(|s| !ri.contains_key(s.id.as_str())).map(|s| s.id.clone()).collect()),
-                ids(m.params.iter().map(|p| p.id.clone()).collect()), ids(m.comps.iter().map(|c| c.id.clone()).collect()), reactions];
+                ids(m.params.iter().filter(|p| !lowered_refs.contains(p.id.as_str())).map(|p| p.id.clone()).collect()), ids(m.comps.iter().map(|c| c.id.clone()).collect()), reactions];
     info.rate_rule_ids = m.rules.iter().filter(|r| r.kind == RK::Rate).map(|r| r.var.clone()).collect();
     // function definitions inlined: reset() re-evaluates these from the infix text (rr::Core)
     info.ia = m.ias.iter().map(|(x, e)| (x.clone(), s(&math::inline_calls(e, &fd)))).collect();
@@ -582,7 +625,7 @@ fn words(s: &str) -> impl Iterator<Item = &str> {
 
 #[allow(clippy::too_many_arguments)]
 fn compile(m: &M, rows: &[String], reactions: &[String], nm: &[f64], conc: &HashMap<String, f64>, init: &mut Init,
-           info: &mut Info, dae: &HashSet<String>, pre: &[(String, E)]) -> Result<Model, Error> {
+           info: &mut Info, dae: &HashSet<String>, pre: &[(String, E)], piecewise: &[E]) -> Result<Model, Error> {
     let mut rules = HashMap::new();
     let mut rule_order = vec![];
     let mut rate_rules = HashMap::new();
@@ -696,6 +739,10 @@ fn compile(m: &M, rows: &[String], reactions: &[String], nm: &[f64], conc: &Hash
         }
     }
 
+    for (i, condition) in piecewise.iter().enumerate() {
+        out_rules.push((format!("@piecewise:{i}"), c.formula(condition, "piecewise trigger")?));
+    }
+
     let mut events = vec![];
     for ev in &m.events {
         let what = format!("event {}", ev.id.clone().unwrap_or_else(|| events.len().to_string()));
@@ -748,7 +795,9 @@ fn compile(m: &M, rows: &[String], reactions: &[String], nm: &[f64], conc: &Hash
     for (comp, output) in volume_rates {
         info.assignment_volume_rates.insert(comp, model.output_regs(&[output]).map_err(inval)?[0]);
     }
-    model.outputs.retain(|(id, _)| !id.starts_with("@rate:"));
+    info.piecewise_roots = model.outputs.iter().filter(|(id, _)| id.starts_with("@piecewise:"))
+        .map(|(_, reg)| *reg).collect();
+    model.outputs.retain(|(id, _)| !id.starts_with('@'));
     Ok(model)
 }
 

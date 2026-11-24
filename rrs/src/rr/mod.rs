@@ -450,6 +450,7 @@ pub struct RoadRunner {
     integs: Vec<Solver>, // settings of the integrators not current
     ss: Solver,
     seed_ctr: (u64, u64),
+    step_rng: Option<(u64, crate::rand::Mt19937)>,
     result: Option<Matrix>,
 }
 
@@ -460,7 +461,7 @@ impl RoadRunner {
         RoadRunner { sbml: String::new(), base: None, c: None, start: 0.0, end: 5.0, points: 51, times: None, sel: vec![], ssel: vec![],
                      cma: false, diff_step: 0.02, flux_threshold: 1e-9, steady_state_threshold: 0.01, integ: Solver::integrator("cvode").unwrap(),
                      integs: INTEGRATORS[1..].iter().map(|n| Solver::integrator(n).unwrap()).collect(),
-                     ss: Solver::steady_state("nleq2").unwrap(), seed_ctr: (u64::MAX, 0), result: None }
+                     ss: Solver::steady_state("nleq2").unwrap(), seed_ctr: (u64::MAX, 0), step_rng: None, result: None }
     }
 
     fn core(&self) -> Result<&Core, String> { self.c.as_ref().ok_or_else(|| "no model loaded".to_string()) }
@@ -486,6 +487,7 @@ impl RoadRunner {
             return Err(e);
         }
         self.seed_ctr = (u64::MAX, 0);
+        self.step_rng = None;
         self.result = None;
         self.default_selections();
         Ok(())
@@ -1151,6 +1153,7 @@ impl RoadRunner {
     pub fn seed(&mut self) -> u64 { self.integrator_named("gillespie").map_or(0, |s| s.num("seed") as u64) }
     pub fn set_seed(&mut self, seed: u64) -> Result<(), String> {
         self.integrator_named("gillespie").unwrap().set("seed", Value::UInt(seed))?;
+        self.step_rng = None;
         self.seed_ctr = (seed, 0); // a seed set again restarts its stream (roadrunner re-seeds)
         Ok(())
     }

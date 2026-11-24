@@ -99,3 +99,40 @@ mod tests {
         assert!((m - (2.0 / std::f64::consts::PI).sqrt()).abs() < 0.01);
     }
 }
+
+/// The 32-bit MT19937 stream used by libroadrunner's Gillespie integrator.
+pub(crate) struct Mt19937 {
+    state: Box<[u32; 624]>,
+    next: usize,
+}
+
+impl Mt19937 {
+    pub(crate) fn new(seed: u32) -> Self {
+        let mut state = Box::new([0u32; 624]);
+        state[0] = seed;
+        for i in 1..state.len() {
+            let prev = state[i - 1];
+            state[i] = 1812433253u32.wrapping_mul(prev ^ (prev >> 30)).wrapping_add(i as u32);
+        }
+        Self { next: state.len(), state }
+    }
+
+    pub(crate) fn uniform(&mut self) -> f64 {
+        let n = self.state.len();
+        if self.next == n {
+            for i in 0..n {
+                let bits = (self.state[i] & 0x80000000) | (self.state[(i + 1) % n] & 0x7fffffff);
+                self.state[i] = self.state[(i + 397) % n] ^ (bits >> 1)
+                    ^ if bits & 1 == 0 { 0 } else { 0x9908b0df };
+            }
+            self.next = 0;
+        }
+        let mut value = self.state[self.next];
+        self.next += 1;
+        value ^= value >> 11;
+        value ^= (value << 7) & 0x9d2c5680;
+        value ^= (value << 15) & 0xefc60000;
+        value ^= value >> 18;
+        f64::from(value.max(1)) / f64::from(u32::MAX)
+    }
+}

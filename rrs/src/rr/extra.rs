@@ -393,7 +393,36 @@ impl RoadRunner {
                     reached.ok_or_else(|| "internal integration step failed".into())
                 })?
             }
-            name => return Err(format!("internalOneStep: the {name} integrator has no internal solver steps")),
+            "euler" | "rk4" => {
+                use crate::fixed::Method;
+                let (method, subdivision) = if name == "euler" {
+                    (Method::Euler, h / self.integ.num("subdivision_steps").max(1.0))
+                } else { (Method::Rk4, 0.0) };
+                self.core_mut()?.integrate_one(t, reset, name, |m, w, _| {
+                    crate::fixed::integrate_fixed(m, w, method, &[t, end], subdivision, 0.0, 0.0, &[], &mut [])?;
+                    Ok(end)
+                })?
+            }
+            "gillespie" => {
+                let seed = self.seed();
+                let ctl = self.integ.ctl();
+                let (old_seed, mut rng) = self.step_rng.take()
+                    .unwrap_or_else(|| (seed, crate::rand::Mt19937::new(seed as u32)));
+                if old_seed != seed { rng = crate::rand::Mt19937::new(seed as u32); }
+                let mut returned = end;
+                let result = self.core_mut()?.integrate_one(t, reset, name, |m, w, _| {
+                    let old_ctl = std::mem::replace(&mut w.ctl, ctl);
+                    let times = m.gillespie_one(w, t, end, || rng.uniform());
+                    w.ctl = old_ctl;
+                    let (time, stop) = times.ok_or("Gillespie integration step failed")?;
+                    returned = stop;
+                    Ok(time)
+                });
+                self.step_rng = Some((seed, rng));
+                result?;
+                returned
+            }
+            name => return Err(format!("internalOneStep: unknown integrator {name}")),
         };
         Ok(now)
     }
@@ -494,11 +523,22 @@ impl RoadRunner {
         if level == 0 { return Ok(text); }
         let mut doc = read_doc(&text)?;
         let version = if version == 0 { doc.version } else { version };
-        if (level, version) == (doc.level, doc.version) { return Ok(text); }
-        if text.contains("/comp/") {
-            doc = read_doc(&sbml_io::comp::flatten(&text, self.base.as_deref())?)?;
+        let comp = text.contains("/comp/");
+        let same_version = (level, version) == (doc.level, doc.version);
+        let external = comp && text.contains("externalModelDefinition");
+        if same_version && !external { return Ok(text); }
+        if level == 2 && crate::sbml::convert::has_level_three_packages(&doc) {
+            return Err(format!("Error converting SBML to level {level} version {version}: Level 3 packages"));
         }
-        convert(&mut doc, level, version)?;
+        if comp {
+            if !same_version && external {
+                return Err(format!("Error converting SBML to level {level} version {version}: external model definitions"));
+            }
+            let flattened = sbml_io::comp::flatten(&text, self.base.as_deref())?;
+            if same_version { return Ok(flattened); }
+            doc = read_doc(&flattened)?;
+        }
+        crate::sbml::convert::convert(&mut doc, level, version)?;
         Ok(sbml_io::write(&doc))
     }
 
@@ -533,6 +573,7 @@ impl RoadRunner {
         let c = self.core_mut()?;
         let mut work = c.m.work();
         let mut vals = c.x.clone();
+        let mut history = c.live.then(|| c.w.hist.snapshot());
         if let Some(state) = state {
             if ids.len() != state.len() { return Err(format!("expected {} state values", ids.len())); }
             // Use the supplied compartment values when converting species amounts.
@@ -542,6 +583,7 @@ impl RoadRunner {
                 }
             }
             c.m.load(&mut work, &c.kres, &vals);
+            if let Some(saved) = history.take() { work.hist.restore(saved); }
             for (s, &v) in ids.iter().zip(state) {
                 if !c.is_species(s) { continue; }
                 let Some(&k) = c.kpos.get(s) else { continue };
@@ -550,9 +592,10 @@ impl RoadRunner {
                 vals[k] = if c.info.amount_params.contains(s) ||
                     (c.info.rate_rule_ids.contains(s) && !c.info.hosu.contains(s)) { v } else { v / vol[0] };
             }
+            if c.live { history = Some(work.hist.save()); }
         }
         c.m.load(&mut work, &c.kres, &vals);
-        if c.live { work.hist.restore(c.w.hist.snapshot()); }
+        if let Some(saved) = history { work.hist.restore(saved); }
         Ok(work)
     }
 
@@ -562,48 +605,18 @@ impl RoadRunner {
         Ok(self.core()?.m.event_roots(&mut work, t))
     }
 
-    fn piecewise_conditions(&self) -> Result<(Vec<E>, Fdefs), String> {
-        let doc = self.doc()?;
-        let Some(m) = doc.model else { return Ok((vec![], Fdefs::new())); };
-        let fd = function_definitions(&m)?;
-        let mut out = vec![];
-        for r in &m.rules {
-            if let Some(e) = r.math() {
-                let expr = math::conv(e).map_err(|e| e.to_string())?;
-                collect_piecewise(&expr, &fd, &mut out, 0)?;
-            }
-        }
-        for r in &m.reactions {
-            let Some(law) = &r.kinetic_law else { continue };
-            let Some(e) = &law.math else { continue };
-            let locals = law.parameters.iter().map(|p| {
-                (p.id.clone(), E::Num(p.value.unwrap_or(f64::NAN)))
-            }).collect();
-            let expr = math::conv(e).map_err(|e| e.to_string())?.subst(&locals);
-            collect_piecewise(&expr, &fd, &mut out, 0)?;
-        }
-        for event in &m.events {
-            if let Some(e) = event.trigger.as_ref().and_then(|trigger| trigger.math.as_ref()) {
-                let expr = math::conv(e).map_err(|e| e.to_string())?;
-                collect_piecewise(&expr, &fd, &mut out, 0)?;
-            }
-        }
-        Ok((out, fd))
-    }
-
     pub fn num_piecewise_triggers(&self) -> Result<usize, String> {
-        Ok(self.piecewise_conditions()?.0.len())
+        Ok(self.core()?.info.piecewise_roots.len())
     }
 
     pub fn piecewise_trigger_roots(&mut self, time: Option<f64>, state: Option<&[f64]>) -> Result<Vec<f64>, String> {
         let t = time.unwrap_or(self.time());
-        let (conditions, fd) = self.piecewise_conditions()?;
         let mut w = self.root_work(t, state)?;
         let c = self.core()?;
-        conditions.iter().map(|condition| {
-            let v = value_at(c, &mut w, t, condition, &fd)?;
-            Ok(if v != 0.0 { 1.0 } else { -1.0 })
-        }).collect()
+        let mut roots = vec![0.0; c.info.piecewise_roots.len()];
+        c.m.record(&mut w, t, &c.info.piecewise_roots, &mut roots);
+        for root in &mut roots { *root = if *root != 0.0 { 1.0 } else { -1.0 }; }
+        Ok(roots)
     }
 
     /// ExecutableModel::getRandom: a uniform number in (0, 1) from the model's seeded stream.
@@ -650,242 +663,4 @@ fn value_at(c: &Core, w: &mut crate::model::Work, t: f64, expr: &E, fd: &Fdefs) 
         c.m.record(w, t, &[reg], &mut v[..1]);
         Ok(v[0])
     }, fd).map_err(|e| e.to_string())
-}
-
-/// A branch root is positive when that branch wins, including the otherwise branch.
-fn collect_piecewise(e: &E, fd: &Fdefs, out: &mut Vec<E>, depth: usize) -> Result<(), String> {
-    if depth > 50 { return Err("recursive SBML function".into()); }
-    if let E::Call(f, args) = e {
-        let (params, body) = fd.get(f).ok_or_else(|| format!("unknown SBML function '{f}'"))?;
-        let bindings = params.iter().cloned().zip(args.iter().cloned()).collect();
-        return collect_piecewise(&body.subst(&bindings), fd, out, depth + 1);
-    }
-    if let E::Op(f, args) = e {
-        if f == "piecewise" {
-            let mut remaining = E::Num(1.0);
-            for pair in args.chunks_exact(2) {
-                out.push(math::op("and", vec![remaining.clone(), pair[1].clone()]));
-                remaining = math::op("and", vec![remaining, math::op("not", vec![pair[1].clone()])]);
-            }
-            if args.len() % 2 != 0 { out.push(remaining); }
-        }
-        for arg in args { collect_piecewise(arg, fd, out, depth)?; }
-    }
-    Ok(())
-}
-
-/// Convert core constructs without changing the model's equations. Reject constructs
-/// for which this conversion has no equivalent in the target.
-fn convert(doc: &mut sbml_io::Document, level: u32, version: u32) -> Result<(), String> {
-    use sbml_io::{Number, Op, Symbol};
-    let bad = |what: &str| Err(format!("Error converting SBML to level {level} version {version}: {what}"));
-    if !matches!((level, version), (2, 1..=5) | (3, 1..=2)) {
-        return bad("unsupported level/version");
-    }
-    let from_level = doc.level;
-    let l3v2 = (level, version) == (3, 2);
-    let Some(m) = doc.model.as_mut() else {
-        (doc.level, doc.version) = (level, version);
-        return Ok(());
-    };
-    let typed = !m.compartment_types.is_empty() || !m.species_types.is_empty();
-    if typed && (level == 3 || matches!(version, 1 | 5)) {
-        return bad("compartment or species types");
-    }
-    if level == 2 && version == 1 && (!m.initial_assignments.is_empty() || !m.constraints.is_empty()) {
-        return bad("initial assignments or constraints require Level 2 Version 2 or later");
-    }
-    if !l3v2 && m.reactions.iter().any(|r| r.reactants.is_empty() && r.products.is_empty()) {
-        return bad("reactions without reactants and products require Level 3 Version 2");
-    }
-    if l3v2 && m.reactions.iter().any(|r| r.fast == Some(true)) {
-        return bad("fast reactions require an older SBML level or version");
-    }
-    if (level, version) != (2, 1) &&
-        m.unit_definitions.iter().flat_map(|u| &u.units).any(|u| u.offset.is_some_and(|x| x != 0.0)) {
-        return bad("nonzero unit offsets require Level 2 Version 1");
-    }
-
-    let srids: HashSet<String> = m.reactions.iter().flat_map(|r| r.reactants.iter().chain(&r.products))
-        .filter_map(|s| s.id.clone()).collect();
-    if level == 2 {
-        if m.conversion_factor.is_some() || m.species.iter().any(|s| s.conversion_factor.is_some()) {
-            return bad("conversion factors");
-        }
-        if m.compartments.iter().any(|c| c.spatial_dimensions.is_some_and(|d| d.fract() != 0.0)) ||
-            m.unit_definitions.iter().flat_map(|u| &u.units).any(|u| u.exponent.is_some_and(|e| e.fract() != 0.0)) {
-            return bad("non-integer dimensions or unit exponents");
-        }
-        let targets = m.rules.iter().filter_map(|r| r.variable())
-            .chain(m.initial_assignments.iter().map(|a| a.symbol.as_str()))
-            .chain(m.events.iter().flat_map(|e| e.assignments.iter().map(|a| a.variable.as_str())));
-        if from_level == 3 && targets.into_iter().any(|t| srids.contains(t)) {
-            return bad("variable stoichiometry symbols");
-        }
-        if from_level == 3 && m.extent_units.is_some() && m.extent_units != m.substance_units {
-            return bad("separate extent and substance units");
-        }
-    }
-
-    let allowed = |math: &mut Math| -> Result<(), String> {
-        visit_math(math, &mut |node| {
-            match node {
-                Math::Apply(Op::Min | Op::Max | Op::Rem | Op::Quotient | Op::Implies, _) if !l3v2 => {
-                    return bad("MathML operator requires Level 3 Version 2");
-                }
-                Math::CallSymbol(s, _) if s.url == Symbol::RATE_OF && !l3v2 => {
-                    return bad("rateOf requires Level 3 Version 2");
-                }
-                Math::Ident(id) if level == 2 && from_level == 3 && srids.contains(id.as_str()) => {
-                    return bad("species reference used as a MathML symbol");
-                }
-                Math::Symbol(s) if level == 2 && s.url == Symbol::AVOGADRO => {
-                    *node = Math::Number { value: Number::Real(math::AVOGADRO), units: None };
-                }
-                Math::Number { units, .. } if level == 2 => { *units = None; }
-                _ => {}
-            }
-            Ok(())
-        })
-    };
-    let apply = |e: Option<&mut Math>| match e { Some(e) => allowed(e), None => Ok(()) };
-    for f in &mut m.function_definitions { apply(f.math.as_mut())?; }
-    for r in &mut m.rules {
-        let expr = match r {
-            sbml_io::Rule::Assignment { math, .. } | sbml_io::Rule::Rate { math, .. } |
-            sbml_io::Rule::Algebraic { math, .. } => math,
-        };
-        apply(expr.as_mut())?;
-    }
-    for a in &mut m.initial_assignments { apply(a.math.as_mut())?; }
-    for c in &mut m.constraints { apply(c.math.as_mut())?; }
-    for r in &mut m.reactions {
-        for sr in r.reactants.iter_mut().chain(&mut r.products) { apply(sr.stoichiometry_math.as_mut())?; }
-        if let Some(kl) = &mut r.kinetic_law { apply(kl.math.as_mut())?; }
-    }
-    for e in &mut m.events {
-        if let Some(t) = &mut e.trigger { apply(t.math.as_mut())?; }
-        if let Some(d) = &mut e.delay { apply(d.math.as_mut())?; }
-        if let Some(p) = &mut e.priority { apply(p.math.as_mut())?; }
-        for a in &mut e.assignments { apply(a.math.as_mut())?; }
-    }
-
-    for r in &mut m.reactions {
-        if level == 3 {
-            r.reversible.get_or_insert(true);
-            r.fast = if l3v2 { None } else { Some(r.fast.unwrap_or(false)) };
-        } else {
-            r.compartment = None;
-        }
-        if let Some(k) = &mut r.kinetic_law {
-            if (level, version) != (2, 1) { (k.time_units, k.substance_units) = (None, None); }
-        }
-        for sr in r.reactants.iter_mut().chain(&mut r.products) {
-            if level == 3 && from_level == 2 {
-                if sr.stoichiometry_math.is_some() { return bad("stoichiometryMath"); }
-                sr.stoichiometry.get_or_insert(1.0);
-                sr.constant.get_or_insert(true);
-            }
-            if level == 2 {
-                sr.constant = None;
-                if version == 1 { (sr.id, sr.name) = (None, None); }
-            }
-        }
-        if (level, version) == (2, 1) {
-            for sr in &mut r.modifiers { (sr.id, sr.name) = (None, None); }
-        }
-    }
-
-    for c in &mut m.compartments {
-        if level == 3 && from_level == 2 {
-            c.constant.get_or_insert(true);
-            c.spatial_dimensions.get_or_insert(3.0);
-            c.outside = None;
-        }
-        if level == 2 && from_level == 3 && c.units.is_none() {
-            c.units = match c.spatial_dimensions.unwrap_or(3.0) as i32 {
-                1 => m.length_units.clone(), 2 => m.area_units.clone(), 3 => m.volume_units.clone(), _ => None,
-            };
-        }
-    }
-    for s in &mut m.species {
-        if level == 3 && from_level == 2 {
-            s.has_only_substance_units.get_or_insert(false);
-            s.boundary_condition.get_or_insert(false);
-            s.constant.get_or_insert(false);
-        }
-        if level == 3 || version >= 3 { (s.charge, s.spatial_size_units) = (None, None); }
-        if level == 2 && from_level == 3 && s.substance_units.is_none() {
-            s.substance_units.clone_from(&m.substance_units);
-        }
-    }
-    if level == 3 && from_level == 2 {
-        for p in &mut m.parameters { p.constant.get_or_insert(true); }
-    }
-
-    for e in &mut m.events {
-        if level == 3 {
-            e.use_values_from_trigger_time.get_or_insert(true);
-            e.time_units = None;
-            if let Some(t) = &mut e.trigger {
-                t.initial_value.get_or_insert(true);
-                t.persistent.get_or_insert(true);
-            }
-        } else {
-            if e.priority.is_some() { return bad("event priorities"); }
-            if let Some(t) = &mut e.trigger {
-                if t.initial_value == Some(false) || t.persistent == Some(false) {
-                    return bad("non-persistent triggers or an initial trigger value of false");
-                }
-                (t.initial_value, t.persistent) = (None, None);
-            }
-            if version < 4 {
-                if e.use_values_from_trigger_time == Some(false) { return bad("useValuesFromTriggerTime=false"); }
-                e.use_values_from_trigger_time = None;
-            } else {
-                e.use_values_from_trigger_time.get_or_insert(true);
-            }
-            if version >= 3 { e.time_units = None; }
-        }
-    }
-    if level == 2 {
-        if let Some(units) = m.time_units.take() {
-            if units != "time" {
-                let mut time = if let Some(u) = m.unit_definitions.iter().find(|u| u.id == units) { u.clone() }
-                    else { sbml_io::UnitDefinition { units: vec![sbml_io::Unit { kind: units, ..Default::default() }], ..Default::default() } };
-                time.id = "time".into();
-                m.unit_definitions.retain(|u| u.id != "time");
-                m.unit_definitions.push(time);
-            }
-        }
-        (m.substance_units, m.volume_units, m.area_units, m.length_units, m.extent_units) = (None, None, None, None, None);
-    }
-    if (level, version) != (2, 1) {
-        for u in m.unit_definitions.iter_mut().flat_map(|d| &mut d.units) { u.offset = None; }
-    }
-    (doc.level, doc.version) = (level, version);
-    Ok(())
-}
-
-fn visit_math(e: &mut Math, visit: &mut impl FnMut(&mut Math) -> Result<(), String>) -> Result<(), String> {
-    visit(e)?;
-    match e {
-        Math::Apply(_, args) | Math::Call(_, args) | Math::CallSymbol(_, args) => {
-            for arg in args { visit_math(arg, visit)?; }
-        }
-        Math::Root { degree: base, arg } | Math::Log { base, arg } => {
-            if let Some(base) = base { visit_math(base, visit)?; }
-            visit_math(arg, visit)?;
-        }
-        Math::Piecewise { pieces, otherwise } => {
-            for (value, condition) in pieces {
-                visit_math(value, visit)?;
-                visit_math(condition, visit)?;
-            }
-            if let Some(value) = otherwise { visit_math(value, visit)?; }
-        }
-        Math::Semantics { math: body, .. } | Math::Lambda { body, .. } => visit_math(body, visit)?,
-        _ => {}
-    }
-    Ok(())
 }
