@@ -342,6 +342,7 @@ impl<'a> Analyser<'a> {
             self.check_compartment(i);
             self.check_conversion_factor(i);
             self.check_initialisation(i);
+            self.check_subvariable(i);
         }
         self.check_circular_rules();
         self.check_functions();
@@ -395,6 +396,18 @@ impl<'a> Analyser<'a> {
     /// declared (the typo case) and one declared but given nothing are
     /// reported separately. With `initialise_missing` the value is filled in
     /// and the report says so.
+    /// `a.b` names a variable inside submodule `a`; with no submodule `a` it is an error, as in
+    /// libAntimony ("'b' is not a subvariable of 'a'"), not a new parameter called "a.b".
+    fn check_subvariable(&mut self, i: usize) {
+        let symbol = &self.module.symbols[i];
+        let Some((head, rest)) = symbol.name.split_once('.') else { return };
+        let is_sub = self.index.get(head).is_some_and(|&j| self.module.symbols[j].kind == SymbolKind::Submodule);
+        if !is_sub {
+            let (span, msg) = (symbol.span, format!("'{rest}' is not a subvariable of '{head}'"));
+            self.diagnostics.add(Code::UndefinedSymbol, span, msg);
+        }
+    }
+
     fn check_initialisation(&mut self, i: usize) {
         let symbol = &self.module.symbols[i];
         // Names, not quantities: asking their value is a category error.

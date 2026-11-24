@@ -82,3 +82,14 @@ def test_no_libroadrunner():
             "print([m for m in sys.modules if m.split('.')[0] in ('roadrunner', 'libsbml')])")
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, check=True).stdout
     assert out.strip().endswith('[]'), out
+
+
+def test_loada_missing_file_and_dotted_name():
+    """A file name that doesn't exist says so (it used to load as a parameter called 'x.ant'), and the
+    Rust Antimony reader rejects 'a.b' when 'a' is not a submodule, as libAntimony does."""
+    import pytest
+    with pytest.raises(FileNotFoundError, match='not found'):
+        te.loada('no_such_model.ant')
+    import roadrunner_nitro as rn
+    with pytest.raises(ValueError, match='not a subvariable'):
+        rn.antimony_to_sbml('x = 1; a.b = 2')

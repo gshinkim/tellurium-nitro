@@ -14,6 +14,7 @@ from __future__ import print_function, division, absolute_import
 
 import os
 import random
+import re
 import warnings
 import importlib
 import json
@@ -583,6 +584,9 @@ def antimonyToSBML(ant):
         isfile = os.path.isfile(ant)
     except ValueError:
         isfile = False
+    if not isfile and isinstance(ant, str) and re.fullmatch(r'[^\s;]+\.(ant|txt|sb)', ant.strip()):
+        raise FileNotFoundError("Antimony file not found: '{}' (relative paths are relative to the current "
+                                "directory, {})".format(ant.strip(), os.getcwd()))
     if _rust_antimony:
         from roadrunner_nitro import antimony_to_sbml
         try:
