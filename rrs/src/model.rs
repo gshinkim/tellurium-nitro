@@ -815,7 +815,7 @@ impl Model {
             rd[nx + np] = t;
             self.dtape.run(&mut rd);
             let tp = t - rd[tr as usize];
-            let before = hs.t.first().is_some_and(|&t0| tp < t0);
+            let before = tp < hs.t.first().copied().unwrap_or(0.0);
             hs.state_at(tp, s, t, &mut yt);
             rd[..nx].copy_from_slice(&yt);
             rd[nx + np] = tp.min(t);
@@ -1853,26 +1853,42 @@ impl Model {
         ok.then_some(rows)
     }
 
+    pub(crate) fn gillespie_one(&self, w: &mut Work, t0: f64, end: f64,
+                                uniform: impl FnMut() -> f64) -> Option<(f64, f64)> {
+        let mut fired = f64::NAN;
+        let mut last = t0;
+        let ok = self.ssa_run(w, t0, &[end], uniform, Some(&mut fired), |_, t, stop, _| {
+            last = t;
+            stop.is_infinite() || (t >= end && (self.nv != self.nr || !self.dt.is_empty()))
+        });
+        ok.then(|| if fired.is_nan() { (last, end) } else { (fired, fired) })
+    }
+
     /// SSA core: the callback sees the state valid on [t, stop) and whether the segment ends
     /// in a reaction attempt. It returns true to finish. With rate rules (`ssa_hybrid`) the state at t
     /// holds at t only, and stop never passes the next `grid` time.
-    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
-        let (ns, nr) = (self.ns, self.nr);
+    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, grid: &[f64], at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
         let mut rng = Rng::new(seed);
-        crate::rand::seed(seed ^ 0xD157_D157_D157_D157); // distrib draws: this sample's own stream
-        let mut t = t0;
+        crate::rand::seed(seed ^ 0xD157_D157_D157_D157);
         self.events_reset(w);
+        self.ssa_run(w, t0, grid, || rng.unif(), None, at)
+    }
+
+    fn ssa_run(&self, w: &mut Work, t0: f64, grid: &[f64], mut uniform: impl FnMut() -> f64,
+               mut one: Option<&mut f64>, mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
+        let (ns, nr) = (self.ns, self.nr);
+        let mut t = t0;
         let resync = |w: &mut Work| for i in 0..ns { w.amt[i] = w.s[i] * self.vol[i]; };
         resync(w);
         if self.has_events() && self.events_at(w, t).is_none() { return false; }
         resync(w);
-        if self.nv != nr || !self.dt.is_empty() { return self.ssa_hybrid(w, t, &mut rng, grid, at); }
+        if self.nv != nr || !self.dt.is_empty() { return self.ssa_hybrid(w, t, &mut uniform, grid, one, at); }
         loop {
             let Work { rr, v, s, hist, .. } = w;
             self.rates_at(hist, rr, v, s, t);
             let a0: f64 = v[..nr].iter().map(|&a| a.max(0.0)).sum();
             if !a0.is_finite() { return false; }
-            let tn = if a0 > 0.0 { t - rng.unif().ln() / a0 } else { f64::INFINITY };
+            let tn = if a0 > 0.0 { t - uniform().ln() / a0 } else { f64::INFINITY };
             let mut te = w.pend.iter().fold(f64::INFINITY, |m, p| m.min(p.0));
             if self.has_events() { // a trigger that turns with time alone while the state waits (t >= 25)
                 let tb = tn.min(te).min(t + 1e6 * (1.0 + t.abs()));
@@ -1890,11 +1906,12 @@ impl Model {
                 }
             }
             if at(w, t, tn.min(te), tn < te) { return true; }
+            let firing = tn < te;
             if te <= tn { // an event time: no reaction fires; the next waiting time is drawn afresh (memoryless)
                 t = te;
             } else {
                 t = tn;
-                let (mut r, mut j) = (rng.unif() * a0, nr);
+                let (mut r, mut j) = (uniform() * a0, nr);
                 for jj in 0..nr { // ponytail: linear search + full propensity recompute; dependency graph if nr is large
                     let a = w.v[jj].max(0.0);
                     if a > 0.0 { j = jj; if r <= a { break; } r -= a; }
@@ -1903,6 +1920,12 @@ impl Model {
             }
             if self.has_events() {
                 match self.events_at(w, t) { None => return false, Some(true) => resync(w), _ => {} }
+            }
+            if firing {
+                if let Some(time) = one.as_deref_mut() {
+                    *time = t;
+                    return true;
+                }
             }
         }
     }
@@ -1923,7 +1946,8 @@ impl Model {
     /// control) from each segment start; a reaction fires when A reaches r = -ln U. A segment ends
     /// at a firing, a trigger change (bisection), a pending event or the next `grid` time; `at`
     /// then sees the state at the segment start. Algebraic states are not supported (false).
-    fn ssa_hybrid(&self, w: &mut Work, mut t: f64, rng: &mut Rng, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
+    fn ssa_hybrid(&self, w: &mut Work, mut t: f64, uniform: &mut impl FnMut() -> f64, grid: &[f64],
+                  mut one: Option<&mut f64>, mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
         if self.alg.contains(&true) { return false; }
         let (ns, nr, ev) = (self.ns, self.nr, self.has_events());
         let (rtol, atol) = (1e-8, 1e-10);
@@ -1965,7 +1989,7 @@ impl Model {
             let cap = w.pend.iter().fold(tg, |m, p| m.min(p.0));
             if cap == f64::INFINITY { return at(w, t, cap, false); } // past the last grid time: `at` finishes
             let y0 = w.s.clone();
-            let r = -rng.unif().ln();
+            let r = -uniform().ln();
             for (x, &(i, _)) in z.iter_mut().zip(&rrc) { *x = w.s[i]; }
             z[nz - 1] = 0.0;
             let mut tc = t;
@@ -2012,11 +2036,12 @@ impl Model {
             std::mem::swap(&mut w.s, &mut y1);
             load(w, &z);
             t = tc;
-            if z[nz - 1] >= r { // a reaction fires at t, chosen by the propensities at t
+            let firing = z[nz - 1] >= r;
+            if firing { // a reaction fires at t, chosen by the propensities at t
                 let Work { rr, v, s, hist, .. } = w;
                 self.rates_at(hist, rr, v, s, t);
                 let a0: f64 = v[..nr].iter().map(|&a| a.max(0.0)).sum();
-                let (mut u, mut j) = (rng.unif() * a0, nr);
+                let (mut u, mut j) = (uniform() * a0, nr);
                 for jj in 0..nr {
                     let a = w.v[jj].max(0.0);
                     if a > 0.0 { j = jj; if u <= a { break; } u -= a; }
@@ -2025,6 +2050,12 @@ impl Model {
             }
             if ev {
                 match self.events_at(w, t) { None => return false, Some(true) => for i in 0..ns { w.amt[i] = w.s[i] * self.vol[i] }, _ => {} }
+            }
+            if firing {
+                if let Some(time) = one.as_deref_mut() {
+                    *time = t;
+                    return true;
+                }
             }
         }
     }

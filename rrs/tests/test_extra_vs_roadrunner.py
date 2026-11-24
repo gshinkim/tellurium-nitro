@@ -121,15 +121,6 @@ def test_internal_one_step_and_more():
     assert 0 < t < 1
     np.testing.assert_allclose(r.getValue('S1'), 10 * np.exp(-0.3 * (t + first_time)), rtol=1e-6)
     np.testing.assert_allclose(r2.getValue('S1'), 9.96920291374347, rtol=1e-12)
-    with np.load(os.path.join(REF, 'chain.npz')) as ref:
-        supported = ref['extra/0/internal_step_support']
-        for n, accepts in zip(('cvode', 'rk45', 'gillespie', 'rk4', 'euler'), supported):
-            r2.setIntegrator(n)
-            if accepts:
-                assert r2.internalOneStep(0, 1.0) > 0
-            else:
-                with pytest.raises(ValueError, match='no internal'):
-                    r2.internalOneStep(0, 1.0)
     # frequency response, exactly: H = k0 X / (iw + k1) for S1 of the chain's first step
     c = rn.RoadRunner(rn.antimony_to_sbml(ANT['chain']))
     f = c.getFrequencyResponse(0.1, 2, 5, 'k0', 'S1', False, False)
@@ -142,6 +133,41 @@ def test_internal_one_step_and_more():
     assert e.getEventRoots() == [-1.0] and e.getEventRoots(3.0) == [1.0]
     assert 0 < e.getRandom() < 1
 
+
+
+@pytest.mark.parametrize("name", ("euler", "rk4", "gillespie", "gillespie_inactive"))
+def test_internal_one_step_fixed_and_stochastic(name):
+    from make_limits_reference import DECAY, REFERENCE
+
+    model = DECAY.replace("S1 = 10", "S1 = 0") if name == "gillespie_inactive" else DECAY
+    integrator = name.removesuffix("_inactive")
+    r = rn.RoadRunner(rn.antimony_to_sbml(model))
+    r.setIntegrator(integrator)
+    if integrator == "gillespie":
+        r.setSeed(42)
+    t = 2.0
+    rows = []
+    for reset in (True, False):
+        t = r.internalOneStep(t, 0.1, reset)
+        rows.append([t, r.getCurrentTime(), r["S1"], r["S2"]])
+    with np.load(REFERENCE) as ref:
+        np.testing.assert_allclose(rows, ref[name], rtol=1e-13, atol=1e-14)
+
+
+def test_delayed_trigger_roots_use_simulation_history():
+    from make_limits_reference import DELAY, REFERENCE
+
+    r = rn.RoadRunner(rn.antimony_to_sbml(DELAY))
+    r.simulate(0, 2, 9)
+    with np.load(REFERENCE) as ref:
+        assert r.getNumPiecewiseTriggers() == ref["num_piecewise"]
+        for i, t in enumerate((1.25, 1.75)):
+            np.testing.assert_array_equal(r.getPiecewiseTriggerRoots(t), ref["piecewise"][i])
+            np.testing.assert_array_equal(r.getEventRoots(t), ref["events"][i])
+            np.testing.assert_array_equal(r.getPiecewiseTriggerRoots(t, [10]), ref["piecewise"][i])
+            np.testing.assert_array_equal(r.getEventRoots(t, [10]), ref["events"][i])
+    assert r.getCurrentTime() == 2
+    assert r["S"] == pytest.approx(2)
 
 
 def test_facade_matrices_and_selection_types():
@@ -293,8 +319,7 @@ def test_sbml_conversion_rejects_unsupported_features():
     from tellurium_nitro.roadrunner.extended_roadrunner import RoadRunner
 
     r = RoadRunner(rn.antimony_to_sbml(ANT['rules']))
-    with pytest.raises(ValueError, match='initial assignments'):
-        r.getSBML(2, 1)
+    assert RoadRunner(r.getSBML(2, 1))['S2'] == r['S2']
     assert RoadRunner(r.getCurrentSBML(2, 1))['S2'] == r['S2']
 
     r = RoadRunner(rn.antimony_to_sbml("J: S -> ; max(1, S); S = 3"))
