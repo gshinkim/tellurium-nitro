@@ -219,6 +219,39 @@ pub struct Work {
     pub atol_scale: Vec<f64>,
     /// solver counters since the last reset: [BDF steps, Rodas4 steps, rejected steps, BDF->Rodas4 switches]
     pub stats: [usize; 4],
+    pub ctl: Ctl,
+    /// variable-step output (ctl.var): (times, rows of outs)
+    pub rows: (Vec<f64>, Vec<f64>),
+}
+
+/// libroadrunner integrator settings the solvers honour (0 / false: unset, as upstream). CVODE:
+/// initial / minimum / maximum step size, maximum steps between outputs (mxstep), maximum BDF
+/// order, a row per step (variable_step_size, at most max_rows rows), multi (multiple_steps: an
+/// output time between steps reports the state at the end of the step past it). Gillespie: max_steps
+/// (firings between outputs), nonneg (skip firings that would make an amount negative).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Ctl {
+    pub h0: f64,
+    pub hmin: f64,
+    pub hmax: f64,
+    pub max_steps: usize,
+    pub max_order: usize,
+    pub nonstiff: bool,
+    pub var: bool,
+    pub max_rows: usize,
+    pub multi: bool,
+    pub nonneg: bool,
+}
+
+impl Ctl {
+    /// Step size h within [hmin, hmax].
+    fn lim(&self, h: f64) -> f64 { let h = h.max(self.hmin); if self.hmax > 0.0 { h.min(self.hmax) } else { h } }
+    // CV_ONE_STEP calls have their own step budget: each call takes at most one step.
+    fn step_limit(&self) -> usize {
+        if self.var || self.multi || self.max_steps == 0 { usize::MAX } else { self.max_steps }
+    }
+    /// Factor of a step size reduction from h, stopping at hmin; None (failure) if h is already there.
+    fn shrink(&self, h: f64, fac: f64) -> Option<f64> { if h <= self.hmin { None } else { Some(fac.max(self.hmin / h)) } }
 }
 
 /// Variable-order (1-5) BDF state: scaled backward differences D (rows of nx), as scipy's BDF /
@@ -671,7 +704,7 @@ impl Model {
             yn: z(nx), dy: z(nx), fx: z(nx), f0: z(nx), k: std::array::from_fn(|_| z(nx)), jf: z(nx * nx), pivf: vec![0; nx],
             lo: vec![], up: vec![], xm: z(ni * nr),
             ra: self.aux.regs(), y0: z(nx), d1: z(nx), d2: z(nx), prev: vec![false; self.events.len()], prevc: vec![false; self.comps.len()],
-            pend: vec![], tmp: vec![], amt: z(nx), atol_scale: vec![1.0; nx], stats: [0; 4],
+            pend: vec![], tmp: vec![], amt: z(nx), atol_scale: vec![1.0; nx], stats: [0; 4], ctl: Ctl::default(), rows: (vec![], vec![]),
             bdf: Bdf { d: z((BDF_MAX + 3) * nx), jev: z(self.jac.len() + self.dt.len()), sc: std::array::from_fn(|_| z(nx)), ..Default::default() },
             hist: Hist { rd: Mutex::new(self.dtape.regs()), yt: Mutex::new(z(nx)), ..Default::default() },
             rng: Rng::new(0x5eed_e7e7),
@@ -917,8 +950,9 @@ impl Model {
     fn step(&self, w: &mut Work, t: f64, t1: f64, h: &mut f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
         let nj = self.jac.len();
-        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, stats: w_stats, hist, .. } = w;
-        if !(*h > 0.0) { *h = (1e-6 * (t1 - t).abs()).max(1e-12); }
+        let Work { rr, rf, v, ev, s: y, yn, dy, fx, f0, k, jf, pivf, y0, lo, up, atol_scale: asc, stats: w_stats, hist, ctl, .. } = w;
+        if !(*h > 0.0) { *h = if ctl.h0 > 0.0 { ctl.h0 } else { (1e-6 * (t1 - t).abs()).max(1e-12) }; }
+        *h = ctl.lim(*h);
         self.full_at(hist, rf, v, ev, y, t);
         self.rhs(v, f0);
         if !self.dt.is_empty() {
@@ -944,7 +978,7 @@ impl Model {
                 for (i, p) in pivf.iter_mut().enumerate() { *p = i; }
             } else {
                 fill(jf, true);
-                if !lu(jf, nx, pivf, 0.0) { *h *= 0.25; rejected = true; w_stats[2] += 1; continue; }
+                if !lu(jf, nx, pivf, 0.0) { *h = hh * ctl.shrink(hh, 0.25)?; rejected = true; w_stats[2] += 1; continue; }
                 lu_pattern(jf, nx, lo, up);
             }
             // stage 1
@@ -987,10 +1021,10 @@ impl Model {
                 w_stats[1] += 1;
                 let mut hn = hh * (0.9 * err.powf(-0.25)).clamp(0.2, 6.0);
                 if rejected { hn = hn.min(hh); }
-                if !(clipped && hn > hh) { *h = hn; }
+                if !(clipped && hn > hh) { *h = ctl.lim(hn); }
                 return Some(if clipped { t1 } else { t + hh });
             }
-            *h = hh * if ok { (0.9 * err.powf(-0.25)).clamp(0.2, 1.0) } else { 0.25 };
+            *h = hh * ctl.shrink(hh, if ok { (0.9 * err.powf(-0.25)).clamp(0.2, 1.0) } else { 0.25 })?;
             rejected = true;
             w_stats[2] += 1;
         }
@@ -1028,7 +1062,8 @@ impl Model {
     /// Returns the new time.
     fn bdf_step(&self, w: &mut Work, t: f64, t1: f64, rtol: f64, atol: f64) -> Option<f64> {
         let nx = self.nx;
-        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, stats: w_stats, hist, .. } = w;
+        let Work { rr, rf, v, ev, s: y, jf, pivf, lo, up, tmp, bdf: b, atol_scale: asc, stats: w_stats, hist, ctl, .. } = w;
+        let max_order = if ctl.max_order > 0 { ctl.max_order.min(BDF_MAX) } else { BDF_MAX };
         let Bdf { d, order, h, t: bt, neq, lu: has_lu, lufac, crate_, jev, sc, nlu, jage, defer } = b;
         let [yp, psi, dd, yn, f, dy, wt] = sc; // wt: inverse error weights 1 / (atol * scale + rtol |y|)
         tmp.resize(BDF_MAX + 3, 0.0);
@@ -1044,7 +1079,7 @@ impl Model {
             self.rhs(v, dy);
             let d2 = rms(nx, |i| (dy[i] - f[i]) * wt[i]) / h0;
             let h1 = if d1 <= 1e-15 && d2 <= 1e-15 { (h0 * 1e-3).max(1e-6) } else { (0.01 / d1.max(d2)).sqrt() };
-            *h = (100.0 * h0).min(h1).min(t1 - t);
+            *h = ctl.lim(if ctl.h0 > 0.0 { ctl.h0 } else { (100.0 * h0).min(h1) }).min(t1 - t);
             d.fill(0.0);
             d[..nx].copy_from_slice(y);
             for i in 0..nx { d[nx + i] = f[i] * *h; }
@@ -1130,8 +1165,9 @@ impl Model {
             };
             if !converged {
                 w_stats[2] += 1;
-                *h *= 0.25;
-                rescale(d, tmp, *order, 0.25);
+                let fac = ctl.shrink(*h, 0.25)?;
+                *h *= fac;
+                rescale(d, tmp, *order, fac);
                 *neq = 0;
                 continue;
             }
@@ -1143,6 +1179,7 @@ impl Model {
                 let mut fac = if nef > 3 { 0.1 } else { (1.0 / ((6.0 * en).powf(1.0 / (k as f64 + 1.0)) + 1e-6)).max(0.1) };
                 if nef >= 2 { fac = fac.min(0.2); }
                 if nef > 3 && k > 1 { *order = k - 1; }
+                let fac = ctl.shrink(*h, fac)?;
                 *h *= fac;
                 rescale(d, tmp, *order, fac);
                 *neq = 0;
@@ -1169,11 +1206,11 @@ impl Model {
         let (mut fac, mut nk) = (eta(err_norm, k + 1, 6.0), k);
         if *neq >= k + 1 {
             let em = if k > 1 { let e = BDF_ERR[k - 1]; eta(rms(nx, |i| e * d[k * nx + i] * wt[i]), k, 6.0) } else { 0.0 };
-            let ep = if k < BDF_MAX { let e = BDF_ERR[k + 1]; eta(rms(nx, |i| e * d[(k + 2) * nx + i] * wt[i]), k + 2, 10.0) } else { 0.0 };
+            let ep = if k < max_order { let e = BDF_ERR[k + 1]; eta(rms(nx, |i| e * d[(k + 2) * nx + i] * wt[i]), k + 2, 10.0) } else { 0.0 };
             if em > fac && em >= ep { (fac, nk) = (em, k - 1) } else if ep > fac { (fac, nk) = (ep, k + 1) }
         }
         if fac < 1.5 { return Some(ynew_t); } // small gain: keep h and order (and the LU)
-        fac = fac.min(10.0);
+        fac = ctl.lim(*h * fac.min(10.0)) / *h;
         if nk != k { *order = nk; *neq = 0; }
         *h *= fac;
         rescale(d, tmp, *order, fac);
@@ -1419,23 +1456,35 @@ impl Model {
     /// roadrunner simulate call that continues from the previous one.
     pub fn simulate_cont(&self, w: &mut Work, times: &[f64], rtol: f64, atol: f64, outs: &[u32], out: &mut [f64]) -> bool {
         crate::rand::seed(w.rng.next_u64()); // distrib draws
+        w.rows.0.clear();
+        w.rows.1.clear();
         if self.alg.contains(&true) { return self.simulate_dae(w, times, rtol, atol, outs, out); }
         let (no, nt) = (outs.len(), times.len());
         let ev = self.has_events();
         let tend = times[nt - 1];
         let mut t = times[0];
-        let mut bdf = rtol < BDF_BELOW_RTOL; // BDF wins at tight tolerances, Rodas4 at loose ones
+        // Prefer the one-step method in nonstiff mode. The stiff default uses BDF at tight
+        // tolerances, or whenever a lower BDF order was explicitly requested.
+        let mut bdf = !w.ctl.nonstiff && (rtol < BDF_BELOW_RTOL || (1..BDF_MAX).contains(&w.ctl.max_order));
         let dl = !self.dly.is_empty(); // delay(): one-step Rodas4, steps no longer than the shortest delay
         if dl { bdf = false; }
         w.bdf.order = 0;
         if ev && self.events_at(w, t).is_none() { return false; }
         if dl && w.hist.t.last().is_none_or(|&x| x < t) { self.hist_push(w, t); }
-        let (mut h, mut q) = (0.0, 0);
+        let (mut h, mut q, mut n) = (0.0, 0, 0); // n: steps since the last output
+        if !self.push_row(w, t, outs) { return true; }
         for _ in 0..MAX_STEPS * 10 {
-            while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; }
+            while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; n = 0; }
             if q == nt { return true; }
-            let t1 = w.pend.iter().fold(tend, |m, p| m.min(p.0));
-            if dl { let cap = self.delay_cap(w, t); if h > cap { h = cap; } }
+            n += 1;
+            if n > w.ctl.step_limit() { return false; }
+            let mut t1 = w.pend.iter().fold(tend, |m, p| m.min(p.0));
+            // Clip at the delay boundary even when the solver's requested minimum is larger.
+            if dl {
+                let cap = self.delay_cap(w, t);
+                if h > cap { h = cap; }
+                if w.ctl.hmin > cap || (h == 0.0 && w.ctl.h0 > cap) { t1 = t1.min(t + cap); }
+            }
             let mut step = if bdf { self.bdf_step(w, t, t1, rtol, atol) } else { self.step(w, t, t1, &mut h, rtol, atol) };
             if step.is_none() && bdf { // BDF gave up (e.g. loose atol on a near-singular system): Rodas4 from here
                 bdf = false;
@@ -1448,13 +1497,14 @@ impl Model {
                 let Work { ra, s, prev, prevc, hist, .. } = w;
                 if self.changed(hist, ra, prev, prevc, s, tn) { te = self.locate(w, t, tn, bdf); }
             }
-            if q < nt && times[q] < te { // interior output points from the dense output
+            if q < nt && times[q] < te && !w.ctl.multi { // interior output points from the dense output
                 if !bdf { self.dense_coef(w); }
                 while q < nt && times[q] < te {
                     if bdf { self.bdf_interp(w, times[q]) } else { self.interp(w, (times[q] - t) / (tn - t)) }
                     let Work { ra, yn, hist, .. } = w;
                     self.record_y(hist, ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
                     q += 1;
+                    n = 0;
                 }
             }
             if te < tn && bdf { // state at the event from the interpolant; restart after it
@@ -1467,12 +1517,31 @@ impl Model {
             }
             t = te;
             self.hist_push(w, t);
+            if !self.push_row(w, t, outs) { return true; } // variable steps: the row before the events
             if ev {
-                match self.events_at(w, t) { None => return false, Some(fired) => if fired || te < tn { w.bdf.order = 0 } }
+                let fired = match self.events_at(w, t) { None => return false, Some(f) => f };
+                if fired || te < tn { w.bdf.order = 0; n = 0; }
                 if dl { self.hist_push(w, t); } // the state after the events, at the same time
+                if fired && !self.push_row(w, t, outs) { return true; } // and after them
+            }
+            while w.ctl.multi && q < nt && times[q] < t { // CV_ONE_STEP: state from the step past the output
+                self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                q += 1;
             }
         }
         false
+    }
+
+    /// With ctl.var, a row of `outs` at t into w.rows (as libroadrunner's variable-step simulate);
+    /// false when it has ctl.max_rows rows (0: no limit).
+    fn push_row(&self, w: &mut Work, t: f64, outs: &[u32]) -> bool {
+        let Work { hist, ra, s, rows: (ts, ys), ctl, .. } = w;
+        if !ctl.var { return true; }
+        ts.push(t);
+        let n = ys.len();
+        ys.resize(n + outs.len(), 0.0);
+        self.record_y(hist, ra, s, t, outs, &mut ys[n..]);
+        ctl.max_rows == 0 || ts.len() < ctl.max_rows
     }
 
     /// Time course of a DAE model (algebraic states: M = diag(1 | 0)) with diffsol's BDF. Each
@@ -1491,7 +1560,8 @@ impl Model {
         let hs = Hist::default(); // no delay() on this path
         let atols: Vec<f64> = (0..nx).map(|i| atol * w.atol_scale[i]).collect();
         let get = |y: &NalgebraVec<f64>, o: &mut [f64]| for (i, x) in o.iter_mut().enumerate() { *x = y.get_index(i) };
-        let (mut t, mut q, mut steps) = (times[0], 0, 0);
+        let ctl = w.ctl;
+        let (mut t, mut q, mut steps, mut n, mut row) = (times[0], 0, 0, 0, true); // row: a variable-step row due after the events
         'seg: loop {
             // a fresh problem per segment: events may have changed parameters and states
             let (rr, rf) = (RefCell::new(w.rr.clone()), RefCell::new(w.rf.clone()));
@@ -1514,22 +1584,38 @@ impl Model {
                 for i in 0..nx { y[i] = if self.alg[i] { 0.0 } else { u[i] } + beta * y[i]; }
             };
             let init = |_p: &[f64], _t: f64, y: &mut [f64]| y.copy_from_slice(&y0);
-            let Ok(problem) = OdeBuilder::<NalgebraMat<f64>>::new().t0(t).rtol(rtol).atol(atols.clone())
+            let Ok(mut problem) = OdeBuilder::<NalgebraMat<f64>>::new().t0(t).rtol(rtol).atol(atols.clone())
                 .rhs_implicit(rhs, jac).mass(mass).init(init, nx).build() else { return false };
+            // Algebraic equations always use BDF, even with stiff=false.
+            problem.ode_options.min_timestep = ctl.hmin.max(f64::EPSILON);
+            if ctl.max_steps > 0 { problem.ode_options.max_number_timesteps = MAX_STEPS * 10; }
             let Ok(mut solver) = problem.bdf::<NalgebraLU<f64>>() else { return false };
+            let h0 = ctl.lim(if ctl.h0 > 0.0 { ctl.h0 } else { solver.state().h });
+            if h0 != solver.state().h { *solver.state_mut().h = h0; }
             get(solver.state().y, &mut w.s); // consistent algebraic states
             steps += 1;
             if steps > MAX_STEPS * 10 { return false; }
             if has_ev { // events see the consistent state; a firing restarts (algebraic states follow)
-                match self.events_at(w, t) { None => return false, Some(true) => continue 'seg, Some(false) => {} }
+                match self.events_at(w, t) { None => return false, Some(true) => { row = true; continue 'seg } Some(false) => {} }
             }
-            while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; }
+            if std::mem::replace(&mut row, false) && !self.push_row(w, t, outs) { return true; }
+            while q < nt && times[q] <= t {
+                self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                q += 1;
+                n = 0;
+            }
             if q == nt { return true; }
-            if solver.set_stop_time(w.pend.iter().fold(tend, |m, p| m.min(p.0))).is_err() { return false; }
+            let segment_end = w.pend.iter().fold(tend, |m, p| m.min(p.0));
             let mut ta = t; // start of the current step
             loop {
                 steps += 1;
-                if steps > MAX_STEPS * 10 { return false; }
+                n += 1;
+                if steps > MAX_STEPS * 10 || n > ctl.step_limit() { return false; }
+                // diffsol exposes its proposed order, but has no adaptive order cap.
+                // Marking the state modified makes its next step restart at order one.
+                if ctl.max_order > 0 && solver.order() > ctl.max_order { let _ = solver.state_mut(); }
+                let cap = if ctl.hmax > 0.0 { segment_end.min(ta + ctl.hmax) } else { segment_end };
+                if solver.set_stop_time(cap).is_err() { return false; }
                 let Ok(reason) = solver.step() else { return false };
                 let tn = solver.state().t;
                 get(solver.state().y, &mut w.yn);
@@ -1554,21 +1640,35 @@ impl Model {
                     }
                 }
                 while q < nt && times[q] < te { // output points inside the step from the interpolant
-                    let Ok(y) = solver.interpolate(times[q]) else { return false };
-                    get(&y, &mut w.yn);
+                    if !ctl.multi || te < tn {
+                        let Ok(y) = solver.interpolate(if ctl.multi { te } else { times[q] }) else { return false };
+                        get(&y, &mut w.yn);
+                    }
                     let Work { ra, yn, hist, .. } = w;
                     self.record_y(hist, ra, yn, times[q], outs, &mut out[q * no..(q + 1) * no]);
                     q += 1;
+                    n = 0;
                 }
-                if te < tn || matches!(reason, OdeSolverStopReason::TstopReached) {
+                if te < tn || (cap == segment_end && matches!(reason, OdeSolverStopReason::TstopReached)) {
                     if te < tn {
                         let Ok(y) = solver.interpolate(te) else { return false };
                         get(&y, &mut w.s);
                     } else {
-                        w.s.copy_from_slice(&w.yn);
+                        get(solver.state().y, &mut w.s);
                     }
                     t = te;
+                    n = 0;
+                    if !self.push_row(w, t, outs) { return true; }
                     continue 'seg;
+                }
+                if ctl.var || (q < nt && times[q] <= tn) {
+                    get(solver.state().y, &mut w.s);
+                    if !self.push_row(w, tn, outs) { return true; }
+                    while q < nt && times[q] <= tn {
+                        self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                        q += 1;
+                        n = 0;
+                    }
                 }
                 ta = tn;
             }
@@ -1578,18 +1678,38 @@ impl Model {
     /// Gillespie direct method from the loaded state (concentrations; amounts = conc * volume,
     /// propensity = rate law at concentrations). Events are checked after every reaction and at
     /// their delayed execution times. Outputs as in `simulate`.
+    /// The firing limit applies to each reporting interval (or maximum-time-step subdivision).
     pub fn gillespie(&self, w: &mut Work, times: &[f64], seed: u64, outs: &[u32], out: &mut [f64]) -> bool {
-        let (no, mut q) = (outs.len(), 0);
-        self.ssa(w, times[0], seed, times, |w, _, stop| {
-            while q < times.len() && times[q] < stop { self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]); q += 1; }
-            q == times.len()
-        })
+        let ctl = w.ctl;
+        let hmax = if ctl.hmax > ctl.hmin { ctl.hmax } else { 0.0 };
+        let (no, mut q, mut n, mut over) = (outs.len(), 0, 0, false);
+        let mut window = times[0];
+        self.ssa(w, times[0], seed, times, |w, _, stop, firing| {
+            while q < times.len() && times[q] < stop {
+                self.record(w, times[q], outs, &mut out[q * no..(q + 1) * no]);
+                window = times[q];
+                q += 1;
+                n = 0;
+            }
+            if q == times.len() { return true; }
+            if hmax > 0.0 && stop > window + hmax {
+                // Constant-rate waiting times are memoryless. Keep the sampled firing, but
+                // reset the budget at any reporting subdivisions that it passes.
+                window += (((stop - window) / hmax).ceil() - 1.0) * hmax;
+                n = 0;
+            }
+            n += usize::from(firing);
+            let target = if hmax > 0.0 { times[q].min(window + hmax) } else { times[q] };
+            over = firing && ctl.max_steps > 0 && n >= ctl.max_steps && stop < target;
+            over
+        }) && !over
     }
 
     /// Variable-step Gillespie from t0 to t1: an output row (time, then `outs`) at t0, after every
     /// reaction firing or event, and at t1; at most max_rows rows. None on failure.
     pub fn gillespie_steps(&self, w: &mut Work, t0: f64, t1: f64, seed: u64, outs: &[u32], max_rows: usize) -> Option<Vec<f64>> {
         let no = outs.len() + 1;
+        let max_rows = if max_rows == 0 { usize::MAX } else { max_rows };
         let mut rows: Vec<f64> = vec![];
         let mut row = vec![0.0; outs.len()];
         let mut push = |w: &mut Work, t: f64, rows: &mut Vec<f64>| {
@@ -1597,18 +1717,30 @@ impl Model {
             rows.push(t);
             rows.extend_from_slice(&row);
         };
-        let ok = self.ssa(w, t0, seed, &[t1], |w, t, stop| {
+        let hmax = w.ctl.hmax;
+        let ok = self.ssa(w, t0, seed, &[t1], |w, t, stop, _| {
             push(w, t.min(t1), &mut rows);
-            if stop > t1 && t < t1 { push(w, t1, &mut rows); }
-            t >= t1 || stop > t1 || rows.len() / no >= max_rows.max(2) // stop == t1: the row at t1 comes next
+            if rows.len() / no == max_rows || t >= t1 { return true; }
+            if stop > t1 {
+                // A finite waiting time may exceed the cap in single-step mode. With
+                // no more reactions, libroadrunner advances by the capped request.
+                let mut k = 1.0;
+                while stop.is_infinite() && hmax > 0.0 && t + k * hmax < t1 && rows.len() / no < max_rows {
+                    push(w, t + k * hmax, &mut rows);
+                    k += 1.0;
+                }
+                if rows.len() / no < max_rows { push(w, t1, &mut rows); }
+                return true;
+            }
+            false
         });
         ok.then_some(rows)
     }
 
-    /// SSA core: `at(w, t, stop)` is called with the state valid on [t, stop) (stop = next firing
-    /// or event time) and returns true to finish. With rate rules (`ssa_hybrid`) the state at t
+    /// SSA core: the callback sees the state valid on [t, stop) and whether the segment ends
+    /// in a reaction attempt. It returns true to finish. With rate rules (`ssa_hybrid`) the state at t
     /// holds at t only, and stop never passes the next `grid` time.
-    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64) -> bool) -> bool {
+    fn ssa(&self, w: &mut Work, t0: f64, seed: u64, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
         let (ns, nr) = (self.ns, self.nr);
         let mut rng = Rng::new(seed);
         crate::rand::seed(seed ^ 0xD157_D157_D157_D157); // distrib draws: this sample's own stream
@@ -1618,7 +1750,7 @@ impl Model {
         resync(w);
         if self.has_events() && self.events_at(w, t).is_none() { return false; }
         resync(w);
-        if self.nv != nr { return self.ssa_hybrid(w, t, &mut rng, grid, at); }
+        if self.nv != nr || !self.dt.is_empty() { return self.ssa_hybrid(w, t, &mut rng, grid, at); }
         loop {
             let Work { rr, v, s, hist, .. } = w;
             self.rates_at(hist, rr, v, s, t);
@@ -1641,7 +1773,7 @@ impl Model {
                     te = te.min(hi);
                 }
             }
-            if at(w, t, tn.min(te)) { return true; }
+            if at(w, t, tn.min(te), tn < te) { return true; }
             if te <= tn { // an event time: no reaction fires; the next waiting time is drawn afresh (memoryless)
                 t = te;
             } else {
@@ -1651,15 +1783,22 @@ impl Model {
                     let a = w.v[jj].max(0.0);
                     if a > 0.0 { j = jj; if r <= a { break; } r -= a; }
                 }
-                for &(i, n) in &self.col[j] {
-                    let i = i as usize;
-                    w.amt[i] += n;
-                    w.s[i] = w.amt[i] / self.vol[i];
-                }
+                self.fire(w, j);
             }
             if self.has_events() {
                 match self.events_at(w, t) { None => return false, Some(true) => resync(w), _ => {} }
             }
+        }
+    }
+
+    /// Reaction j fires (w.ctl.nonneg: not if an amount would go negative, as libroadrunner's
+    /// nonnegative).
+    fn fire(&self, w: &mut Work, j: usize) {
+        if w.ctl.nonneg && self.col[j].iter().any(|&(i, n)| w.amt[i as usize] + n < 0.0) { return; }
+        for &(i, n) in &self.col[j] {
+            let i = i as usize;
+            w.amt[i] += n;
+            w.s[i] = w.amt[i] / self.vol[i];
         }
     }
 
@@ -1668,7 +1807,7 @@ impl Model {
     /// control) from each segment start; a reaction fires when A reaches r = -ln U. A segment ends
     /// at a firing, a trigger change (bisection), a pending event or the next `grid` time; `at`
     /// then sees the state at the segment start. Algebraic states are not supported (false).
-    fn ssa_hybrid(&self, w: &mut Work, mut t: f64, rng: &mut Rng, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64) -> bool) -> bool {
+    fn ssa_hybrid(&self, w: &mut Work, mut t: f64, rng: &mut Rng, grid: &[f64], mut at: impl FnMut(&mut Work, f64, f64, bool) -> bool) -> bool {
         if self.alg.contains(&true) { return false; }
         let (ns, nr, ev) = (self.ns, self.nr, self.has_events());
         let (rtol, atol) = (1e-8, 1e-10);
@@ -1708,7 +1847,7 @@ impl Model {
         loop {
             let tg = grid.get(grid.partition_point(|&g| g <= t)).copied().unwrap_or(f64::INFINITY);
             let cap = w.pend.iter().fold(tg, |m, p| m.min(p.0));
-            if cap == f64::INFINITY { return at(w, t, cap); } // past the last grid time: `at` finishes
+            if cap == f64::INFINITY { return at(w, t, cap, false); } // past the last grid time: `at` finishes
             let y0 = w.s.clone();
             let r = -rng.unif().ln();
             for (x, &(i, _)) in z.iter_mut().zip(&rrc) { *x = w.s[i]; }
@@ -1718,6 +1857,7 @@ impl Model {
             while tc < cap { // adaptive RK4 to the first hit or cap
                 steps += 1;
                 if steps > MAX_STEPS * 100 { return false; }
+                if w.ctl.hmax > w.ctl.hmin { h = h.min(w.ctl.hmax); }
                 let last = h >= cap - tc;
                 if last { h = cap - tc; }
                 rk4(w, tc, h, &z, &mut z1, &mut b);
@@ -1752,7 +1892,7 @@ impl Model {
             }
             // report the segment start, then move to its end
             let mut y1 = std::mem::replace(&mut w.s, y0);
-            if at(w, t, tc) { return true; }
+            if at(w, t, tc, z[nz - 1] >= r) { return true; }
             std::mem::swap(&mut w.s, &mut y1);
             load(w, &z);
             t = tc;
@@ -1765,13 +1905,7 @@ impl Model {
                     let a = w.v[jj].max(0.0);
                     if a > 0.0 { j = jj; if u <= a { break; } u -= a; }
                 }
-                if j < nr {
-                    for &(i, n) in &self.col[j] {
-                        let i = i as usize;
-                        w.amt[i] += n;
-                        w.s[i] = w.amt[i] / self.vol[i];
-                    }
-                }
+                if j < nr { self.fire(w, j); }
             }
             if ev {
                 match self.events_at(w, t) { None => return false, Some(true) => for i in 0..ns { w.amt[i] = w.s[i] * self.vol[i] }, _ => {} }

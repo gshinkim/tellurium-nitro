@@ -663,7 +663,13 @@ def test_integrator_and_solver_settings():
     assert L.resetCurrentIntegratorParameters(h) == 1 and L.getCurrentIntegratorParameterDouble(h, b'relative_tolerance') == 1e-6
     assert L.setCurrentIntegratorParameterDouble(h, b'nope', 1.0) == -1 and "no setting 'nope'" in err()
     assert L.getCurrentIntegratorParameterDouble(h, b'nope') == -1.0
-    assert L.setCurrentIntegratorParameterBoolean(h, b'variable_step_size', 1) == -1  # cvode: not honoured, refused
+    assert L.getCurrentIntegratorParameterType(h, b'variable_step_size') == 2
+    assert L.setCurrentIntegratorParameterBoolean(h, b'variable_step_size', 1) == 1
+    assert L.getCurrentIntegratorParameterBoolean(h, b'variable_step_size') == 1
+    for key in (b'initial_time_step', b'minimum_time_step', b'maximum_time_step'):
+        assert L.getCurrentIntegratorParameterType(h, key) == 8
+        assert L.setCurrentIntegratorParameterDouble(h, key, 0.02) == 1
+        assert L.getCurrentIntegratorParameterDouble(h, key) == 0.02
     assert L.setCurrentIntegratorIndividualTolerance(h, b'k1', 1e-9) == -1 and 'neither a floating species nor has a rate rule' in err()
     assert L.setCurrentIntegrator(h, b'lsoda') == -1 and L.hasError()
     assert L.setCurrentIntegrator(h, b'gillespie') == 1
