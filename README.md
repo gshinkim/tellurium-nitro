@@ -49,7 +49,7 @@ before. libroadrunner and libsbml are not needed: the Rust engine does all the w
 | Results | roadrunner's answers | **The same answers** (within the solver's normal error), and more exact for control coefficients |
 | Math engine | roadrunner (C++) | New Rust engine (no libroadrunner, no libsbml) |
 | Simulate a model over time | baseline | **about 1.4-8x faster** |
-| Load a 1000-reaction model | about 30 s | **about 1-3 s** |
+| Load a 1000-reaction model | about 30 s | **about 0.3 s** |
 | Steady state, control coefficients, sensitivities | baseline | **400 to 18,000x faster** |
 | Processor cores used | 1 | all of them, when it helps |
 | Models roadrunner refuses (delays, algebraic rules, fast reactions) | error | **runs them** |
