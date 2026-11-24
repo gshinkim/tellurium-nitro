@@ -14,7 +14,7 @@ SED-ML simulation experiments: http://www.sed-ml.org/
     # Change back to the original (with 'getName') when libsedml is fixed
     sedmlDoc: L1V1 
     inputType:      'SEDML_FILE'
-    workingDir:     '/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+    workingDir:     '/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
     saveOutputs:    'False'
     outputDir:      'None'
     plottingEngine: '<MatplotlibEngine>'
@@ -39,7 +39,7 @@ import pandas
 import os.path
 Config.LOADSBMLOPTIONS_RECOMPILE = True
 
-workingDir = r'/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+workingDir = r'/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
 
 # --------------------------------------------------------
 # Models
@@ -67,7 +67,7 @@ __range__range_0_0_s1_init_uM = np.linspace(start=10.0, stop=30.0, num=4)
 for __k__range_0_0_s1_init_uM, __value__range_0_0_s1_init_uM in enumerate(__range__range_0_0_s1_init_uM):
     Application0.resetAll()
     Application0['init([s1])'] = __value__range_0_0_s1_init_uM
-    Application0.timeCourseSelections = ['[s0]', 'time', '[s1]']
+    Application0.timeCourseSelections = ['time', '[s0]', '[s1]']
     task_0_0[0] = Application0.simulate(start=0.0, end=30.0, steps=1000)
 
     repeatedTask_0_0.extend(task_0_0)

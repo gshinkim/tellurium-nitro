@@ -14,7 +14,7 @@ SED-ML simulation experiments: http://www.sed-ml.org/
     # Change back to the original (with 'getName') when libsedml is fixed
     sedmlDoc: L1V1 
     inputType:      'SEDML_FILE'
-    workingDir:     '/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+    workingDir:     '/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
     saveOutputs:    'False'
     outputDir:      'None'
     plottingEngine: '<MatplotlibEngine>'
@@ -39,7 +39,7 @@ import pandas
 import os.path
 Config.LOADSBMLOPTIONS_RECOMPILE = True
 
-workingDir = r'/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+workingDir = r'/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
 
 # --------------------------------------------------------
 # Models
@@ -67,7 +67,7 @@ __range__range_0_0_common_delta_A = np.linspace(start=0.2, stop=1.0, num=4)
 for __k__range_0_0_common_delta_A, __value__range_0_0_common_delta_A in enumerate(__range__range_0_0_common_delta_A):
     repressor_activator_oscillations.resetAll()
     repressor_activator_oscillations['common_delta_A'] = __value__range_0_0_common_delta_A
-    repressor_activator_oscillations.timeCourseSelections = ['[PrmR]', '[mRNA_R]', '[PrmA]', '[R]', '[PrmR_bound]', '[C]', '[A]', '[mRNA_A_]', 'time', '[PrmA_bound]']
+    repressor_activator_oscillations.timeCourseSelections = ['[A]', '[C]', '[PrmR_bound]', '[PrmA]', 'time', '[mRNA_A_]', '[PrmA_bound]', '[PrmR]', '[R]', '[mRNA_R]']
     task_0_0[0] = repressor_activator_oscillations.simulate(start=0.0, end=200.0, steps=400)
 
     repeatedTask_0_0.extend(task_0_0)

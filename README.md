@@ -470,6 +470,16 @@ All three give identical outcomes; no test differs from regular tellurium. The 1
 official release, so they are upstream issues. Wall time is about the same for all three because the suite is
 mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation.
 
+**This repository's own tests** (Python package, Rust core and C API, including SED-ML/OMEX), run in a fresh
+environment with only Nitro installed (no libroadrunner, no libsbml): **3346 passed, 0 failed**. 4 tests are
+skipped; all 4 skips come unchanged from upstream tellurium. Answers are compared with libroadrunner's,
+recorded once in `rrs/tests/reference/` and `tellurium_nitro/tests/reference/`, so the tests never need
+libroadrunner installed.
+
+```bash
+python -m pytest tellurium_nitro/tests rrs/tests rrs/capi/tests
+```
+
 ### 3. Old tellurium bugs, now fixed
 
 Nitro also fixes those 14 failures and a few other long-standing tellurium bugs. Its own test suite

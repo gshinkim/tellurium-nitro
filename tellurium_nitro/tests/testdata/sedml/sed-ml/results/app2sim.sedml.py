@@ -14,7 +14,7 @@ SED-ML simulation experiments: http://www.sed-ml.org/
     # Change back to the original (with 'getName') when libsedml is fixed
     sedmlDoc: L1V1 
     inputType:      'SEDML_FILE'
-    workingDir:     '/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+    workingDir:     '/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
     saveOutputs:    'False'
     outputDir:      'None'
     plottingEngine: '<MatplotlibEngine>'
@@ -39,7 +39,7 @@ import pandas
 import os.path
 Config.LOADSBMLOPTIONS_RECOMPILE = True
 
-workingDir = r'/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
+workingDir = r'/Users/gio/Desktop/tellurium-nitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
 
 # --------------------------------------------------------
 # Models
@@ -68,7 +68,7 @@ Application0.resetAll()
 task_0_0 = [None]
 Application0.setIntegrator('cvode')
 if Application0.conservedMoietyAnalysis == True: Application0.conservedMoietyAnalysis = False
-Application0.timeCourseSelections = ['[s0]', 'time', '[s1]']
+Application0.timeCourseSelections = ['time', '[s0]', '[s1]']
 task_0_0[0] = Application0.simulate(start=0.0, end=20.0, steps=1000)
 # Task <task_0_1>
 Application0_0.resetAll()
@@ -76,7 +76,7 @@ Application0_0.resetAll()
 task_0_1 = [None]
 Application0_0.setIntegrator('cvode')
 if Application0_0.conservedMoietyAnalysis == True: Application0_0.conservedMoietyAnalysis = False
-Application0_0.timeCourseSelections = ['[s0]', 'time', '[s1]']
+Application0_0.timeCourseSelections = ['time', '[s0]', '[s1]']
 task_0_1[0] = Application0_0.simulate(start=0.0, end=30.0, steps=1000)
 
 # --------------------------------------------------------
