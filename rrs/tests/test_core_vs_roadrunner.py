@@ -303,6 +303,8 @@ def sc_reset(r, rec, sbml):
     r.sim(0, 4, 9); r.reset(); snap()
     r.setValue('init(%s)' % ps[0], 0.77); snap()
     r.resetToOrigin(); snap()
+    # init(...) set after a parameter change: libroadrunner reloads at the initial values (parameters too)
+    r.sim(0, 4, 9); r.setValue(ps[0], 0.555); r.setValue('init([%s])' % fs[0], 2.5); snap()
     rec('sim', lambda: r.sim(0, 2, 5), atol=1e-10, scaled=True)
 
 
@@ -426,7 +428,7 @@ def run_all(make, sbml, name, rec):
         sub('structure%d/' % cma, sc_structure, cma)
         sub('values%d/' % cma, sc_values, cma, cma)
         sub('set%d/' % cma, sc_set, cma, cma)
-        if name not in ('events', 'raterule'):
+        if name != 'raterule':
             sub('steady%d/' % cma, sc_steady, cma)
     sub('reset/', sc_reset)
     if name == 'rules':
@@ -580,8 +582,8 @@ def test_integrator_registry():
         b.setIntegrator(name)
         assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('rk45')
-    with pytest.raises(ValueError):  # variable_step_size=True (default): adaptive output grid not built yet
-        b.simulate(0, 1, 5)
+    y = np.asarray(b.simulate(0, 1, 5))  # variable_step_size=True (default): a row per accepted step
+    assert y.shape[0] > 5 and y[-1, 0] == 1
     b.setIntegratorSetting('variable_step_size', False)
     assert np.asarray(b.simulate(0, 1, 5)).shape[0] == 5
     b.setIntegrator('cvode')
@@ -641,11 +643,22 @@ def test_big_model_load_defers_structural_analysis():
     assert len(r.getIndependentFloatingSpeciesIds()) + len(r.getDependentFloatingSpeciesIds()) == len(r.getFloatingSpeciesIds())
 
 
-def test_amount_rate_variable_compartment():
+@pytest.mark.parametrize('volume', ["c = 1; c' = 0.1", "c := 1 + 2*p; p = 0; p' = 0.05"])
+def test_amount_rate_variable_compartment(volume):
     # S1' is d(amount)/dt = reaction rate k*[S1] (libroadrunner agrees); V d[S1]/dt alone misses C dV/dt
-    r = rn.RoadRunner(rn.antimony_to_sbml("compartment c = 1; c' = 0.1; S1 in c; S1 = 1; J1: S1 -> ; k*S1; k = 0.2"))
+    r = rn.RoadRunner(rn.antimony_to_sbml(f"compartment c; {volume}; S1 in c; S1 = 1; J1: S1 -> ; k*S1; k = 0.2"))
     r.simulate(0, 2, 3)
     assert abs(r.getValue("S1'") + 0.2 * r.getValue('[S1]')) < 1e-12
+
+
+def test_amount_rate_rule_in_assignment_compartment():
+    r = rn.RoadRunner(rn.antimony_to_sbml(
+        "compartment c; c := 1 + 0.1*time; substanceOnly species S1 in c; S1 = 1; S1' = 2"))
+    r.setIntegratorSetting('relative_tolerance', 1e-11)
+    r.setIntegratorSetting('absolute_tolerance', 1e-13)
+    r.simulate(0, 2, 3)
+    assert r.getValue("S1'") == pytest.approx(2.0, abs=1e-12)
+    assert r.getValue('S1') == pytest.approx(5.0, abs=1e-8)
 
 
 def test_reset_reevaluates_initial_assignment_with_function():

@@ -506,8 +506,8 @@ pub unsafe extern "C" fn listToString(list: *mut RRList) -> *mut c_char {
 // ---------------------------------------------------------------- handle-based utilities
 
 #[no_mangle]
-pub extern "C" fn writeRRData(_handle: RRHandle, _fileNameAndPath: *const c_char) -> c_int {
-    crate::api::not_implemented("writeRRData", 0)
+pub unsafe extern "C" fn writeRRData(handle: RRHandle, fileNameAndPath: *const c_char) -> c_int {
+    crate::api::write_rr_data(handle, fileNameAndPath)
 }
 
 /// Upstream is a no-op that returns true.

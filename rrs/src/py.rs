@@ -541,6 +541,7 @@ fn simulate_fixed<'py>(py: Python<'py>, model: &PyModel, method: &str, times: Py
     let mut out = vec![0.0; times.len() * outs.len()];
     let mut w = m.work();
     m.load(&mut w, &[], &[]);
+    m.events_reset(&mut w);
     integrate_fixed(m, &mut w, method, &times, step, rtol, atol, &outs, &mut out).map_err(verr)?;
     arr(py, out, &[times.len(), outs.len()])
 }
@@ -686,6 +687,22 @@ impl PyRR {
         let m = self.r.simulate().map_err(verr)?;
         arr(py, m.data.clone(), &[m.nr, m.nc])
     }
+    /// simulateTimes(times, selections=None) -> array (len(times) x selections): output at exactly `times`.
+    #[pyo3(signature = (times, selections=None))]
+    fn simulateTimes<'py>(&mut self, py: Python<'py>, times: Vec<f64>, selections: Option<Vec<String>>) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(s) = selections { self.r.set_selections(&s).map_err(verr)?; }
+        self.r.times = Some(times);
+        let m = self.r.simulate().map(|m| (m.data.clone(), m.nr, m.nc));
+        self.r.times = None;
+        let (d, nr, nc) = m.map_err(verr)?;
+        arr(py, d, &[nr, nc])
+    }
+    /// Replace the model's SBML text (an edited document); with `regenerate`, recompile keeping current values.
+    #[pyo3(signature = (sbml, regenerate=true))]
+    fn setSBML(&mut self, sbml: String, regenerate: bool) -> PyResult<()> { self.r.edit(|s| { *s = sbml; Ok(()) }, regenerate).map_err(verr) }
+    fn getFluxThreshold(&self) -> f64 { self.r.flux_threshold }
+    fn setFluxThreshold(&mut self, v: f64) { self.r.flux_threshold = v; }
+    fn getSteadyStateSolverSettings(&self) -> Vec<&'static str> { self.r.steady_state_solver().params.iter().map(|p| p.name).collect() }
     fn oneStep(&mut self, t: f64, h: f64) -> PyResult<f64> { self.r.one_step(t, h).map_err(verr) }
     fn getCurrentTime(&self) -> f64 { self.r.time() }
 
@@ -710,6 +727,9 @@ impl PyRR {
     fn getIntegratorName(&self) -> &'static str { self.r.integrator().name }
     fn setIntegratorSetting(&mut self, key: &str, v: &Bound<'_, PyAny>) -> PyResult<()> { self.r.integrator_mut().set(key, to_value(v)?).map_err(verr) }
     fn getIntegratorSetting<'py>(&self, py: Python<'py>, key: &str) -> PyResult<Bound<'py, PyAny>> { from_value(py, self.r.integrator().get(key).map_err(verr)?) }
+    /// CVODEIntegrator.setIndividualTolerance(sid, value): absolute tolerance on one variable's amount.
+    fn setIndividualTolerance(&mut self, sid: &str, value: f64) -> PyResult<()> { self.r.set_individual_tolerance(sid, value).map_err(verr) }
+    fn getAbsoluteToleranceVector(&mut self) -> PyResult<Vec<f64>> { self.r.absolute_tolerance_vector().map_err(verr) }
     fn getIntegratorSettings(&self) -> Vec<&'static str> { self.r.integrator().params.iter().map(|p| p.name).collect() }
     fn setSteadyStateSolver(&mut self, name: &str) -> PyResult<()> { self.r.set_steady_state_solver(name).map_err(verr) }
     fn getSteadyStateSolverName(&self) -> &'static str { self.r.steady_state_solver().name }

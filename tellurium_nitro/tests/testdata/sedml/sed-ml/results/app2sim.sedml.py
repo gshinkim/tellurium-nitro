@@ -14,17 +14,17 @@ SED-ML simulation experiments: http://www.sed-ml.org/
     # Change back to the original (with 'getName') when libsedml is fixed
     sedmlDoc: L1V1 
     inputType:      'SEDML_FILE'
-    workingDir:     '/Users/gio/Desktop/TelluriumNitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
+    workingDir:     '/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
     saveOutputs:    'False'
     outputDir:      'None'
     plottingEngine: '<MatplotlibEngine>'
 
-macOS-26.6.2-arm64-arm-64bit
-python 3.12.14 (main, Aug 12 2026, 13:57:54) [Clang 21.0.0 (clang-2100.1.1.101)]
+macOS-26.6.2-arm64-arm-64bit-Mach-O
+python 3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]
 ####################################################################################################
 """
 import tellurium_nitro as te
-from roadrunner import Config
+from tellurium_nitro.nitro import Config
 from tellurium_nitro.sedml.mathml import *
 from tellurium_nitro.sedml.tesedml import process_trace, terminate_trace, fix_endpoints
 
@@ -39,7 +39,7 @@ import pandas
 import os.path
 Config.LOADSBMLOPTIONS_RECOMPILE = True
 
-workingDir = r'/Users/gio/Desktop/TelluriumNitro/tellurium_nitro/tests/testdata/sedml/sed-ml'
+workingDir = r'/Users/gio/Desktop/tellurium-nitro/.claude/worktrees/agent-aeb060fff99a59918/tellurium_nitro/tests/testdata/sedml/sed-ml'
 
 # --------------------------------------------------------
 # Models
@@ -68,7 +68,7 @@ Application0.resetAll()
 task_0_0 = [None]
 Application0.setIntegrator('cvode')
 if Application0.conservedMoietyAnalysis == True: Application0.conservedMoietyAnalysis = False
-Application0.timeCourseSelections = ['[s1]', 'time', '[s0]']
+Application0.timeCourseSelections = ['[s0]', 'time', '[s1]']
 task_0_0[0] = Application0.simulate(start=0.0, end=20.0, steps=1000)
 # Task <task_0_1>
 Application0_0.resetAll()
@@ -76,7 +76,7 @@ Application0_0.resetAll()
 task_0_1 = [None]
 Application0_0.setIntegrator('cvode')
 if Application0_0.conservedMoietyAnalysis == True: Application0_0.conservedMoietyAnalysis = False
-Application0_0.timeCourseSelections = ['[s1]', 'time', '[s0]']
+Application0_0.timeCourseSelections = ['[s0]', 'time', '[s1]']
 task_0_1[0] = Application0_0.simulate(start=0.0, end=30.0, steps=1000)
 
 # --------------------------------------------------------

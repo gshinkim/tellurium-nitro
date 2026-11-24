@@ -41,6 +41,7 @@ setup(name='tellurium_nitro',
       package_data={
           "tellurium_nitro": ["*.txt"],
           "tellurium_nitro.sedml": ["templates/*.template"],
+          "tellurium_nitro.roadrunner": ["test_models/*.xml"],
       },
       install_requires=[
           # general
@@ -49,10 +50,9 @@ setup(name='tellurium_nitro',
           'matplotlib>=2.0.2',
           'pandas>=2.0',
           # SBW-derived
-          'libroadrunner>=2.8',
+          'libroadrunner_nitro',  # the Rust engine: pip install ./rrs
           'antimony>=3.1.0',
           # standards
-          'python-libsbml>=5.20',
           'python-libnuml>=1.0.0',
           'python-libsedml>=2.0.17',
           'python-libcombine>=0.2.2',
@@ -79,9 +79,6 @@ setup(name='tellurium_nitro',
           ],
         ':(platform_machine != "arm64")': [
           'phrasedml>=1.0.9',
-          ],
-        ': platform_system == "Windows"': [
-          'rrplugins>=2.1',
           ],
           },
       )

@@ -1374,11 +1374,14 @@ impl Model {
     /// Any delay() in the model.
     pub fn has_delays(&self) -> bool { !self.dly.is_empty() }
 
-    /// Is any event trigger true at (w.s, t)?
-    pub fn any_trigger(&self, w: &mut Work, t: f64) -> bool {
-        let Work { ra, s, hist, .. } = w;
-        self.aux_at(hist, ra, s, t);
-        self.events.iter().any(|e| ra[e.trig as usize] != 0.0)
+    /// Does any event trigger or tracked comparison differ from its last accepted value?
+    pub(crate) fn trigger_changed(&self, w: &mut Work, y: &[f64], t: f64) -> bool {
+        self.changed(&w.hist, &mut w.ra, &w.prev, &w.prevc, y, t)
+    }
+
+    /// Limit a step to the next scheduled event execution.
+    pub(crate) fn next_event_time(&self, w: &Work, end: f64) -> f64 {
+        w.pend.iter().fold(end, |t, p| t.min(p.0))
     }
 
     /// Process trigger transitions and execute due events at t (as `simulate` does between steps).
@@ -1493,7 +1496,7 @@ impl Model {
         for _ in 0..MAX_STEPS * 10 {
             while q < nt && times[q] <= t { self.record(w, t, outs, &mut out[q * no..(q + 1) * no]); q += 1; }
             if q == nt { return true; }
-            let t1 = w.pend.iter().fold(tend, |m, p| m.min(p.0));
+            let t1 = self.next_event_time(w, tend);
             if dl { let cap = self.delay_cap(w, t); if h > cap { h = cap; } }
             let mut step = if bdf { self.bdf_step(w, t, t1, rtol, atol) } else { self.step(w, t, t1, &mut h, rtol, atol) };
             if step.is_none() && bdf { // BDF gave up (e.g. loose atol on a near-singular system): Rodas4 from here

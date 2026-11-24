@@ -42,6 +42,7 @@ pub struct Info {
     /// Non-floating species whose parameter value is an amount.
     pub amount_params: HashSet<String>,
     pub rate_rule_ids: Vec<String>,
+    pub assignment_volume_rates: HashMap<String, u32>,
     /// Full stoichiometry matrix rows (non-boundary species) x reactions, row-major.
     pub rows: Vec<String>,
     pub n: Vec<f64>,
@@ -533,7 +534,11 @@ impl<'a> C<'a> {
     fn dconc(&mut self, s: &str) -> Result<String, Error> {
         if let Some(r) = self.rate_rules.get(s).cloned() {
             let f = self.formula(&r, &format!("rate rule for {s}"))?;
-            return self.conc_of(s, f);
+            if !self.hosu.contains(s) { return Ok(f); }
+            let v = self.comp_formula(s, s)?;
+            let comp = self.comp_of[s].clone();
+            let dv = self.rate_of(&comp)?;
+            return Ok(format!("(({f}) - {s} * ({dv})) / ({v})"));
         }
         let i = self.rows.iter().position(|r| r == s).unwrap();
         let nr = self.reactions.len();
@@ -682,6 +687,15 @@ fn compile(m: &M, rows: &[String], reactions: &[String], nm: &[f64], conc: &Hash
         out_rules.push((v.clone(), c.conc_of(&v, f)?));
     }
 
+    let mut volume_rates = vec![];
+    for comp in &m.comps {
+        if c.rules.contains_key(&comp.id) && species.iter().any(|s| c.comp_of[s] == comp.id) {
+            let output = format!("@rate:{}", comp.id);
+            out_rules.push((output.clone(), c.rate_of(&comp.id)?));
+            volume_rates.push((comp.id.clone(), output));
+        }
+    }
+
     let mut events = vec![];
     for ev in &m.events {
         let what = format!("event {}", ev.id.clone().unwrap_or_else(|| events.len().to_string()));
@@ -730,7 +744,12 @@ fn compile(m: &M, rows: &[String], reactions: &[String], nm: &[f64], conc: &Hash
     };
     let init_c = species.iter().map(|s| conc[s]).collect();
     let vols = species.iter().map(|s| vol[s]).collect();
-    Model::new(species, init_c, vols, reactions.to_vec(), rates, stoich, c.params.names.clone(), pvals, x).map_err(inval)
+    let mut model = Model::new(species, init_c, vols, reactions.to_vec(), rates, stoich, c.params.names.clone(), pvals, x).map_err(inval)?;
+    for (comp, output) in volume_rates {
+        info.assignment_volume_rates.insert(comp, model.output_regs(&[output]).map_err(inval)?[0]);
+    }
+    model.outputs.retain(|(id, _)| !id.starts_with("@rate:"));
+    Ok(model)
 }
 
 #[cfg(test)]

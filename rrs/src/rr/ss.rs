@@ -82,6 +82,13 @@ impl Core {
         ok
     }
 
+    /// Integrate over times with a fresh CVODEIntegrator's defaults (rtol 1e-6, atol 1e-12 scaled
+    /// per state as roadrunner's).
+    fn advance_default(&mut self, times: &[f64]) -> Result<(), String> {
+        let tol: Vec<f64> = self.atol_scale()?.iter().map(|s| 1e-12 * s).collect();
+        self.advance(times, &[], 1e-6, &tol).map(|_| ())
+    }
+
     /// Floating species amounts (independent ones with moieties, as auto_moiety_analysis) and
     /// rate-rule states: roadrunner's state vector.
     fn state_vector(&mut self) -> Result<Vec<f64>, String> {
@@ -105,7 +112,7 @@ impl Core {
         if let Some(times) = &cfg.presim {
             for &t in times {
                 self.reset()?;
-                if t != 0.0 { self.advance(&[0.0, t], &[], 1e-6, 1e-12)?; }
+                if t != 0.0 { self.advance_default(&[0.0, t])?; }
                 if self.newton_here(&cfg.newton, cfg.time0) { return Ok(None); }
             }
             err = format!("SteadyStateSolver failed to solve presimulation program: {err}");
@@ -113,9 +120,9 @@ impl Core {
         if let Some((thresh, steps, end)) = cfg.approx {
             let h = end / steps;
             self.reset()?;
-            self.advance(&[0.0, end - h], &[], 1e-6, 1e-12)?;
+            self.advance_default(&[0.0, end - h])?;
             let a = self.state_vector()?;
-            self.advance(&[end - h, end], &[], 1e-6, 1e-12)?;
+            self.advance_default(&[end - h, end])?;
             let b = self.state_vector()?;
             let tol: f64 = a.iter().zip(&b).map(|(x, y)| ((x - y) / h).abs()).sum();
             self.m.load(&mut self.q, &self.kres, &self.x);

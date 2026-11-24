@@ -1,7 +1,3 @@
-"""Drop-in replacement for libroadrunner backed by the Rust engine: ``import tellurium_nitro.nitro as roadrunner``.
-
-Everything is libroadrunner's, except ``RoadRunner``: it runs simulate/steadyState/MCA/sensitivities in
-roadrunner_nitro and falls back to roadrunner for anything the Rust engine can't do exactly the same way.
-"""
-from roadrunner import *  # noqa: F401,F403
-from .roadrunner.extended_roadrunner import ExtendedRoadRunner as RoadRunner, turbo  # noqa: F401
+"""Drop-in for libroadrunner's Python module, on the Rust engine: ``import tellurium_nitro.nitro as roadrunner``."""
+from .roadrunner.extended_roadrunner import (  # noqa: F401
+    ExtendedRoadRunner as RoadRunner, ExecutableModel, NamedArray, Logger, Config, SelectionRecord, Solver, turbo)

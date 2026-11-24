@@ -332,7 +332,6 @@ class KisaoSedmlTestCase(unittest.TestCase):
         self.assertTrue("model0.setIntegrator('euler')" in pycode)
 
 
-    @pytest.mark.skip(reason="bug in roadrunner")
     def test_kisao_rk45_1(self):
         p = """
             model0 = model "m1.xml"
@@ -346,7 +345,6 @@ class KisaoSedmlTestCase(unittest.TestCase):
         te.executeInlineOmex(inline_omex)
 
 
-    @pytest.mark.skip(reason="bug in roadrunner")
     def test_kisao_rk45_2(self):
         p = """
             model0 = model "m1.xml"

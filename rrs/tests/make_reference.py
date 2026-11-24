@@ -1,6 +1,7 @@
 """Record libroadrunner's answers for test_core_vs_roadrunner.py into reference/<model>.npz.
 
     python rrs/tests/make_reference.py [model ...]     (needs libroadrunner; only missing entries are computed)
+    python rrs/tests/make_reference.py --fixed          (fixed-step reference courses)
 """
 import os, sys
 import numpy as np
@@ -58,7 +59,52 @@ def load(path):
         return dict(z)
 
 
+def fixed_references():
+    import test_fixed_vs_roadrunner as F
+
+    def simulate(sbml, sel, method, settings, *args, **kwargs):
+        r = roadrunner.RoadRunner(sbml)
+        r.setIntegrator(method)
+        for k, v in settings.items():
+            r.integrator.setValue(k, v)
+        r.timeCourseSelections = sel
+        return np.asarray(r.simulate(*args, **kwargs))
+
+    ref = load(F.REF)
+    cv = dict(relative_tolerance=1e-12, absolute_tolerance=1e-24, maximum_num_steps=10**7)
+    for name, sbml, end, n in F.models():
+        key = f'{name}/ids'
+        if key not in ref:
+            rr = roadrunner.RoadRunner(sbml)
+            ref[key] = np.array(rr.model.getFloatingSpeciesIds())
+        ids = ref[key]
+        sel = ['time'] + [f'[{i}]' for i in ids]
+        k = f'{name}/cvode'
+        if k not in ref:
+            ref[k] = simulate(sbml, sel, 'cvode', cv, 0, end, n)
+        for label, integ, settings, method, _ in F.CASES:
+            key = f'{name}/{label}'
+            if key not in ref:
+                if method == 'rk45' and name in F.TIGHT:
+                    ref[key] = ref[k]
+                else:
+                    stop, points = F.fixed_grid(name, method, end, n)
+                    ref[key] = simulate(sbml, sel, integ, settings, 0, stop, points)
+        if name in F.ANT:
+            for i, (eps, hmax, rows) in enumerate(F.VARIABLE):
+                key = f'{name}/variable{i}'
+                if key not in ref:
+                    ref[key] = simulate(sbml, sel, 'rk45', dict(epsilon=eps, maximum_time_step=hmax, max_output_rows=rows), 0, 10)
+                if key + '/cvode' not in ref:
+                    ref[key + '/cvode'] = simulate(sbml, sel, 'cvode', cv, times=ref[key][:, 0].tolist())
+        print(name, flush=True)
+    np.savez_compressed(F.REF, **ref)
+
+
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--fixed']:
+        fixed_references()
+        sys.exit()
     # libroadrunner is slow: only what is missing is computed; existing entries are kept as they are.
     # ss_settings: per case. Models: only those without a reference file, or named on the command line
     # (their scenarios rerun in order, since each call depends on the state the previous ones left;
