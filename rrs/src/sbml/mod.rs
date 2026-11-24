@@ -53,7 +53,6 @@ pub struct Info {
     pub values: HashMap<String, f64>,
     // the model after the rewrites, as a libsbml document would show it
     pub n_events: usize,
-    pub event_ids: Vec<String>,
     pub rule_vars: Vec<String>,
     pub hosu: HashSet<String>,
     /// Conversion factor ids: the model's, then the species' (those set).
@@ -337,7 +336,6 @@ pub fn from_sbml(sbml: &str) -> Result<(Model, Info), Error> {
     info.rows = rows;
     info.n = nm;
     info.n_events = m.events.len();
-    info.event_ids = m.events.iter().filter_map(|e| e.id.clone()).collect();
     info.rule_vars = m.rules.iter().filter(|r| r.kind != RK::Alg).map(|r| r.var.clone()).collect();
     info.hosu = m.species.iter().filter(|s| s.hosu).map(|s| s.id.clone()).collect();
     info.conversion_factors = m.cf.iter().chain(m.species.iter().filter_map(|s| s.cf.as_ref())).cloned().collect();

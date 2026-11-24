@@ -755,7 +755,6 @@ impl PyRR {
     fn getGlobalParameterIds(&self) -> Vec<String> { self.r.global_parameter_ids() }
     fn getCompartmentIds(&self) -> Vec<String> { self.r.compartment_ids() }
     fn getReactionIds(&self) -> Vec<String> { self.r.reaction_ids() }
-    fn getEventIds(&self) -> Vec<String> { self.r.event_ids() }
     fn getRateRuleIds(&self) -> Vec<String> { self.r.rate_rule_ids() }
     fn getIndependentFloatingSpeciesIds(&self) -> Vec<String> { self.r.independent_ids() }
     fn getDependentFloatingSpeciesIds(&self) -> Vec<String> { self.r.dependent_ids() }
