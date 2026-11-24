@@ -324,7 +324,8 @@ pub fn from_sbml(sbml: &str) -> Result<(Model, Info), Error> {
     info.ids = [ids(rows.clone()), ids(m.species.iter().filter(|s| !ri.contains_key(s.id.as_str())).map(|s| s.id.clone()).collect()),
                 ids(m.params.iter().map(|p| p.id.clone()).collect()), ids(m.comps.iter().map(|c| c.id.clone()).collect()), reactions];
     info.rate_rule_ids = m.rules.iter().filter(|r| r.kind == RK::Rate).map(|r| r.var.clone()).collect();
-    info.ia = m.ias.iter().map(|(x, e)| (x.clone(), s(e))).collect();
+    // function definitions inlined: reset() re-evaluates these from the infix text (rr::Core)
+    info.ia = m.ias.iter().map(|(x, e)| (x.clone(), s(&math::inline_calls(e, &fd)))).collect();
     info.fdefs = m.fdefs.iter().map(|(f, a, b)| {
         let mut parts = a.clone();
         parts.push(s(b));

@@ -18,7 +18,7 @@ impl Ls {
     pub fn nd(&self) -> usize { self.order.len() - self.ni }
 }
 
-fn round_tol(x: f64, tol: f64) -> f64 {
+pub(crate) fn round_tol(x: f64, tol: f64) -> f64 {
     if x.abs() < tol { 0.0 } else if (x.ceil() - x).abs() < tol { x.ceil() } else if (x - x.floor()).abs() < tol { x.floor() } else { x }
 }
 
@@ -26,7 +26,7 @@ fn round_tol(x: f64, tol: f64) -> f64 {
 /// these into FMAs, which decides near-ties between pivot columns.
 // ponytail: fused on aarch64 only; matches roadrunner's x86 builds only where those don't contract
 #[inline]
-fn fma(a: f64, b: f64, c: f64) -> f64 { if cfg!(target_arch = "aarch64") { a.mul_add(b, c) } else { a * b + c } }
+pub(crate) fn fma(a: f64, b: f64, c: f64) -> f64 { if cfg!(target_arch = "aarch64") { a.mul_add(b, c) } else { a * b + c } }
 
 /// Reference BLAS dnrm2 (scaled sum of squares).
 fn dnrm2(x: impl Iterator<Item = f64>) -> f64 {

@@ -18,7 +18,8 @@ pub enum Method { Euler, Rk4, Rk45 }
 ///   subdivision_steps = k is step = interval / k).
 /// - Rk45: `step` is libroadrunner's maximum_time_step, which is also its first step (<= 0: 1.0);
 ///   `atol` is its epsilon (bound on the 2-norm of the per-step error estimate, in amounts);
-///   minimum_time_step is 1e-12. `rtol` is unused (libroadrunner's rk45 has no relative tolerance).
+///   minimum_time_step is 1e-12. `rtol` is unused; epsilon is clamped by `rk45_tol` where it is
+///   meaningless for the state scale.
 ///
 /// On success w.s / params hold the final state.
 #[allow(clippy::too_many_arguments, clippy::neg_cmp_op_on_partial_ord)] // !(a <= b): NaN fails
@@ -121,8 +122,9 @@ pub fn integrate_fixed(m: &Model, w: &mut Work, method: Method, times: &[f64], s
                             let e = k1[j] / 360. - 128. / 4275. * k3[j] - 2197. / 75240. * k4[j] + k5[j] / 50. + 2. / 55. * k6[j];
                             (e * m.vol[j]).powi(2)
                         }).sum::<f64>().sqrt();
-                        let q = if !error.is_finite() { 0.1 } else if error == 0. { 4. } else { (0.84 * (eps / error).powf(0.25)).clamp(0.1, 4.) };
-                        if !(error <= eps) && htry > hmin { hp = (q * h).max(hmin); continue; }
+                        let tol = rk45_tol(eps, (0..nx).map(|j| (y[j] * m.vol[j]).powi(2)).sum::<f64>().sqrt());
+                        let q = if !error.is_finite() { 0.1 } else if error == 0. { 4. } else { (0.84 * (tol / error).powf(0.25)).clamp(0.1, 4.) };
+                        if !(error <= tol) && htry > hmin { hp = (q * h).max(hmin); continue; }
                         axpy(&mut y, 1408. * h / 2565., &k3);
                         axpy(&mut y, 2197. / 4104. * h, &k4);
                         axpy(&mut y, -1. / 5. * h, &k5);
@@ -142,6 +144,16 @@ pub fn integrate_fixed(m: &Model, w: &mut Work, method: Method, times: &[f64], s
         m.record(w, t1, outs, &mut out[i * no..(i + 1) * no]);
     }
     Ok(())
+}
+
+/// The per-step error bound for libroadrunner's absolute epsilon on a state of 2-norm `ynorm`
+/// (amounts): epsilon itself where it means something (identical steps to libroadrunner), tightened
+/// to epsilon relative where the state is tiny (epsilon would allow 100% errors) and loosened to what
+/// rounding can reach where it is huge (else steps shrink to minimum_time_step and never end).
+fn rk45_tol(eps: f64, ynorm: f64) -> f64 {
+    let mut tol = eps;
+    if ynorm > 0.0 { tol = tol.min(eps * ynorm); }
+    tol.max(64.0 * f64::EPSILON * ynorm)
 }
 
 #[cfg(test)]

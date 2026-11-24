@@ -6,6 +6,12 @@
 //! floating species] the engine holds (species as concentrations; boundary species whose engine value
 //! is an amount stay amounts), plus the time. Everything else (rules, rates) is computed from them.
 mod cons;
+mod eig;
+mod eig_aed;
+mod ss;
+#[cfg(test)]
+mod regen_test;
+pub use eig::eigenvalues;
 mod sel;
 mod settings;
 
@@ -81,9 +87,10 @@ struct Core {
     plain: bool,            // floating species are all engine species without rate rules
     nss: bool,              // events or time-dependent rates: no steady state
     /// libstruct's view: SBML species without boundaryCondition (constant ones too), N from the SBML
-    ls: Ls, ls_rows: Vec<String>, ls_n: Vec<f64>,
+    ls_rows: Vec<String>, ls_n: Vec<f64>, ls_nr: usize,
+    /// libstruct's analysis and csum_dep, computed on first use (a dense QR: seconds on big models)
+    ls_cell: std::cell::OnceCell<(Ls, Vec<usize>)>,
     /// dependent species (index into ls's dependents) with a moiety total: those not set by rules
-    csum_dep: Vec<usize>,
     /// initial concentrations of rule-set floating species as the SBML declares them (0 if unset)
     rule_init: HashMap<String, f64>,
     w: Work, fresh: bool, live: bool, // the running simulation (event state, delay history)
@@ -164,18 +171,27 @@ impl Core {
                 }
             }
         }
-        let ls = cons::analyze(&ls_n, ls_rows.len(), doc.model.as_ref().map_or(0, |m| m.reactions.len()));
+        let ls_nr = doc.model.as_ref().map_or(0, |m| m.reactions.len());
         let rule_init = doc.model.iter().flat_map(|sm| sm.species.iter().filter(|s| fids.contains(&s.id) && info.rule_vars.contains(&s.id)).map(|s| {
             let v = sm.compartments.iter().find(|c| c.id == s.compartment).and_then(|c| c.size).unwrap_or(1.0);
             (s.id.clone(), s.initial_concentration.or(s.initial_amount.map(|a| a / v)).unwrap_or(0.0))
         })).collect();
-        let csum_dep = (0..ls.nd()).filter(|&d| !info.rule_vars.contains(&ls_rows[ls.order[ls.ni + d]])).collect();
         let w = m.work();
-        Ok(Core { xi: x0.clone(), x: x0.clone(), x0, t: 0.0, tgt, ia: ok.then_some(ia), cconst, sp, rx, plain, nss, ls, w, fresh: true,
-                  live: false, q, qok: false, rd: None, csum: vec![], ls_rows, ls_n, csum_dep, rule_init, keys, kres, kpos, xo, m, info })
+        Ok(Core { xi: x0.clone(), x: x0.clone(), x0, t: 0.0, tgt, ia: ok.then_some(ia), cconst, sp, rx, plain, nss, ls_nr, ls_cell: Default::default(), w, fresh: true,
+                  live: false, q, qok: false, rd: None, csum: vec![], ls_rows, ls_n, rule_init, keys, kres, kpos, xo, m, info })
     }
 
     fn fids(&self) -> &[String] { &self.info.ids[0] }
+    fn ls_all(&self) -> &(Ls, Vec<usize>) {
+        self.ls_cell.get_or_init(|| {
+            let ls = cons::analyze(&self.ls_n, self.ls_rows.len(), self.ls_nr);
+            let dep = (0..ls.nd()).filter(|&d| !self.info.rule_vars.contains(&self.ls_rows[ls.order[ls.ni + d]])).collect();
+            (ls, dep)
+        })
+    }
+    fn ls(&self) -> &Ls { &self.ls_all().0 }
+    /// dependent species (index into ls's dependents) with a moiety total: those not set by rules
+    fn csum_dep(&self) -> &[usize] { &self.ls_all().1 }
     fn comp_of(&self, s: &str) -> &str { &self.info.comp_of[s] }
     fn touch(&mut self) { self.live = false; self.qok = false; }
 
@@ -240,7 +256,7 @@ impl Core {
         for s in &fids {
             let v = match vals.get(s) {
                 // amounts are kept when a compartment changed since its initial value (as roadrunner)
-                Some(&v) => match self.kpos.get(self.comp_of(s)) { Some(&c) if self.x[c] != 0.0 => v * self.xi[c] / self.x[c], _ => v },
+                Some(&v) => match self.kpos.get(self.comp_of(s)) { Some(&c) if self.x[c] != 0.0 && !self.tgt.contains(&c) => v * self.xi[c] / self.x[c], _ => v },
                 None => match self.rule_init.get(s) { Some(&v) => v, None => self.species(s, true)? },
             };
             out.push(v);
@@ -328,17 +344,9 @@ impl Core {
         self.touch();
     }
 
-    /// Steady state from the current state into x; the solver's work is left in q.
-    fn solve(&mut self) -> Result<(), String> {
-        if self.nss { return Err("steady state: the model has events or time-dependent rates".into()); }
-        self.m.load(&mut self.q, &self.kres, &self.x);
-        let ok = self.m.steady_state(&mut self.q);
-        self.qok = false;
-        if !ok { return Err("steady state not found".into()); }
-        let s = self.q.s.clone();
-        self.take_states(&s);
-        Ok(())
-    }
+    /// Steady state from the current state into x with the solver settings (rr::ss); the solution
+    /// is left in q.
+    fn solve(&mut self, cfg: &ss::SsCfg) -> Result<Option<f64>, String> { self.solve_with(cfg) }
 
     /// d state/dt (engine units: concentrations) at the current state and time.
     fn state_rates(&mut self) -> Vec<f64> {
@@ -452,9 +460,13 @@ impl RoadRunner {
         };
         let mut c = compile1(&[])?;
         if let Some(o) = &old {
+            // as libroadrunner's LLVMModelGenerator::regenerateModel: every current value (species,
+            // compartments, parameters) and the time carry over; initial values are the edited SBML's
+            // where the edit changed them, else the user's (libroadrunner keeps init() edits in its document)
             for (j, k) in c.keys.iter().enumerate() {
                 if let Some(&i) = o.kpos.get(k) {
-                    if o.x0[i] == c.x0[j] || (o.x0[i].is_nan() && c.x0[j].is_nan()) { c.x[j] = o.x[i]; c.xi[j] = o.xi[i]; }
+                    c.x[j] = o.x[i];
+                    if o.x0[i] == c.x0[j] || (o.x0[i].is_nan() && c.x0[j].is_nan()) { c.xi[j] = o.xi[i]; }
                 }
             }
             c.t = o.t;
@@ -476,7 +488,18 @@ impl RoadRunner {
     pub fn clear_model(&mut self) { self.c = None; self.sbml.clear(); self.result = None; self.sel.clear(); self.ssel.clear(); }
 
     /// The SBML as loaded (with edits).
-    pub fn get_sbml(&self) -> Result<String, String> { self.core()?; Ok(self.sbml.clone()) }
+    /// The model's SBML as libroadrunner's getSBML gives it: libsbml writes the stoichiometry of every
+    /// species reference (default 1); the text is otherwise the one loaded.
+    pub fn get_sbml(&self) -> Result<String, String> {
+        self.core()?;
+        let Ok(mut doc) = read_doc(&self.sbml) else { return Ok(self.sbml.clone()) };
+        let Some(m) = doc.model.as_mut() else { return Ok(self.sbml.clone()) };
+        let mut changed = false;
+        for sr in m.reactions.iter_mut().flat_map(|r| r.reactants.iter_mut().chain(r.products.iter_mut())) {
+            if sr.stoichiometry.is_none() && sr.stoichiometry_math.is_none() { sr.stoichiometry = Some(1.0); changed = true; }
+        }
+        Ok(if changed && !self.sbml.contains("/comp/") { sbml_io::write(&doc) } else { self.sbml.clone() })
+    }
 
     /// The SBML with the current values as initial values (initial assignments removed).
     pub fn get_current_sbml(&mut self) -> Result<String, String> {
@@ -506,7 +529,18 @@ impl RoadRunner {
 
     /// Recompile the (edited) SBML, keeping current values, time and settings. The event state and
     /// delay history restart. Selections that no longer resolve fall back to the defaults.
-    pub fn regenerate(&mut self) -> Result<(), String> {
+    pub fn regenerate(&mut self) -> Result<(), String> { self.regenerate_opt(false) }
+
+    /// regenerate(); with `reset`, then reset() unless the model ran since the last reset (as
+    /// libroadrunner's regenerateModel(force, reset) after rule / initial-assignment / event edits).
+    pub fn regenerate_opt(&mut self, reset: bool) -> Result<(), String> {
+        let fresh = self.c.as_ref().is_some_and(|c| c.fresh);
+        self.regenerate_inner()?;
+        if reset && fresh { self.reset()?; }
+        Ok(())
+    }
+
+    fn regenerate_inner(&mut self) -> Result<(), String> {
         let old = self.c.take();
         if let Err(e) = self.rebuild(old) { return Err(e); }
         if self.plan(&self.sel.clone()).is_err() || self.check(&self.ssel.clone()).is_err() { self.default_selections(); }
@@ -521,6 +555,8 @@ impl RoadRunner {
         let mut s = format!("roadrunner_nitro state 1\nt {:?}\ncma {}\nfresh {}\nx {}\nxi {}\nprev {}\n", c.t, self.cma as u8, c.fresh as u8,
                             v(&c.x), v(&c.xi), prev.iter().map(|&b| if b { "1" } else { "0" }).collect::<Vec<_>>().join(" "));
         for (t, e, vals) in &pend { s += &format!("pend {t:?} {e} {}\n", v(vals)); }
+        // the delay() history a continued run reads
+        for (k, a) in ["hist_t", "hist_y", "hist_f"].iter().zip(c.w.hist.series()) { s += &format!("{k} {}\n", v(a)); }
         s += "sbml\n";
         s += &self.sbml;
         std::fs::write(path, s).map_err(|e| format!("{}: {e}", path.display()))
@@ -551,6 +587,9 @@ impl RoadRunner {
         (c.x, c.xi, c.t, c.fresh) = (x, xi, get("t")?.parse().map_err(|_| bad())?, get("fresh")? == "1");
         let prev = get("prev")?.split_whitespace().map(|b| b == "1").collect();
         c.m.set_event_state(&mut c.w, prev, pend)?;
+        if let (Some(t), Some(y), Some(fv)) = (f.get("hist_t"), f.get("hist_y"), f.get("hist_f")) {
+            c.w.hist.restore((nums(t)?, nums(y)?, nums(fv)?));
+        }
         c.touch();
         if self.cma { self.c.as_mut().unwrap().csum = self.csum_now()?; }
         self.default_selections();
@@ -562,13 +601,13 @@ impl RoadRunner {
     /// Floating species ids (conserved moiety analysis on: libstruct's order, independent first).
     pub fn floating_ids(&self) -> Vec<String> {
         let Some(c) = &self.c else { return vec![] };
-        if self.cma { c.ls.order.iter().map(|&i| &c.ls_rows[i]).filter(|s| c.info.rows.contains(s)).cloned().collect() } else { c.fids().to_vec() }
+        if self.cma { c.ls().order.iter().map(|&i| &c.ls_rows[i]).filter(|s| c.info.rows.contains(s)).cloned().collect() } else { c.fids().to_vec() }
     }
     pub fn independent_ids(&self) -> Vec<String> {
-        self.c.as_ref().map_or(vec![], |c| c.ls.order[..c.ls.ni].iter().map(|&i| c.ls_rows[i].clone()).collect())
+        self.c.as_ref().map_or(vec![], |c| c.ls().order[..c.ls().ni].iter().map(|&i| c.ls_rows[i].clone()).collect())
     }
     pub fn dependent_ids(&self) -> Vec<String> {
-        self.c.as_ref().map_or(vec![], |c| c.ls.order[c.ls.ni..].iter().map(|&i| c.ls_rows[i].clone()).collect())
+        self.c.as_ref().map_or(vec![], |c| c.ls().order[c.ls().ni..].iter().map(|&i| c.ls_rows[i].clone()).collect())
     }
     pub fn boundary_ids(&self) -> Vec<String> { self.ids(1) }
     /// Global parameters (+ conserved moiety totals `_CSUMi` with moiety analysis on).
@@ -583,7 +622,7 @@ impl RoadRunner {
     pub fn reaction_ids(&self) -> Vec<String> { self.ids(4) }
     pub fn rate_rule_ids(&self) -> Vec<String> { self.c.as_ref().map_or(vec![], |c| c.info.rate_rule_ids.clone()) }
     pub fn conserved_moiety_ids(&self) -> Vec<String> {
-        match &self.c { Some(c) if self.cma => (0..c.csum_dep.len()).map(|k| format!("_CSUM{k}")).collect(), _ => vec![] }
+        match &self.c { Some(c) if self.cma => (0..c.csum_dep().len()).map(|k| format!("_CSUM{k}")).collect(), _ => vec![] }
     }
     pub fn eigenvalue_ids(&self) -> Vec<String> {
         self.floating_ids().iter().flat_map(|s| ["eigen", "eigenReal", "eigenImag"].map(|f| format!("{f}({s})"))).collect()
@@ -661,18 +700,18 @@ impl RoadRunner {
     fn csum_now(&mut self) -> Result<Vec<f64>, String> {
         let a = self.amounts()?;
         let c = self.core()?;
-        let (ls, ni) = (&c.ls, c.ls.ni);
-        Ok(c.csum_dep.iter().map(|&d| a[ls.order[ni + d]] - (0..ni).map(|b| ls.l0[d * ni + b] * a[ls.order[b]]).sum::<f64>()).collect())
+        let (ls, ni) = (&c.ls(), c.ls().ni);
+        Ok(c.csum_dep().iter().map(|&d| a[ls.order[ni + d]] - (0..ni).map(|b| ls.l0[d * ni + b] * a[ls.order[b]]).sum::<f64>()).collect())
     }
 
     /// Dependent species from the totals and the independent species (moiety analysis on).
     fn fix_dependents(&mut self) -> Result<(), String> {
         let a = self.amounts()?;
         let c = self.core_mut()?;
-        let ni = c.ls.ni;
-        for (q, d) in c.csum_dep.clone().into_iter().enumerate() {
-            let s = c.ls_rows[c.ls.order[ni + d]].clone();
-            let amt = c.csum[q] + (0..ni).map(|b| c.ls.l0[d * ni + b] * a[c.ls.order[b]]).sum::<f64>();
+        let ni = c.ls().ni;
+        for (q, d) in c.csum_dep().to_vec().into_iter().enumerate() {
+            let s = c.ls_rows[c.ls().order[ni + d]].clone();
+            let amt = c.csum[q] + (0..ni).map(|b| c.ls().l0[d * ni + b] * a[c.ls().order[b]]).sum::<f64>();
             let Some(&j) = c.kpos.get(&s) else { continue };
             let (_, vol) = c.species_raw(&s)?;
             c.x[j] = amt / vol;
@@ -721,7 +760,7 @@ impl RoadRunner {
 
     fn csum_index(&self, k: &str) -> Option<usize> {
         let c = self.c.as_ref()?;
-        k.strip_prefix("_CSUM").and_then(|n| n.parse::<usize>().ok()).filter(|&n| self.cma && n < c.csum_dep.len() && !c.kpos.contains_key(k))
+        k.strip_prefix("_CSUM").and_then(|n| n.parse::<usize>().ok()).filter(|&n| self.cma && n < c.csum_dep().len() && !c.kpos.contains_key(k))
     }
 
     fn init_value(&mut self, k: &str, conc: bool) -> Result<f64, String> {
@@ -754,9 +793,15 @@ impl RoadRunner {
         let i = c.m.state_ids.iter().position(|x| x == k).ok_or_else(|| format!("'{k}' has no rate of change"))?;
         let is_sp = c.is_species(k);
         if conc && !is_sp { return Err(format!("'{k}' is not a species")); }
-        let r = c.state_rates()[i];
-        // ponytail: amount rate = V d[S]/dt, ignoring dV/dt of a varying compartment
-        Ok(if is_sp && !conc { r * c.species_raw(k)?.1 } else { r })
+        let rates = c.state_rates();
+        let r = rates[i];
+        if !is_sp || conc || c.info.amount_params.contains(k) { return Ok(r); }
+        // d(C V)/dt = V dC/dt + C dV/dt (dV/dt: the compartment's rate rule)
+        let (v, vol) = c.species_raw(k)?;
+        let comp = c.comp_of(k).to_string();
+        let dv = c.m.state_ids.iter().position(|x| *x == comp).map_or(0.0, |j| rates[j]);
+        // ponytail: a compartment set by an assignment rule contributes no dV/dt term here
+        Ok(r * vol + v * dv)
     }
 
     pub fn set_value(&mut self, s: &str, v: f64) -> Result<(), String> {
@@ -775,7 +820,7 @@ impl RoadRunner {
                 self.set_key(&k, v, conc)?;
                 if self.cma && self.core()?.ls_rows.contains(&k) {
                     match self.dependent_ids().iter().position(|d| *d == k) {
-                        Some(d) => if let Some(q) = self.core()?.csum_dep.iter().position(|&x| x == d) {
+                        Some(d) => if let Some(q) = self.core()?.csum_dep().iter().position(|&x| x == d) {
                             let t = self.csum_now()?[q];
                             self.core_mut()?.csum[q] = t;
                         },
@@ -1159,8 +1204,9 @@ impl RoadRunner {
     /// Steady state from the current state (the model is left there); returns |d[S]/dt| of the
     /// floating species.
     pub fn steady_state(&mut self) -> Result<f64, String> {
+        let cfg = ss::SsCfg::of(&self.ss)?;
         let c = self.core_mut()?;
-        c.solve()?;
+        if let Some(tol) = c.solve(&cfg)? { return Ok(tol); }
         let r = c.state_rates();
         Ok(c.sp.iter().flatten().map(|&j| r[j] * r[j]).sum::<f64>().sqrt())
     }
@@ -1184,7 +1230,7 @@ impl RoadRunner {
         let c = self.core()?;
         let nr = c.info.ids[4].len();
         if !self.cma { return Ok(Matrix::new(c.ls_rows.clone(), c.info.ids[4].clone(), c.ls_n.clone())); }
-        let rows: Vec<String> = c.ls.order.iter().map(|&i| c.ls_rows[i].clone()).collect();
+        let rows: Vec<String> = c.ls().order.iter().map(|&i| c.ls_rows[i].clone()).collect();
         let data = self.pick(&rows)?.iter().flat_map(|&i| c.ls_n[i * nr..(i + 1) * nr].to_vec()).collect();
         Ok(Matrix::new(rows, c.info.ids[4].clone(), data))
     }
@@ -1199,15 +1245,15 @@ impl RoadRunner {
     /// L0: dependent x independent.
     pub fn l0_matrix(&self) -> Result<Matrix, String> {
         let c = self.core()?;
-        Ok(Matrix::new(self.dependent_ids(), self.independent_ids(), c.ls.l0.clone()))
+        Ok(Matrix::new(self.dependent_ids(), self.independent_ids(), c.ls().l0.clone()))
     }
     /// L = [I; L0]: all floating species (libstruct's order) x independent species.
     pub fn link_matrix(&self) -> Result<Matrix, String> {
         let c = self.core()?;
-        let (ni, nd) = (c.ls.ni, c.ls.nd());
+        let (ni, nd) = (c.ls().ni, c.ls().nd());
         let mut d = vec![0.0; (ni + nd) * ni];
         for b in 0..ni { d[b * ni + b] = 1.0; }
-        d[ni * ni..].copy_from_slice(&c.ls.l0);
+        d[ni * ni..].copy_from_slice(&c.ls().l0);
         let rows = self.independent_ids().into_iter().chain(self.dependent_ids()).collect();
         Ok(Matrix::new(rows, self.independent_ids(), d))
     }
@@ -1215,17 +1261,17 @@ impl RoadRunner {
     pub fn conservation_matrix(&self) -> Result<Matrix, String> {
         if !self.cma { return Err("conservation matrix: conserved moiety analysis is off".into()); }
         let c = self.core()?;
-        let (ni, nd) = (c.ls.ni, c.ls.nd());
+        let (ni, nd) = (c.ls().ni, c.ls().nd());
         // every dependent species has a row (as roadrunner); those set by rules have no total and
         // are labelled by their id
         let mut d = vec![0.0; nd * (ni + nd)];
         for k in 0..nd {
-            for b in 0..ni { let v = c.ls.l0[k * ni + b]; d[k * (ni + nd) + b] = if v != 0.0 { -v } else { 0.0 }; }
+            for b in 0..ni { let v = c.ls().l0[k * ni + b]; d[k * (ni + nd) + b] = if v != 0.0 { -v } else { 0.0 }; }
             d[k * (ni + nd) + ni + k] = 1.0;
         }
         let deps = self.dependent_ids();
-        let rows = (0..nd).map(|k| match c.csum_dep.iter().position(|&x| x == k) { Some(q) => format!("_CSUM{q}"), None => deps[k].clone() }).collect();
-        let cols = c.ls.order.iter().map(|&i| c.ls_rows[i].clone()).collect();
+        let rows = (0..nd).map(|k| match c.csum_dep().iter().position(|&x| x == k) { Some(q) => format!("_CSUM{q}"), None => deps[k].clone() }).collect();
+        let cols = c.ls().order.iter().map(|&i| c.ls_rows[i].clone()).collect();
         Ok(Matrix::new(rows, cols, d))
     }
 
@@ -1266,8 +1312,8 @@ impl RoadRunner {
         Ok(Matrix::new(ind.clone(), ind, out))
     }
 
-    pub fn full_eigenvalues(&mut self) -> Result<Vec<(f64, f64)>, String> { let j = self.full_jacobian()?; Ok(eig(&j)) }
-    pub fn reduced_eigenvalues(&mut self) -> Result<Vec<(f64, f64)>, String> { let j = self.reduced_jacobian()?; Ok(eig(&j)) }
+    pub fn full_eigenvalues(&mut self) -> Result<Vec<(f64, f64)>, String> { let j = self.full_jacobian()?; eig::eigenvalues(&j.data, j.nr) }
+    pub fn reduced_eigenvalues(&mut self) -> Result<Vec<(f64, f64)>, String> { let j = self.reduced_jacobian()?; eig::eigenvalues(&j.data, j.nr) }
 
     // ------------------------------------------------------------ MCA
 
@@ -1293,9 +1339,10 @@ impl RoadRunner {
     /// (unscaled CCC species x reactions, unscaled FCC, v, [S]) at steady state (model left there).
     fn mca(&mut self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<String>), String> {
         let ids = self.floating_ids();
+        let cfg = ss::SsCfg::of(&self.ss)?;
         let c = self.core_mut()?;
         c.need_mca()?;
-        c.solve()?;
+        c.solve(&cfg)?;
         let (ns, nr) = (c.m.ns, c.m.nr);
         let (mut e, mut uc, mut uf, mut cc, mut fc, mut el) = (vec![0.0; nr * ns], vec![0.0; ns * nr], vec![0.0; nr * nr], vec![0.0; ns * nr], vec![0.0; nr * nr], vec![0.0; nr * ns]);
         if !c.m.mca(&mut c.q, &mut e, &mut uc, &mut uf, &mut cc, &mut fc, &mut el) { return Err("MCA: singular Jacobian".into()); }
@@ -1342,6 +1389,7 @@ impl RoadRunner {
 
     fn ucc(&mut self, var: &str, par: &str) -> Result<(f64, f64, f64, bool), String> {
         let ds = self.diff_step;
+        let cfg = ss::SsCfg::of(&self.ss)?;
         let c = self.core_mut()?;
         c.need_mca()?;
         let var = var.trim_matches(['[', ']']).to_string();
@@ -1356,14 +1404,17 @@ impl RoadRunner {
         let mut h = ds * p0;
         if h.abs() < 1e-12 { h = ds; }
         let mut f = [0.0; 4];
+        let (x0, t0, fresh) = (c.x.clone(), c.t, c.fresh);
         for (k, dx) in [h, 2.0 * h, -h, -2.0 * h].into_iter().enumerate() {
-            let mut x = c.x.clone();
-            x[j] += dx;
-            c.m.load(&mut c.q, &c.kres, &x);
-            if !c.m.steady_state(&mut c.q) { c.qok = false; return Err("cc: no steady state at a stencil point".into()); }
-            f[k] = if flux { c.q.v[idx] } else { c.q.s[idx] };
+            c.x = x0.clone();
+            c.x[j] += dx;
+            c.touch();
+            let r = c.solve(&cfg).map_err(|e| format!("cc: no steady state at a stencil point ({e})"));
+            if r.is_ok() { f[k] = if flux { c.q.v[idx] } else { c.q.s[idx] }; }
+            if let Err(e) = r { (c.x, c.t, c.fresh) = (x0, t0, fresh); c.touch(); return Err(e); }
         }
-        c.qok = false;
+        (c.x, c.t, c.fresh) = (x0, t0, fresh);
+        c.touch();
         let now = if flux { let r = c.reg(&var)?; c.out(&[r])[0] } else { c.species(&var, true)? };
         Ok(((f[3] + 8.0 * f[0] - 8.0 * f[2] - f[1]) / (12.0 * h), p0, now, flux))
     }
@@ -1395,12 +1446,5 @@ impl RoadRunner {
         if c.info.amount_params.contains(x) { e *= c.species_raw(x)?.1; } // engine value is an amount: d/d[S]
         Ok((e, v[r]))
     }
-}
-
-/// Eigenvalues (re, im) of a square matrix.
-fn eig(j: &Matrix) -> Vec<(f64, f64)> {
-    // ponytail: nalgebra's Schur order, not LAPACK dgeev's (roadrunner's); same set of values
-    if j.nr == 0 { return vec![]; }
-    nalgebra::DMatrix::from_row_slice(j.nr, j.nc, &j.data).complex_eigenvalues().iter().map(|z| (z.re, z.im)).collect()
 }
 

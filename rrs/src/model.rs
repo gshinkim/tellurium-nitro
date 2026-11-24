@@ -44,6 +44,8 @@ impl Hist {
         (std::mem::take(&mut self.t), std::mem::take(&mut self.y), std::mem::take(&mut self.f))
     }
     pub fn restore(&mut self, s: (Vec<f64>, Vec<f64>, Vec<f64>)) { (self.t, self.y, self.f) = s; }
+    /// The recorded series (t, y, f), borrowed.
+    pub fn series(&self) -> [&[f64]; 3] { [&self.t, &self.y, &self.f] }
 
     /// State at tp into out (Hermite between recorded points; before the first: the first; after the
     /// last: linear to (t_now, s_now)).
@@ -185,6 +187,29 @@ fn conservation(stoich: &[f64], nx: usize, nv: usize, rows: usize, vol: &[f64], 
         }
     }
     Cons { indep, dep, l0, lc, nzr, jred }
+}
+
+/// Newton settings (crate::rr maps the steady-state solver registry onto these).
+#[derive(Debug, Clone)]
+pub struct NewtonOpts {
+    pub max_iter: usize,
+    /// converged when the full step is <= rtol * |x| (and the residual small)
+    pub rtol: f64,
+    /// smallest line-search damping factor
+    pub min_damping: f64,
+    /// backtracking line search (false: full Newton steps)
+    pub linesearch: bool,
+    /// singular Jacobian: least-squares step instead of failing
+    pub rank_deficient: bool,
+    pub allow_negative: bool,
+    /// > 0: also converged when |f|_inf <= fnorm_tol / when the step <= step_tol
+    pub fnorm_tol: f64,
+    pub step_tol: f64,
+}
+impl Default for NewtonOpts {
+    fn default() -> Self {
+        NewtonOpts { max_iter: 100, rtol: 1e-12, min_damping: 1e-10, linesearch: true, rank_deficient: false, allow_negative: false, fnorm_tol: 0.0, step_tol: 0.0 }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -839,65 +864,99 @@ impl Model {
 
     // ------------------------------------------------------------ steady state
 
-    fn newton(&self, w: &mut Work) -> bool {
+    /// Newton on the reduced system from w.x (independent states) as `o` configures it.
+    fn newton(&self, w: &mut Work, o: &NewtonOpts) -> bool {
         let ni = self.ni();
         let Work { rr, rf, v, ev, s, tc, x, xt, dx, f, jr, piv, hist, .. } = w;
         self.expand(x, tc, s);
         self.rates_at(hist, rr, v, s, 0.0);
         let (mut fn0, mut sc) = self.resid(v, f);
-        for _ in 0..100 {
+        let done = |fnv: f64, sc: f64| fnv <= 1e-14 * sc || (o.fnorm_tol > 0.0 && fnv <= o.fnorm_tol);
+        for _ in 0..o.max_iter {
             if !fn0.is_finite() { return false; }
-            if fn0 <= 1e-14 * sc { return true; }
+            if done(fn0, sc) { return true; }
             self.full_at(hist, rf, v, ev, s, 0.0);
             jr.fill(0.0);
             for &(d, e, c) in &self.jred { jr[d as usize] += c * ev[e as usize]; }
-            if !lu(jr, ni, piv, 1e-15) { return false; }
             for (d, &y) in dx.iter_mut().zip(f.iter()) { *d = -y; }
-            lu_solve(jr, ni, piv, dx, 1);
+            if lu(jr, ni, piv, 1e-15) {
+                lu_solve(jr, ni, piv, dx, 1);
+            } else if o.rank_deficient {
+                // NLEQ2's rank strategy: the minimum-norm least-squares step
+                jr.fill(0.0);
+                for &(d, e, c) in &self.jred { jr[d as usize] += c * ev[e as usize]; }
+                let j = nalgebra::DMatrix::from_row_slice(ni, ni, jr);
+                let eps = 1e-12 * inf_norm(jr).max(f64::MIN_POSITIVE);
+                let Ok(st) = j.svd(true, true).solve(&nalgebra::DVector::from_column_slice(dx), eps) else { return false };
+                dx.copy_from_slice(st.as_slice());
+            } else {
+                return false;
+            }
             let mut lam = 1.0;
             loop {
                 for b in 0..ni { xt[b] = x[b] + lam * dx[b]; }
                 self.expand(xt, tc, s);
                 self.rates_at(hist, rr, v, s, 0.0);
                 let (fnt, sct) = self.resid(v, f);
-                if fnt.is_finite() && (fnt <= (1.0 - 1e-4 * lam) * fn0 || fnt <= 1e-14 * sct) {
+                let decrease = fnt <= (1.0 - 1e-4 * lam) * fn0 || fnt <= 1e-14 * sct;
+                if fnt.is_finite() && (decrease || !o.linesearch) {
                     x.copy_from_slice(xt);
-                    let small = lam == 1.0 && inf_norm(dx) <= 1e-12 * inf_norm(x) && fnt <= 1e-8 * sct;
+                    let small = lam == 1.0 && inf_norm(dx) <= o.rtol * inf_norm(x) && fnt <= 1e-8 * sct;
+                    let step = o.step_tol > 0.0 && lam * inf_norm(dx) <= o.step_tol;
                     fn0 = fnt; sc = sct;
-                    if small { return true; }
+                    if small || step || done(fnt, sct) { return true; }
                     break;
                 }
+                if !o.linesearch { return false; }
                 lam *= 0.5;
-                if lam < 1e-10 { return false; }
+                if lam < o.min_damping { return false; }
             }
         }
         false
     }
 
-    fn valid(&self, w: &Work) -> bool {
-        w.s.iter().enumerate().all(|(i, &c)| c.is_finite() && (i >= self.ns || c >= -1e-10)) && w.v.iter().all(|r| r.is_finite())
+    fn valid(&self, w: &Work, allow_negative: bool) -> bool {
+        w.s.iter().enumerate().all(|(i, &c)| c.is_finite() && (allow_negative || i >= self.ns || c >= -1e-10)) && w.v.iter().all(|r| r.is_finite())
     }
 
-    /// Steady state from w.s (initial state, params loaded). On success w.s, w.v, w.ev hold the solution.
-    pub fn steady_state(&self, w: &mut Work) -> bool {
+    /// Moiety totals of the dependent states from w.s (into w.tc).
+    fn totals(&self, w: &mut Work) {
         for (d, &i) in self.dep.iter().enumerate() {
             w.tc[d] = w.s[i] - self.lc[d].iter().map(|&(b, l)| l * w.s[self.indep[b as usize]]).sum::<f64>();
         }
-        let mut ok = false;
+    }
+
+    /// Newton from w.s (totals in w.tc). On success w.s, w.v, w.ev hold the solution; on failure
+    /// w.s holds Newton's last iterate.
+    fn newton_from_s(&self, w: &mut Work, o: &NewtonOpts) -> bool {
+        for (b, &i) in self.indep.iter().enumerate() { w.x[b] = w.s[i]; }
+        if self.newton(w, o) && self.valid(w, o.allow_negative) {
+            let Work { rf, v, ev, s, hist, .. } = w;
+            self.full_at(hist, rf, v, ev, s, 0.0);
+            return self.valid(w, o.allow_negative);
+        }
+        self.expand(&w.x.clone(), &w.tc.clone(), &mut w.s); // ponytail: alloc only on the failure path
+        false
+    }
+
+    /// Newton alone from w.s (params loaded), as `o` configures it.
+    pub fn newton_solve(&self, w: &mut Work, o: &NewtonOpts) -> bool {
+        self.totals(w);
+        self.newton_from_s(w, o)
+    }
+
+    /// Steady state from w.s (initial state, params loaded): Newton, else integrate towards it over
+    /// growing horizons. On success w.s, w.v, w.ev hold the solution.
+    pub fn steady_state(&self, w: &mut Work) -> bool {
+        self.totals(w);
+        let o = NewtonOpts::default();
         let (mut t, mut h) = (0.0, 0.0);
         for horizon in [0.0, 1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6] {
             if horizon > 0.0 && !self.integrate(w, t, horizon, &mut h, 1e-6, 1e-12) { break; }
             t = horizon;
-            for (b, &i) in self.indep.iter().enumerate() { w.x[b] = w.s[i]; }
-            if self.newton(w) && self.valid(w) { ok = true; break; }
-            self.expand(&w.x.clone(), &w.tc.clone(), &mut w.s); // ponytail: alloc only on the rare fallback path
+            if self.newton_from_s(w, &o) { return true; }
         }
-        if ok {
-            let Work { rf, v, ev, s, hist, .. } = w;
-            self.full_at(hist, rf, v, ev, s, 0.0);
-            ok = self.valid(w);
-        }
-        ok
+        false
     }
 
     // ------------------------------------------------------------ Rodas4 integrator

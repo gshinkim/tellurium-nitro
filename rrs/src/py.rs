@@ -478,6 +478,15 @@ fn antimony_to_sbml(source: &str) -> PyResult<String> {
     Ok(antimony::sbml::write_sbml(&loaded.document))
 }
 
+/// Eigenvalues of a square matrix (list of rows) in libroadrunner's order (ls::getEigenValues:
+/// CLAPACK zgeev on the transpose, parts rounded to 1e-12), as a complex array.
+#[pyfunction]
+fn eigenvalues<'py>(py: Python<'py>, rows: Vec<Vec<f64>>) -> PyResult<Bound<'py, PyAny>> {
+    let n = rows.len();
+    if rows.iter().any(|r| r.len() != n) { return Err(pyo3::exceptions::PyValueError::new_err("eigenvalues: the matrix must be square")); }
+    cplx(py, crate::rr::eigenvalues(&rows.concat(), n))
+}
+
 /// Flatten a hierarchical (comp) SBML document into SBML core text. ``base``: directory external
 /// model definitions are relative to. ValueError if it cannot be flattened.
 #[pyfunction]
@@ -596,6 +605,7 @@ fn roadrunner_nitro(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::sens::register(m)?;
     m.add_function(wrap_pyfunction!(antimony_to_sbml, m)?)?;
     m.add_function(wrap_pyfunction!(flatten_comp, m)?)?;
+    m.add_function(wrap_pyfunction!(eigenvalues, m)?)?;
     m.add_function(wrap_pyfunction!(from_sbml, m)?)?;
     m.add_function(wrap_pyfunction!(sbml_edit, m)?)?;
     m.add_class::<Session>()?;
@@ -660,7 +670,8 @@ impl PyRR {
     fn clearModel(&mut self) { self.r.clear_model() }
     fn getSBML(&self) -> PyResult<String> { self.r.get_sbml().map_err(verr) }
     fn getCurrentSBML(&mut self) -> PyResult<String> { self.r.get_current_sbml().map_err(verr) }
-    fn regenerate(&mut self) -> PyResult<()> { self.r.regenerate().map_err(verr) }
+    #[pyo3(signature = (reset=false))]
+    fn regenerate(&mut self, reset: bool) -> PyResult<()> { self.r.regenerate_opt(reset).map_err(verr) }
     fn saveState(&self, path: &str) -> PyResult<()> { self.r.save_state(std::path::Path::new(path)).map_err(verr) }
     fn loadState(&mut self, path: &str) -> PyResult<()> { self.r.load_state(std::path::Path::new(path)).map_err(verr) }
 

@@ -1,6 +1,6 @@
 """Record libroadrunner's answers for test_core_vs_roadrunner.py into reference/<model>.npz.
 
-    python rrs/tests/make_reference.py [model ...]     (needs libroadrunner; slow on the big models)
+    python rrs/tests/make_reference.py [model ...]     (needs libroadrunner; only missing entries are computed)
 """
 import os, sys
 import numpy as np
@@ -31,6 +31,7 @@ class RR:
     timeCourseSelections = property(lambda s: s.r.timeCourseSelections)
     steadyStateSelections = property(lambda s: s.r.steadyStateSelections)
     def getConservedMoietyIds(self): return list(self.r.model.getConservedMoietyIds())
+    def getRatesOfChangeIds(self): return list(self.r.getRatesOfChangeNamedArray().colnames)
     cms = getConservedMoietyIds
     def fconc(self): return self.r.model.getFloatingSpeciesConcentrations()
     def finit(self): return self.r.model.getFloatingSpeciesInitConcentrations()
@@ -44,14 +45,40 @@ class RR:
     def settings(self, name):
         self.r.setIntegrator(name)
         return [(k, self.r.integrator.getValue(k)) for k in self.r.integrator.getSettings()]
+    def ss_set(self, solver, settings):
+        self.r.setSteadyStateSolver(solver)
+        for k, v in settings.items():
+            setattr(self.r.steadyStateSolver, k, v)
+
+
+def load(path):
+    if not os.path.exists(path):
+        return {}
+    with np.load(path, allow_pickle=True) as z:
+        return dict(z)
 
 
 if __name__ == '__main__':
+    # libroadrunner is slow: only what is missing is computed; existing entries are kept as they are.
+    # ss_settings: per case. Models: only those without a reference file, or named on the command line
+    # (their scenarios rerun in order, since each call depends on the state the previous ones left;
+    # new keys are added, existing ones kept).
     os.makedirs(T.REF, exist_ok=True)
+    path = os.path.join(T.REF, 'ss_settings.npz')
+    cases = load(path).get('cases', np.array({}, dtype=object)).item()
+    todo = [c for c in T.ss_cases() if c[0] not in cases]
+    for key, ant, solver, st in todo:
+        cases[key] = T.ss_run(RR, T.rn.antimony_to_sbml(ant), solver, st)
+    if todo:
+        np.savez_compressed(path, cases=np.array(cases, dtype=object))
+    print('ss_settings', len(todo), 'new cases', flush=True)
     for name, sbml in T.MODELS:
-        if len(sys.argv) > 1 and name not in sys.argv[1:]:
+        path = os.path.join(T.REF, name + '.npz')
+        old = load(path)
+        if old and name not in sys.argv[1:]:
             continue
         rec = T.Rec()
         T.run_all(RR, sbml, name, rec)
-        np.savez_compressed(os.path.join(T.REF, name + '.npz'), **rec.out)
-        print(name, len(rec.out), 'entries', flush=True)
+        new = {k: v for k, v in rec.out.items() if k not in old}
+        np.savez_compressed(path, **{**old, **new})
+        print(name, len(new), 'new entries', flush=True)

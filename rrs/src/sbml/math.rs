@@ -23,6 +23,21 @@ pub enum E {
 
 pub type Fdefs = HashMap<String, (Vec<String>, E)>;
 
+/// Calls of function definitions replaced by their bodies (recursively).
+pub fn inline_calls(e: &E, fd: &Fdefs) -> E {
+    match e {
+        E::Call(f, a) => {
+            let a: Vec<E> = a.iter().map(|x| inline_calls(x, fd)).collect();
+            match fd.get(f) {
+                Some((args, body)) => inline_calls(&body.subst(&args.iter().cloned().zip(a).collect()), fd),
+                None => E::Call(f.clone(), a),
+            }
+        }
+        E::Op(f, a) => E::Op(f.clone(), a.iter().map(|x| inline_calls(x, fd)).collect()),
+        _ => e.clone(),
+    }
+}
+
 pub fn num(x: f64) -> E { E::Num(x) }
 pub fn name(s: &str) -> E { E::Name(s.to_string()) }
 pub fn op(f: &str, a: Vec<E>) -> E { E::Op(f.to_string(), a) }

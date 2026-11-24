@@ -15,6 +15,7 @@ impl Value {
             | (Str(_), v @ Str(_)) | (Doubles(_), v @ Doubles(_)) => v,
             (Bool(_), _) if int == Some(0.0) || int == Some(1.0) => Bool(int == Some(1.0)),
             (Int(_), _) if int.is_some() => Int(int.unwrap() as i64),
+            (Int(_), Double(d)) if d.is_finite() => Double(d), // as libroadrunner's Setting: the value keeps its type
             (UInt(_), Int(i)) if i >= 0 => UInt(i as u64),
             (UInt(_), Double(d)) if int.is_some() && d >= 0.0 => UInt(d as u64),
             (Double(_), _) if num.is_some() => Double(num.unwrap()),
@@ -111,6 +112,26 @@ impl Solver {
         if newton {
             params.push(p("num_max_iters", "Maximum Iterations", "Maximum Newton iterations.", Int(200)));
             params.push(p("allow_negative", "Allow Negative", "Accept negative concentrations.", Bool(false)));
+            // KINSOL's tuning knobs (Jacobian reuse, inexact-Newton forcing, residual monitoring): they
+            // shape the iteration path, not the root it converges to
+            params.push(p("print_level", "Kinsol Print Level", "Kinsol logger level (no output from Nitro).", Int(0)));
+            params.push(p("eta_form", "ETA Form", "Form of nu coefficient. One of eta_choice1, eta_choice2 or eta_constant", Str("eta_choice1".into())));
+            params.push(p("no_init_setup", "No Init Setup", "No initial matrix setup", Bool(false)));
+            params.push(p("no_res_monitoring", "No Residual Monitoring", "No residual monitoring", Bool(false)));
+            params.push(p("max_setup_calls", "Max Setup Calls", "Max. iterations without matrix setup", Int(10)));
+            params.push(p("max_subsetup_calls", "Max Sub Setup Calls", "Max. iterations without residual check", Int(5)));
+            params.push(p("eta_constant_value", "ETA Constant Value", "Constant value of nu", Double(0.1)));
+            params.push(p("eta_param_gamma", "ETA Gamma", "Value of gamma where 0 << gamma << 1.0. Use 0 to indidate default value of 0.9.", Int(0)));
+            params.push(p("eta_param_alpha", "ETA alpha", "Value of alpha where 1.0 < alpha < 2.0. Use 0 to indicate default value of 2.0. ", Int(0)));
+            params.push(p("res_mon_min", "Residual Monitoring Param Minimum", "Value of omega_min - lower bound residual monitoring", Double(1e-5)));
+            params.push(p("res_mon_max", "Residual Monitoring Param Minimum", "Value of omega_max - upper bound residual monitoring", Double(0.9)));
+            params.push(p("res_mon_constant_value", "Residual Monitoring Constant Value", "Constant value of omega", Double(0.9)));
+            params.push(p("no_min_eps", "No Minimum Epsilon", "Lower bound on epsilon", Bool(false)));
+            params.push(p("max_newton_step", "Max Newton Step size", "Max. scaled length of Newton step. If 0 use default value which is 1000*||D_u*u_0||2.", Int(0)));
+            params.push(p("max_beta_fails", "Max Beta Fails", "Max. number of beta-condition failures", Int(10)));
+            params.push(p("func_norm_tol", "Func Norm Tol", "Function-norm stopping tolerance (max norm of d/dt). If 0, Nitro converges to machine precision (KINSOL: uround^1/3).", Int(0)));
+            params.push(p("scaled_step_tol", "Scaled Step Tol", "Scaled-step stopping tolerance. If 0, Nitro's own (KINSOL: uround^2/3).", Int(0)));
+            params.push(p("rel_err_func", "Relative Error Function", "Relative error in computing F(u) (Nitro's Jacobian is exact).", Int(0)));
         } else {
             params.push(p("relative_tolerance", "Relative Tolerance", "Relative tolerance of the solution.", Double(1e-12)));
             params.push(p("maximum_iterations", "Maximum Iterations", "Maximum Newton iterations.", Int(100)));
@@ -120,9 +141,13 @@ impl Solver {
         }
         let hint = if newton { if name == "newton" { "Newton iteration" } else { "Newton iteration with linesearch strategy" } }
                    else { "Steady-state nonlinear systems of equations solver" };
-        // ponytail: every solver runs the engine's damped Newton with presimulation fallback; the
-        // settings are kept for the API, not honoured individually
-        Some(Solver { name, hint, description: "Damped Newton on the reduced system, integrating towards the steady state when Newton fails.", params })
+        let description = match name {
+            "nleq1" => "Damped Newton on the moiety-reduced system (NLEQ1's settings); fails on a singular Jacobian.",
+            "nleq2" => "Damped Newton on the moiety-reduced system (NLEQ2's settings), least-squares steps on a singular Jacobian.",
+            "newton" => "Full-step Newton on the moiety-reduced system (KINSOL KIN_NONE's settings).",
+            _ => "Newton with backtracking line search on the moiety-reduced system (KINSOL KIN_LINESEARCH's settings).",
+        };
+        Some(Solver { name, hint, description, params })
     }
 
     fn find(&self, key: &str) -> Result<usize, String> {

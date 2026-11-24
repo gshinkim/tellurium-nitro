@@ -63,10 +63,21 @@ def models():
         yield k, sbml_of(src), 4.0, 41
 
 
-def compare(sbml, t_end, n, integ, settings, method, sub):
+# rk45's epsilon is absolute (on amounts). 00009 (compartment 4e-12, amounts ~1e-17): there it is
+# meaningless (libroadrunner's rk45 moves by 63% when one initial value changes by 1e-15); 00033
+# (values ~1e5): rounding never meets it, libroadrunner's steps fall to minimum_time_step and grind
+# for hours. Nitro clamps the bound to the state's scale (fixed.rs rk45_tol); those two are checked
+# against a tight CVODE run instead.
+TIGHT = {'00009', '00033'}
+
+
+def compare(sbml, t_end, n, integ, settings, method, sub, tight=False):
     r = roadrunner.RoadRunner(sbml)
-    r.setIntegrator(integ)
-    for k, v in settings.items():
+    r.setIntegrator('cvode' if tight else integ)
+    if tight:
+        r.integrator.relative_tolerance, r.integrator.absolute_tolerance = 1e-12, 1e-24
+        r.integrator.maximum_num_steps = 10 ** 7
+    for k, v in ({} if tight else settings).items():
         r.integrator.setValue(k, v)
     ids = list(r.model.getFloatingSpeciesIds())
     r.timeCourseSelections = ['time'] + [f'[{i}]' for i in ids]  # nitro states are concentrations
@@ -91,6 +102,19 @@ def compare(sbml, t_end, n, integ, settings, method, sub):
     return d.max(), rel.max(), (d / (scale + 1e-300)).max(), rows
 
 
+def rr_error(sbml, t_end, n, settings):
+    """libroadrunner's own rk45 against tight CVODE (abs diff / column max)."""
+    out = []
+    for integ, st in (('rk45', settings), ('cvode', {'relative_tolerance': 1e-12, 'absolute_tolerance': 1e-24})):
+        r = roadrunner.RoadRunner(sbml)
+        r.setIntegrator(integ)
+        for k, v in st.items():
+            r.integrator.setValue(k, v)
+        r.timeCourseSelections = ['time'] + [f'[{i}]' for i in r.model.getFloatingSpeciesIds()]
+        out.append(np.asarray(r.simulate(0, t_end, n))[:, 1:])
+    return (np.abs(out[0] - out[1]) / (np.abs(out[1]).max(0) + 1e-300)).max()
+
+
 def test_fixed_vs_roadrunner(verbose=False):
     worst = []
     for name, sbml, t_end, n in models():
@@ -98,11 +122,22 @@ def test_fixed_vs_roadrunner(verbose=False):
             # rk45's epsilon is absolute (on amounts). 00009 (compartment 4e-12, amounts ~1e-17): it is
             # meaningless and libroadrunner's own rk45 result moves by 63% when one initial value changes
             # by 1e-15. 00033 (values ~1e5): steps fall to minimum_time_step, both engines grind for hours.
-            if name in ('00009', '00033') and method == 'rk45':
-                continue
-            da, dr, dn, rows = compare(sbml, t_end, n, integ, settings, method, sub)
+            tight = name in TIGHT and method == 'rk45'
+            da, dr, dn, rows = compare(sbml, t_end, n, integ, settings, method, sub, tight)
             if verbose:
                 print(f'{name:20s} {label:22s} rows {rows:5d}  max abs {da:.1e}  max rel {dr:.1e}  max abs/colmax {dn:.1e}', flush=True)
+            if tight:  # accuracy against the exact solution, not step-for-step parity
+                # global error of a per-step bound epsilon (relative here): ~1e4 epsilon over the run
+                assert rows == n and dn <= 1e4 * settings.get('epsilon', 1e-12), (name, label, 'vs tight CVODE', dn)
+                continue
+            if method == 'rk45' and dn > 1e-9:
+                # epsilon tightened for this state's scale (rk45_tol): no longer step for step, but at
+                # least as accurate as libroadrunner's rk45
+                mine, theirs = compare(sbml, t_end, n, integ, settings, method, sub, True)[2], rr_error(sbml, t_end, n, settings)
+                if verbose:
+                    print(f'{"":20s} {"":22s} vs tight CVODE: nitro {mine:.1e}  libroadrunner {theirs:.1e}')
+                assert mine <= theirs, (name, label, mine, theirs)
+                continue
             worst.append((dn, name, label))
             if not verbose: assert dn <= 1e-9, (name, label, dn)
     return max(worst)
