@@ -1,10 +1,10 @@
 """SBML Test Suite (semantic time courses) through the roadrunner_nitro C API alone (the libroadrunner
-rrc_api.h drop-in, rrs/capi) via ctypes: no Python engine. Same judging as run.py / run_core.py;
+rrc_api.h drop-in, libroadrunner_nitro/capi) via ctypes: no Python engine. Same judging as run.py / run_core.py;
 flux-balance cases are skipped (te.fba).
 
 worker: python run_capi.py <cases_dir> <out.jsonl> <id> [<id> ...]
 driver: python run_capi.py <cases_dir> <out.jsonl> --all [nproc]
-Library: $RRC_LIB, else rrs/target/release/libroadrunner_nitro_c_api.{dylib,so}.
+Library: $RRC_LIB, else ../libroadrunner_nitro/target/release/libroadrunner_nitro_c_api.{dylib,so}.
 """
 import ctypes as C, os, sys, time
 
@@ -12,8 +12,9 @@ import run as base
 import run_core
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIB = os.environ.get('RRC_LIB') or os.path.join(HERE, '..', '..', 'rrs', 'target', 'release',
-                                                  'libroadrunner_nitro_c_api.' + ('dylib' if sys.platform == 'darwin' else 'so'))
+LIB = os.environ.get('RRC_LIB') or os.path.join(HERE, '..', '..', '..', 'libroadrunner_nitro', 'target', 'release',
+                                                  {'darwin': 'libroadrunner_nitro_c_api.dylib', 'win32': 'roadrunner_nitro_c_api.dll'}
+                                                  .get(sys.platform, 'libroadrunner_nitro_c_api.so'))
 
 
 class RRCData(C.Structure):

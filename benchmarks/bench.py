@@ -29,7 +29,7 @@ def tight(r):
     ss.relative_tolerance, ss.absolute_tolerance, ss.maximum_num_steps = 1e-10, 1e-12, 10 ** 7  # tighter takes >15 min
 
 
-def chain(n=40):  # the Tellurium Turbo benchmark model (same as rrs/check.py)
+def chain(n=40):  # the Tellurium Turbo benchmark model (same as libroadrunner_nitro/check.py)
     lines = ["J0: $X0 -> S1; k0*X0"]
     for i in range(1, n):
         lines.append(f"J{i}: S{i} -> S{i+1}; k{i}*S{i} - k{i}r*S{i+1}")

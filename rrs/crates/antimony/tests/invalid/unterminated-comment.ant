@@ -1,3 +1,0 @@
-model *m()
-  k1 = 1; /* never closed
-end
