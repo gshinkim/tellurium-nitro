@@ -1,6 +1,0 @@
-model *m()
-  function MM(S, Vm, Km)
-    Vm*S/(Km + S)
-  end
-  k = MM(1, 2);
-end

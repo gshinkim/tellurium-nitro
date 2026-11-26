@@ -1,3 +1,0 @@
-model *m()
-  k1 = "unterminated;
-end

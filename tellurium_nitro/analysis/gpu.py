@@ -8,7 +8,7 @@ GPU-accelerated, parallel metabolic control analysis over many parameter sets.
     res['fcc'].shape                   # (10000, nReactions, nReactions)
 
 How the work is split:
-  * steady states + unscaled elasticities: the Rust engine ``roadrunner_nitro`` (rrs/) on all
+  * steady states + unscaled elasticities: the Rust engine ``roadrunner_nitro`` (libroadrunner_nitro) on all
     cores when its batch model takes the model, else one RoadRunner steady state per sample
     (in parallel worker processes)
   * C = -L (N_R E L)^-1 N_R,  F = I + E C,  and scaling: one batched solve on the GPU

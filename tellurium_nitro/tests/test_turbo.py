@@ -643,12 +643,20 @@ class TestRoadRunner(unittest.TestCase):
         self.assertIn('J9', r.model.getReactionIds())
 
     def test_dropin_module(self):
-        import tellurium_nitro.nitro as rr
+        # tellurium_nitro.nitro is a deprecated alias of roadrunner_nitro, libroadrunner's Python module
+        import importlib
+        import sys
+        import roadrunner_nitro
+        sys.modules.pop('tellurium_nitro.nitro', None)
+        with self.assertWarns(DeprecationWarning):
+            rr = importlib.import_module('tellurium_nitro.nitro')
         r = rr.RoadRunner(te.antimonyToSBML(chain(12)))
-        self.assertIsInstance(r, ExtendedRoadRunner)
+        self.assertIsInstance(r, roadrunner_nitro.RoadRunner)
         self.assertIsInstance(r.simulate(0, 10, 11), rr.NamedArray)
-        rr.Config.setValue('x', 1)
-        self.assertEqual(rr.Config.getValue('x'), 1)
+        old = rr.Config.getValue(rr.Config.MAX_OUTPUT_ROWS)
+        rr.Config.setValue(rr.Config.MAX_OUTPUT_ROWS, 12345)
+        self.assertEqual(rr.Config.getValue(rr.Config.MAX_OUTPUT_ROWS), 12345)
+        rr.Config.setValue(rr.Config.MAX_OUTPUT_ROWS, old)
         rr.Logger.setLevel(rr.Logger.LOG_WARNING)
 
     def test_named_array_and_pickle(self):
@@ -674,7 +682,7 @@ class TestRoadRunner(unittest.TestCase):
         r.setKineticLaw('J1', 'k1*S1/2')
         self.assertEqual(r.getKineticLaw('J1').replace(' ', ''), 'k1*S1/2')
         r.removeInitialAssignment('p')
-        self.assertEqual(r.getInitialAssignmentIds(), [])
+        self.assertEqual(list(r.getInitialAssignmentIds()), [])  # a tuple, as libroadrunner
         self.assertEqual(r.p, 1.0)
         r.setInitValue('k1', 0.1)
         self.assertEqual(r.getValue('init(k1)'), 0.1)

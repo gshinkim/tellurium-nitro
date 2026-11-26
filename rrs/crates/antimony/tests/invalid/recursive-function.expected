@@ -1,2 +1,0 @@
-# SPEC 6.3: SBML function definitions cannot recurse, so a function that calls itself is always an error.
-dcRecursiveFunction 2

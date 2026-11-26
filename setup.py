@@ -50,7 +50,7 @@ setup(name='tellurium_nitro',
           'matplotlib>=2.0.2',
           'pandas>=2.0',
           # SBW-derived
-          'libroadrunner_nitro',  # the Rust engine: pip install ./rrs
+          'libroadrunner_nitro>=0.2',  # the Rust engine and libroadrunner's Python API
           'antimony>=3.1.0',
           'phrasedml>=1.3',
           # standards

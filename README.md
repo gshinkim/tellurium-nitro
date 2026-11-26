@@ -63,7 +63,8 @@ New things you can do that regular tellurium can't:
 - **Run many simulations at once:** `r.simulateBatch(...)` runs one simulation per set of parameter values, on
   every core. Handy for parameter scans, fitting and "what if" questions.
 - **Use it from plain roadrunner code:** if your scripts start with `import roadrunner`, change that one line to
-  `import tellurium_nitro.nitro as roadrunner` and the rest runs on the fast engine.
+  `import roadrunner_nitro as roadrunner` and the rest runs on the fast engine (`tellurium_nitro.nitro` still
+  works for now, but is deprecated).
 - **Flux balance analysis:** `te.fba(model)` solves flux balance problems (linear programs), which roadrunner
   doesn't do.
 
@@ -86,9 +87,10 @@ New things you can do that regular tellurium can't:
 
 Check with `cargo --version`.
 
-**3. Download Tellurium Nitro:**
+**3. Download Tellurium Nitro and its engine,** side by side in one folder:
 
 ```bash
+git clone https://github.com/gshinkim/libroadrunner_nitro.git
 git clone https://github.com/gshinkim/tellurium-nitro.git
 cd tellurium-nitro
 ```
@@ -100,17 +102,17 @@ python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 ```
 
-**5. Install Tellurium Nitro and its dependencies:**
+**5. Build and install the Rust engine** (`libroadrunner_nitro`). This takes 1-3 minutes the first time.
 
 ```bash
 pip install --upgrade pip
-pip install .
+pip install ../libroadrunner_nitro
 ```
 
-**6. Build and install the Rust engine.** This takes 1-3 minutes the first time.
+**6. Install Tellurium Nitro and its dependencies:**
 
 ```bash
-pip install ./rrs
+pip install .
 ```
 
 **7. Check that it works:**
@@ -119,7 +121,8 @@ pip install ./rrs
 python -c "import tellurium_nitro as te; print('Nitro engine on:', te.turbo())"
 ```
 
-It should print `Nitro engine on: True`. If the import fails, step 6 didn't finish; run it again and read the error.
+It should print `Nitro engine on: True`. If the import fails, step 5 or 6 didn't finish; run it again and read
+the error.
 
 From now on, activate the environment (step 4, `source .venv/bin/activate`) whenever you want to use Nitro.
 
@@ -152,7 +155,7 @@ print(r.getScaledFluxControlCoefficientMatrix())   # which reaction controls the
 Change only the import line. Everything below it stays the same.
 
 ```python
-import tellurium_nitro.nitro as roadrunner     # was: import roadrunner
+import roadrunner_nitro as roadrunner          # was: import roadrunner
 r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
 r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
@@ -160,125 +163,28 @@ r.simulate(0, 10, 100)                      # runs on the fast engine
 ### Use it without Python: the C library (libroadrunner's C API)
 
 Many programs use libroadrunner through its shared library and C API instead of Python: C and C++ programs,
-MATLAB, Julia, R, C#, Delphi and others. Nitro provides the same thing: a shared library,
+MATLAB, Julia, R, C#, Delphi and others. Nitro's engine provides the same thing: a shared library,
 `libroadrunner_nitro_c_api`, that exports **all 350 functions** of libroadrunner's C API (`rrc_api.h`,
 `rrc_types.h`, `rrc_utilities.h`) with the same names, arguments and memory rules. It does not need Python,
 libroadrunner or libsbml.
 
-**1. Build the library** (needs Rust, step 2 of the install; takes 1-3 minutes):
+It is built from the engine's repository, [libroadrunner_nitro](https://github.com/gshinkim/libroadrunner_nitro),
+whose README explains how to build it, use it from C, Python (ctypes), MATLAB, Julia and C#, switch an existing
+libroadrunner program to it, and where it differs from libroadrunner's C API (only where libroadrunner's was wrong).
 
 ```bash
-cd rrs
-cargo build --release -p roadrunner_nitro_c_api
-cd ..
+cd ../libroadrunner_nitro
+cargo build --release -p roadrunner_nitro_c_api      # makes target/release/<library file>
 ```
 
-This makes one file in `rrs/target/release/`:
-
-| System | File |
-|---|---|
-| macOS | `libroadrunner_nitro_c_api.dylib` |
-| Linux | `libroadrunner_nitro_c_api.so` (untested) |
-| Windows | `roadrunner_nitro_c_api.dll` (untested) |
-
-The C headers are in `rrs/capi/include/`. They are libroadrunner's own headers, unchanged.
-
-**2. Check it:** this lists every function in the headers and confirms the library exports it.
-
-```bash
-python rrs/capi/tests/check_exports.py        # prints: 350 declared / 350 exported
-```
-
-**3. Use it from C or C++.** A complete example is in
-[`rrs/capi/examples/simulate.c`](rrs/capi/examples/simulate.c): it loads a model, simulates it, finds the steady
-state and a control coefficient. The core of it:
-
-```c
-#include "rrc_api.h"
-
-RRHandle rr = createRRInstance();
-if (!loadSBMLFromFile(rr, "model.xml"))            /* or loadSBML(rr, sbml_text) */
-    printf("error: %s\n", getLastError());
-RRCDataPtr result = simulateEx(rr, 0, 10, 100);    /* time 0 to 10, 100 points */
-double value;
-getRRCDataElement(result, 99, 1, &value);          /* last row, first species */
-freeRRCData(result);                               /* free what the API returns, as with libroadrunner */
-freeRRInstance(rr);
-```
-
-Compile and run it (macOS; on Linux use `-Wl,-rpath,...` the same way):
-
-```bash
-cc -I rrs/capi/include rrs/capi/examples/simulate.c \
-   -L rrs/target/release -lroadrunner_nitro_c_api -Wl,-rpath,$PWD/rrs/target/release -o simulate
-./simulate                  # the model built into the example
-./simulate my_model.xml     # any SBML file
-```
-
-**4. Use it from Python without tellurium** (`ctypes`, part of Python):
-
-```python
-import ctypes
-rr = ctypes.CDLL("rrs/target/release/libroadrunner_nitro_c_api.dylib")
-rr.createRRInstance.restype = ctypes.c_void_p
-rr.loadSBMLFromFile.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-rr.simulateEx.restype = ctypes.c_void_p
-rr.simulateEx.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_int]
-rr.getRRCDataElement.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_double)]
-rr.getRRDataNumRows.argtypes = [ctypes.c_void_p]
-rr.freeRRCData.argtypes = [ctypes.c_void_p]
-rr.freeRRInstance.argtypes = [ctypes.c_void_p]
-
-h = rr.createRRInstance()
-rr.loadSBMLFromFile(h, b"model.xml")
-res = rr.simulateEx(h, 0.0, 10.0, 11)
-v = ctypes.c_double()
-rr.getRRCDataElement(res, rr.getRRDataNumRows(res) - 1, 1, ctypes.byref(v))
-print(v.value)
-rr.freeRRCData(res); rr.freeRRInstance(h)
-```
-
-**5. Use it from other languages.** Load the library file the way you load libroadrunner's, with the headers from
-`rrs/capi/include` (these were not tested here):
-
-- MATLAB: `loadlibrary('libroadrunner_nitro_c_api', 'rrc_api.h', 'addheader', 'rrc_types.h')`, then
-  `calllib('libroadrunner_nitro_c_api', 'createRRInstance')`.
-- Julia: `ccall((:createRRInstance, "libroadrunner_nitro_c_api"), Ptr{Cvoid}, ())`.
-- C#: `[DllImport("roadrunner_nitro_c_api")] static extern IntPtr createRRInstance();`
-
-**6. Switch an existing libroadrunner program to Nitro.** Either link it with `-lroadrunner_nitro_c_api` instead of
-`-lroadrunner_c_api`, or, without recompiling, give Nitro's library libroadrunner's file name and put it where the
-program looks for libroadrunner. On macOS:
-
-```bash
-cp rrs/target/release/libroadrunner_nitro_c_api.dylib /path/to/libroadrunner_c_api.dylib
-install_name_tool -id @rpath/libroadrunner_c_api.dylib /path/to/libroadrunner_c_api.dylib
-```
-
-A program built against libroadrunner (`-lroadrunner_c_api`) then runs on Nitro's engine unchanged (tested with
-the example above).
-
-**How we know it's right.** The whole SBML Test Suite runs through the C library alone, with no Python involved:
-all 1789 time-course cases and all 100 stochastic cases pass. (The other 34 cases are flux-balance problems,
-which libroadrunner's C API doesn't do either.) Reproduce:
+**How we know it's right.** The whole SBML Test Suite runs through the C library alone, with no Python engine
+involved. Reproduce from this repository (the library is found in `../libroadrunner_nitro/target/release`, or set
+`RRC_LIB`):
 
 ```bash
 python benchmarks/sts/run_capi.py <suite>/cases/semantic capi.jsonl --all
 python benchmarks/sts/run_capi_stochastic.py <suite>/cases/stochastic capi_stoch.jsonl 10000
-python -m pytest rrs/capi/tests                # every section of the API, plus a C test with no memory leaks
 ```
-
-**Where it differs from libroadrunner's C API: only where libroadrunner's was wrong.**
-
-| Function | libroadrunner | Nitro |
-|---|---|---|
-| `getRatesOfChange` | values in a different order from `getRatesOfChangeIds` | values match the ids |
-| `setTimeCourseSelectionList("time, cc(S1, k1)")` | splits inside `cc(...)` at the comma | splits only between selections |
-| `loadSimulationSettings` | settings have no effect | start, duration, steps and tolerances are applied |
-| `getFloatingSpeciesInitialConcentrationByIndex` | bad index returns "success" without a value | bad index is an error |
-| `getConfigurationXML`, `writeRRData` | declared but missing | implemented |
-| `steadyState` | gives up when Newton fails from the current state | also finds steady states Newton alone misses |
-| euler / rk4 / rk45 integrators | ignore events after the start time | apply every event |
 
 ### Run many simulations at once
 
@@ -301,8 +207,8 @@ they don't make every possible combination.
 
 - `te.antimony(False)` reads Antimony with libantimony instead of Nitro's faster Rust reader (see below).
 - `pip install ".[gpu]"` adds PyTorch for `te.gpu(True)` (see [GPU](#from-tellurium-turbo-batched-control-coefficients-and-gpu)).
-- The engine is compiled for your own computer's processor (`rrs/.cargo/config.toml`, `target-cpu=native`). To
-  build a copy you can share with other machines, delete that file before step 6.
+- The engine is compiled for your own computer's processor (`libroadrunner_nitro/.cargo/config.toml`,
+  `target-cpu=native`). To build a copy you can share with other machines, delete that file before step 5.
 
 ## How much faster is it?
 
@@ -474,14 +380,14 @@ All three give identical outcomes; no test differs from regular tellurium. The 1
 official release, so they are upstream issues. Wall time is about the same for all three because the suite is
 mostly SED-ML/OMEX parsing, file I/O and plotting on tiny models, not simulation.
 
-**This repository's own tests** (Python package, Rust core and C API, including SED-ML/OMEX), run in a fresh
-environment with only Nitro installed (no libroadrunner, no libsbml): **3347 passed, 0 failed**. 4 tests are
-skipped; all 4 skips come unchanged from upstream tellurium. Answers are compared with libroadrunner's,
-recorded once in `rrs/tests/reference/` and `tellurium_nitro/tests/reference/`, so the tests never need
-libroadrunner installed.
+**This repository's own tests** cover the tellurium layer (including SED-ML/OMEX). The engine's tests (Rust core,
+C API, libroadrunner's own Python test suite and the SBML Test Suite) are in the engine's repository. Answers are
+compared with libroadrunner's, recorded once in `tellurium_nitro/tests/reference/` and
+`libroadrunner_nitro/tests/reference/`, so the tests never need libroadrunner installed.
 
 ```bash
-python -m pytest tellurium_nitro/tests rrs/tests rrs/capi/tests
+python -m pytest tellurium_nitro/tests                 # this repository
+cd ../libroadrunner_nitro && python -m pytest tests    # the engine (see its README for the rest)
 ```
 
 ### 3. Old tellurium bugs, now fixed
@@ -503,24 +409,28 @@ optional extras). What that means for you:
 - **Smaller fixes:** `distributed_sensitivity_analysis` no longer crashes on its bounds check, `run_case(...,
   py_code=True)` writes its Python script again, and two test files that needed the old `six` package now run.
 
-You can also compare Nitro with roadrunner on your own machine: `python rrs/check.py` prints both results and timings.
+You can also compare Nitro with roadrunner on your own machine: `python ../libroadrunner_nitro/check.py` prints both results and timings.
 
 ## For experts: how it works
 
 A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) in which roadrunner's compute engine is
 rewritten in Rust: steady states, time courses, events, rules, control analysis (MCA), sensitivities and
 Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and batches run on every CPU core.
-`tellurium_nitro.nitro` provides libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`, `Config`,
-`SelectionRecord`) on the Rust engine, so `roadrunner.RoadRunner(sbml)` code runs without libroadrunner.
+The engine package `roadrunner_nitro` provides libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`,
+`Config`, `SelectionRecord`, solver and option classes) on the Rust engine, so `roadrunner.RoadRunner(sbml)` code
+runs without libroadrunner. Tellurium Nitro's `RoadRunner` is a subclass of it that adds tellurium's helpers
+(plotting, export, `gillespie`, ...), as regular tellurium extends libroadrunner's.
 
 Plain-language explainer of what changed and how it is built: [`docs/specJIT.pdf`](docs/specJIT.pdf).
 Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.md).
 
-- **`ExtendedRoadRunner`** (`tellurium_nitro/roadrunner/extended_roadrunner.py`): libroadrunner's Python API over
-  `roadrunner_nitro.RoadRunner` (the Rust core in `rrs/src/rr/`: load, selections, simulate, steady state, MCA,
-  Gillespie, model editing, save/load state). `simulateBatch`, sensitivities and `te.controlCoefficients` use the
-  batch model built by `rrs_bridge.from_sbml`.
-- **Rust engine** (`rrs/`, Python module `roadrunner_nitro`):
+- **`ExtendedRoadRunner`** (`tellurium_nitro/roadrunner/extended_roadrunner.py`): a subclass of
+  `roadrunner_nitro.RoadRunner` (libroadrunner's Python API, in the engine's `python/roadrunner_nitro/`, over the
+  Rust core in its `src/rr/`) that adds tellurium's helpers: plotting, export, `gillespie`, the short Jarnac names.
+  `simulateBatch`, sensitivities and `te.controlCoefficients` use the batch model built by
+  `roadrunner_nitro`'s `from_sbml` (`rrs_bridge.from_sbml` here).
+- **Rust engine** ([libroadrunner_nitro](https://github.com/gshinkim/libroadrunner_nitro), Python module
+  `roadrunner_nitro`):
   - Rate laws become a flat tape with exact symbolic derivatives (Jacobians, elasticities, parameter derivatives).
   - The tape is JIT-compiled to native code with Cranelift after 2000 evaluations, so short one-shot runs don't pay
     the compile cost. The JIT output is bit-identical to the interpreter.
@@ -537,23 +447,23 @@ Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.m
   - **MCA:** closed form, `C = -L (N_R E L)^-1 N_R` and `F = I + E C`.
   - **Sensitivities:** forward, one parameter per core.
   - **Gillespie SSA.**
-- **SBML reader** (`rrs/src/sbml/`, on the pure-Rust `rrs/crates/sbml-io`): reads SBML Level 1-3 straight into
+- **SBML reader** (`libroadrunner_nitro/src/sbml/`, on the pure-Rust `libroadrunner_nitro/crates/sbml-io`): reads SBML Level 1-3 straight into
   the engine, including hierarchical `comp` models (flattened in `sbml-io/src/comp.rs`). No libsbml, and no
   roadrunner compile: a 1000-species model loads in about 0.3 s.
-- **Antimony:** read by a pure-Rust reader (`rrs/crates/antimony`, from
+- **Antimony:** read by a pure-Rust reader (`libroadrunner_nitro/crates/antimony`, from
   [PathwayDesigner-rs](https://github.com/sys-bio/PathwayDesigner-rs)), about 4x faster to load than libantimony.
   Anything it rejects goes to libantimony. `te.antimony(False)` always uses libantimony. Species are listed in
   declaration order, which can differ from libantimony's, so select result columns by name, not position.
-- **RoadRunner core** (`rrs/src/rr/`): libroadrunner's instance behaviour in Rust: selections, get/set values,
+- **RoadRunner core** (`libroadrunner_nitro/src/rr/`): libroadrunner's instance behaviour in Rust: selections, get/set values,
   reset, simulate, `oneStep`, steady state (with the nleq1/nleq2/newton settings, presimulation and
   approximation), Jacobians, eigenvalues (LAPACK's `zgeev`, ported, so the order matches libroadrunner's),
   elasticities and control coefficients, conserved moiety analysis (libstruct's QR, ported, so the species order
-  and `_CSUM` totals match), Gillespie, integrator settings, model editing (`rrs/src/sbml/edit.rs`), SBML level
+  and `_CSUM` totals match), Gillespie, integrator settings, model editing (`libroadrunner_nitro/src/sbml/edit.rs`), SBML level
   and version conversion, and save/load state. The Python `ExtendedRoadRunner` and the C library are both thin
   layers over this one core.
 - **Integrators:** cvode (BDF / Rodas4, honours tolerances per species, step limits and variable step output),
-  gillespie, and libroadrunner's euler, rk4 and rk45 (`rrs/src/fixed.rs`).
-- **C library** (`rrs/capi/`): all 350 functions of libroadrunner's C API on the core; see
+  gillespie, and libroadrunner's euler, rk4 and rk45 (`libroadrunner_nitro/src/fixed.rs`).
+- **C library** (`libroadrunner_nitro/capi/`): all 350 functions of libroadrunner's C API on the core; see
   [Use it without Python](#use-it-without-python-the-c-library-libroadrunners-c-api).
 - **Where Nitro gives the correct answer and libroadrunner doesn't** (each case has a test):
   - Control coefficients and elasticities are exact, not finite differences.
@@ -655,7 +565,8 @@ for large models with many samples. CUDA was not benchmarked.
 
 ## Changed files (vs sys-bio/tellurium)
 
-- `rrs/` (new): Rust engine `roadrunner_nitro`
+- `libroadrunner_nitro/` (new, since moved to its own repository,
+  [libroadrunner_nitro](https://github.com/gshinkim/libroadrunner_nitro)): Rust engine `roadrunner_nitro`
   - `src/expr.rs` tape + derivatives, `src/jit.rs` Cranelift JIT, `src/model.rs` solvers/integrators/events/SSA/MCA,
     `src/sens.rs` sensitivities, `src/rand.rs` `distrib` random draws, `src/fixed.rs` euler/rk4/rk45
   - `src/sbml/` SBML reader, model editing, level/version conversion; `src/rr/` the RoadRunner core;
@@ -663,7 +574,8 @@ for large models with many samples. CUDA was not benchmarked.
   - `crates/sbml-io` (SBML reader/writer, `comp` flattening), `crates/antimony` (Antimony reader)
   - `capi/` (new): the C library `libroadrunner_nitro_c_api`, libroadrunner's headers, tests, `examples/simulate.c`
   - `tests/`: core, editing, integrator, conversion and limits tests against libroadrunner's recorded answers
-- `tellurium_nitro/roadrunner/extended_roadrunner.py`: libroadrunner's Python API on the Rust core (no libroadrunner)
+- `tellurium_nitro/roadrunner/extended_roadrunner.py`: a subclass of `roadrunner_nitro.RoadRunner` (libroadrunner's
+  Python API on the Rust core) adding tellurium's helpers
 - `tellurium_nitro/analysis/rrs_bridge.py` (new): SBML -> Rust batch model for `simulateBatch`, sensitivities and
   `te.controlCoefficients`
 - `tellurium_nitro/analysis/gpu.py` (new): `te.gpu()`, `te.getGPU()`, `te.controlCoefficients()` (Rust first)
@@ -1247,4 +1159,4 @@ The `TELLURIUM_ENGINE` environment variable is no longer read (there is no roadr
 
 | Command | What it does |
 |---|---|
-| `import tellurium_nitro.nitro as roadrunner` | Use instead of `import roadrunner`: `RoadRunner`, `NamedArray`, `Logger`, `Config`, `SelectionRecord` on the fast engine, without libroadrunner. |
+| `import roadrunner_nitro as roadrunner` | Use instead of `import roadrunner`: libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`, `Config`, `SelectionRecord`, ...) on the fast engine, without libroadrunner. (`tellurium_nitro.nitro` is a deprecated alias.) |

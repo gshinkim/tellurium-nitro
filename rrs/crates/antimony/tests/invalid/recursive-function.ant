@@ -1,5 +1,0 @@
-model *m()
-  function fact(n)
-    n*fact(n - 1)
-  end
-end
