@@ -63,7 +63,8 @@ New things you can do that regular tellurium can't:
 - **Run many simulations at once:** `r.simulateBatch(...)` runs one simulation per set of parameter values, on
   every core. Handy for parameter scans, fitting and "what if" questions.
 - **Use it from plain roadrunner code:** if your scripts start with `import roadrunner`, change that one line to
-  `import tellurium_nitro.nitro as roadrunner` and the rest runs on the fast engine.
+  `import roadrunner_nitro as roadrunner` and the rest runs on the fast engine (`tellurium_nitro.nitro` still
+  works for now, but is deprecated).
 - **Flux balance analysis:** `te.fba(model)` solves flux balance problems (linear programs), which roadrunner
   doesn't do.
 
@@ -152,7 +153,7 @@ print(r.getScaledFluxControlCoefficientMatrix())   # which reaction controls the
 Change only the import line. Everything below it stays the same.
 
 ```python
-import tellurium_nitro.nitro as roadrunner     # was: import roadrunner
+import roadrunner_nitro as roadrunner          # was: import roadrunner
 r = roadrunner.RoadRunner('my_model.xml')  # an SBML file, or SBML text
 r.simulate(0, 10, 100)                      # runs on the fast engine
 ```
@@ -510,8 +511,10 @@ You can also compare Nitro with roadrunner on your own machine: `python rrs/chec
 A fork of [sys-bio/tellurium](https://github.com/sys-bio/tellurium) in which roadrunner's compute engine is
 rewritten in Rust: steady states, time courses, events, rules, control analysis (MCA), sensitivities and
 Gillespie. Each model's math is JIT-compiled to native code with Cranelift, and batches run on every CPU core.
-`tellurium_nitro.nitro` provides libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`, `Config`,
-`SelectionRecord`) on the Rust engine, so `roadrunner.RoadRunner(sbml)` code runs without libroadrunner.
+The engine package `roadrunner_nitro` provides libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`,
+`Config`, `SelectionRecord`, solver and option classes) on the Rust engine, so `roadrunner.RoadRunner(sbml)` code
+runs without libroadrunner. Tellurium Nitro's `RoadRunner` is a subclass of it that adds tellurium's helpers
+(plotting, export, `gillespie`, ...), as regular tellurium extends libroadrunner's.
 
 Plain-language explainer of what changed and how it is built: [`docs/specJIT.pdf`](docs/specJIT.pdf).
 Technical rewrite spec: [`docs/roadrunner-rs-spec.md`](docs/roadrunner-rs-spec.md).
@@ -1247,4 +1250,4 @@ The `TELLURIUM_ENGINE` environment variable is no longer read (there is no roadr
 
 | Command | What it does |
 |---|---|
-| `import tellurium_nitro.nitro as roadrunner` | Use instead of `import roadrunner`: `RoadRunner`, `NamedArray`, `Logger`, `Config`, `SelectionRecord` on the fast engine, without libroadrunner. |
+| `import roadrunner_nitro as roadrunner` | Use instead of `import roadrunner`: libroadrunner's Python API (`RoadRunner`, `NamedArray`, `Logger`, `Config`, `SelectionRecord`, ...) on the fast engine, without libroadrunner. (`tellurium_nitro.nitro` is a deprecated alias.) |
